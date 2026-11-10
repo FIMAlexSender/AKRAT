@@ -73,6 +73,15 @@ impl Identity {
         &self.public_key
     }
 
+    pub fn detached_copy(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            public_key: self.public_key.clone(),
+            private_key: self.private_key.clone(),
+        }
+    }
+
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.public_key)
     }
