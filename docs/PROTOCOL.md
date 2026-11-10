@@ -1,8 +1,8 @@
 # Protocol status
 
-Protocol structures for a draft version 1 exchange exist in `akrat-protocol`, but no wire framing, listener, or outbound connection exists. The structures are not yet an interoperability specification. The local encrypted vault envelope is version 1 and is separate from the network protocol.
+Protocol structures for a draft version 1 exchange exist in `akrat-protocol`. `akrat-network` implements standalone TCP listening/connecting and a 4-byte big-endian length prefix around bounded JSON frames, with a 30-second I/O deadline. The framing is not integrated with handshake/session state and the structures are not yet an interoperability specification. The local encrypted vault envelope is version 1 and is separate from the network protocol.
 
-The draft uses a fixed version and suite identifier. Follow-up work still needs bounded network framing, authenticated connection state, manual fingerprint verification, and fail-closed handling in a real transport. The app must not accept a session as verified based on the handshake alone; people must compare fingerprints over an independent channel.
+The draft uses a fixed version and suite identifier. Follow-up work still needs authenticated connection state, manual fingerprint verification, and fail-closed handling in a real transport. The app must not accept a session as verified based on the handshake alone; people must compare fingerprints over an independent channel.
 
 The experimental `akrat-crypto::session` library implements a 3-message authenticated handshake. The initiator signs a hello containing its Ed25519 public key, ephemeral X25519 public key, one-time ML-KEM-768 encapsulation key, nonce, suite, and version. The responder verifies it, performs ephemeral X25519, encapsulates to the ML-KEM key, signs a response and provides key confirmation. HKDF-SHA-256 combines the fixed-length X25519 and ML-KEM secrets with the signed transcript hash and derives a session ID and distinct directional keys. The initiator verifies the responder and returns a signed HMAC key confirmation. The responder accepts the session only after checking it.
 

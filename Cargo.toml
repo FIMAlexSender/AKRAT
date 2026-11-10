@@ -30,4 +30,5 @@ hkdf = "0.13"
 hmac = "0.13"
 ml-kem = { version = "0.3.4", features = ["getrandom", "zeroize"] }
 x25519-dalek = { version = "3", features = ["getrandom"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 

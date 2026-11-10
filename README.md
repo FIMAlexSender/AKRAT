@@ -15,7 +15,7 @@ AKRAT is an open source peer to peer messenger project. The repository currently
 | Experimental authenticated hybrid session library | Implemented in `akrat-crypto`; not integrated into the desktop UI or network |
 | X25519 and ML-KEM-768 handshake | Experimental library only; ML-KEM implementation is unaudited |
 | Session AES-256-GCM message envelope | Implemented in the crypto library; no transport or app integration |
-| Direct network transport | Not implemented |
+| Direct TCP transport and bounded framing | Implemented as a standalone library; not connected to crypto or app |
 | Persistent conversations | Not implemented |
 
 No cryptographic or network security claim should be inferred from this preview.
@@ -40,15 +40,15 @@ On Windows, the encrypted vault is stored at `%LOCALAPPDATA%\AKRAT\identities.va
 - `akrat-app` contains the Dioxus Desktop interface.
 - `akrat-core` contains shared identity and trust domain types.
 - `akrat-crypto` generates independent Ed25519 identities and signs/verifies messages.
-- `akrat-protocol` defines draft versioned handshake and message types; no transport framing exists.
-- `akrat-network` is reserved for direct peer transport.
+- `akrat-protocol` defines draft versioned handshake and message types plus bounded JSON encoding.
+- `akrat-network` provides direct TCP connect/listen and bounded length-prefixed framing; it accepts no application trust decisions and is not wired to the UI.
 - `akrat-storage` encodes identity records in a versioned encrypted vault envelope and reads/writes vault files.
 
-The network crate remains an empty boundary. The cryptographic session library is experimental and not connected to the application. Do not use it for sensitive messages. The Signal `libsignal` integration remains unavailable because of the previously documented API and licensing review.
+The network crate provides standalone TCP primitives but no authenticated peer workflow. The cryptographic session library is experimental and not connected to the network or application. Do not use it for sensitive messages. The Signal `libsignal` integration remains unavailable because of the previously documented API and licensing review.
 
 ## Security posture
 
-AKRAT is not suitable for sending messages in this state. Identity generation and local vault encryption are operational. An experimental hybrid handshake and message cipher exist in a library, but there is no contact verification workflow, TCP transport, or end-to-end message path in the desktop application. Review [the threat model](docs/THREAT_MODEL.md), [the architecture](docs/ARCHITECTURE.md), and [the protocol status](docs/PROTOCOL.md) before contributing to security-sensitive work.
+AKRAT is not suitable for sending messages in this state. Identity generation and local vault encryption are operational. An experimental hybrid handshake and message cipher exist in a library, and standalone bounded TCP framing is tested, but there is no contact verification workflow or end-to-end message path in the desktop application. Review [the threat model](docs/THREAT_MODEL.md), [the architecture](docs/ARCHITECTURE.md), and [the protocol status](docs/PROTOCOL.md) before contributing to security-sensitive work.
 
 `cargo audit` currently reports five transitive warnings: unmaintained `fxhash`, `paste`, and `proc-macro-error`, plus unsoundness advisories for `glib 0.18.5` and build dependency `rand 0.7.3`. They arrive through Dioxus Desktop's cross-platform Wry dependency tree. The `glib` and `rand 0.7.3` entries are not part of the Windows target build in this checkout, but affect other target dependency graphs. No advisory is suppressed; the dependency path needs follow-up as the desktop stack evolves.
 
