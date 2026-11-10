@@ -6,7 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+ml-kem.workspace = true
+serde_json.workspace = true
+akrat-protocol = { path = "../akrat-protocol" }
+x25519-dalek.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 akrat-core = { path = "../akrat-core" }

@@ -26,4 +26,8 @@ zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = "3"
 hex = "0.4"
 thiserror = "2"
+hkdf = "0.13"
+hmac = "0.13"
+ml-kem = { version = "0.3.4", features = ["getrandom", "zeroize"] }
+x25519-dalek = { version = "3", features = ["getrandom"] }
 

@@ -3,6 +3,8 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+pub mod session;
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("secure random generation failed")]
