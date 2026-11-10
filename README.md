@@ -1,6 +1,6 @@
 # AKRAT
 
-AKRAT is an experimental peer-to-peer desktop messenger. Version 0.1.0 connects a Windows desktop interface to direct TCP sessions, invitation import/export, manual fingerprint verification, and encrypted local conversation history.
+AKRAT is an experimental peer-to-peer desktop messenger. Version 0.1.1 connects a Windows desktop interface to direct TCP sessions, invitation import/export, manual fingerprint verification, and encrypted local conversation history.
 
 ## Current capabilities
 
@@ -57,7 +57,7 @@ cargo build --release -p akrat-app
 cargo audit
 ```
 
-`cargo audit` currently reports five transitive advisories in the Dioxus desktop dependency graph. They are not suppressed; details and reachability are documented in [the security review](docs/SECURITY_REVIEW.md).
+`cargo audit` currently reports five transitive advisories in the Dioxus desktop dependency graph. They are not suppressed; details and reachability are documented in [the security review](docs/SECURITY_REVIEW.md). CI runs the audit directly so its findings remain visible in the job output.
 
 ## Documentation
 
@@ -65,6 +65,7 @@ cargo audit
 - [Protocol status](docs/PROTOCOL.md)
 - [Threat model](docs/THREAT_MODEL.md)
 - [Dependency and security review](docs/SECURITY_REVIEW.md)
+- [Validation procedure and limits](docs/VALIDATION.md)
 
 ## License
 

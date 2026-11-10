@@ -628,6 +628,22 @@ mod tests {
             Err(SessionError::Sequence)
         ));
 
+        let retry = alice_session
+            .encrypt(b"same logical message after uncertain delivery")
+            .expect("encrypt retry");
+        let retry_again = alice_session
+            .encrypt(b"same logical message after uncertain delivery")
+            .expect("encrypt retry again");
+        assert_eq!(retry.sequence + 1, retry_again.sequence);
+        assert_ne!(retry.nonce, retry_again.nonce);
+        assert_ne!(retry.ciphertext, retry_again.ciphertext);
+        assert_eq!(
+            bob_session.decrypt(&retry).expect("decrypt retry"),
+            bob_session
+                .decrypt(&retry_again)
+                .expect("decrypt retry again")
+        );
+
         let reply = bob_session.encrypt(b"message from Bob").expect("encrypt");
         assert_eq!(
             alice_session.decrypt(&reply).expect("decrypt"),

@@ -146,7 +146,7 @@ fn App() -> Element {
                         span { class: if app_state.listener.read().is_some() || !app_state.active_sessions.read().is_empty() { "status-dot" } else { "status-dot offline" } }
                         span { "{application_status(&app_state)}" }
                     }
-                    div { class: "version", "VERSION 0.1.0 · EXPÉRIMENTAL" }
+                    div { class: "version", "VERSION 0.1.1 · EXPÉRIMENTAL" }
                 }
             }
             section { class: "main-panel",
@@ -574,8 +574,10 @@ fn ConnectionView() -> Element {
                 button {
                     class: "secondary-button form-submit",
                     onclick: move |_| {
-            let eval = document::eval("const value = await dioxus.recv(); await navigator.clipboard.writeText(value); dioxus.send(true);");
-                        let _ = eval.send(uri.clone());
+                        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(uri.clone())) {
+                            Ok(()) => error.set(None),
+                            Err(problem) => error.set(Some(format!("Impossible de copier l'invitation : {problem}"))),
+                        }
                     },
                     "Copier l'invitation"
                 }
@@ -2048,8 +2050,8 @@ fn SettingsView() -> Element {
         }
         div { class: "settings-card",
             div { class: "setting-row",
-                div { strong { "Version" } p { "Version 0.1.0 · messagerie directe expérimentale." } }
-                span { class: "setting-value", "0.1.0" }
+                div { strong { "Version" } p { "Version 0.1.1 · messagerie directe expérimentale." } }
+                span { class: "setting-value", "0.1.1" }
             }
             div { class: "setting-row",
                 div { strong { "Réseau" } p { "TCP direct IPv4/IPv6 selon votre réseau; aucun relais." } }

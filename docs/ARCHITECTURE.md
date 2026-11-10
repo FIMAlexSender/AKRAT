@@ -8,7 +8,7 @@ The user unlocks a vault and selects a local identity. An invitation is parsed a
 
 Each conversation is keyed by a local identity and a remote contact. The session actor handles encrypted text and acknowledgements over a single reliable TCP stream. The app persists outgoing text before enqueueing it, persists incoming text before acknowledging it, and deduplicates message IDs in the encrypted vault. TCP transmission is not treated as application receipt. Unacknowledged messages are marked uncertain after disconnection or restart and can be retried with the same ID. Session keys are ephemeral and are not stored; a reconnect performs a fresh handshake.
 
-The vault file uses Argon2id (64 MiB, three passes, one lane) and AES-256-GCM. Unlock derives a key kept in memory for subsequent writes; each write uses a fresh random nonce and the vault format's fixed salt until the next unlock. The in-memory key is discarded when locking. Vault updates use a temporary file, flush the file, then rename it into place.
+The vault is an encrypted JSON document, not a SQLite database. It uses Argon2id (64 MiB, three passes, one lane) and AES-256-GCM. Unlock derives a key kept in memory for subsequent writes; each write uses a fresh random nonce and the vault format's fixed salt until the next unlock. The in-memory key is discarded when locking. Vault updates use a temporary file, flush the file, then rename it into place. Each replacement is atomic at the file level; the app does not provide SQLite transactions or a multi-record write-ahead log.
 
 ## Limits
 

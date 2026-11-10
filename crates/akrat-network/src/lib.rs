@@ -565,7 +565,7 @@ mod tests {
         receive_frame, respond_session, send_frame, start_listener, start_message_session,
     };
     use akrat_crypto::create_identity;
-    use akrat_protocol::EncryptedMessage;
+    use akrat_protocol::{EncryptedMessage, MAX_FRAME_SIZE, SessionPayload, encode_frame};
     use tokio::io::AsyncWriteExt;
 
     fn message(sequence: u64, sender: &str, recipient: &str) -> EncryptedMessage {
@@ -577,6 +577,34 @@ mod tests {
             nonce: vec![0; 12],
             ciphertext: vec![sequence as u8; 32],
         }
+    }
+
+    #[test]
+    fn maximum_control_character_text_fits_inside_an_encrypted_frame() {
+        let payload = SessionPayload::Text {
+            message_id: "a".repeat(32),
+            text: "\0".repeat(super::MAX_SESSION_TEXT_SIZE),
+        };
+        let plaintext = serde_json::to_vec(&payload).expect("serialize payload");
+        let encrypted = EncryptedMessage {
+            session_id: vec![0; 16],
+            sender_id: "a".repeat(64),
+            recipient_id: "b".repeat(64),
+            sequence: u64::MAX,
+            nonce: vec![0; 12],
+            ciphertext: vec![u8::MAX; plaintext.len() + 16],
+        };
+        let frame = encode_frame(&encrypted).expect("maximum text frame");
+
+        assert!(plaintext.len() + 16 <= 64 * 1024);
+        assert!(frame.len() <= MAX_FRAME_SIZE);
+        assert!(matches!(
+            encode_frame(&EncryptedMessage {
+                ciphertext: vec![0; MAX_FRAME_SIZE + 1],
+                ..encrypted
+            }),
+            Err(akrat_protocol::FrameError::TooLarge)
+        ));
     }
 
     #[tokio::test]
