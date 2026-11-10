@@ -37,7 +37,8 @@ button { cursor: pointer; }
 .nav-item { display: flex; align-items: center; gap: 13px; min-height: 55px; padding: 11px 14px; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 12px; text-align: left; font-size: 13px; font-weight: 700; transition: background .15s, color .15s; }
 .nav-item:hover { background: var(--surface-hover); }
 .nav-item.active { color: #17191d; background: linear-gradient(115deg, var(--accent-soft), var(--accent)); box-shadow: 0 5px 18px #ff98581a; }
-.nav-glyph { width: 24px; color: var(--muted); text-align: center; font-size: 20px; line-height: 1; }
+.nav-glyph { display: inline-flex; flex: 0 0 24px; align-items: center; justify-content: center; width: 24px; color: var(--muted); text-align: center; line-height: 1; }
+.nav-glyph svg { display: block; }
 .nav-item.active .nav-glyph { color: #1d2025; }
 .side-bottom { margin-top: auto; border-top: 1px solid var(--line); padding-top: 12px; }
 .local-card { padding: 13px; color: var(--text); background: var(--surface-raised); border: 1px solid #ffffff08; border-radius: 12px; font-size: 12px; font-weight: 700; }
@@ -95,7 +96,9 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
 .notice { min-height: 18px; color: var(--accent); font-size: 11px; font-weight: 700; }
 .gate input { padding: 13px; }
 .gate .notice { margin-top: 14px; }
-.toast { position: fixed; bottom: 20px; left: 50%; max-width: 80vw; padding: 12px 18px; transform: translateX(-50%); color: var(--text); background: var(--surface-raised); border: 1px solid #ff985866; border-radius: 10px; box-shadow: 0 12px 35px #0008; font-size: 12px; }
+.toast { position: fixed; z-index: 5; bottom: 20px; left: 50%; max-width: 80vw; padding: 12px 18px 14px; overflow: hidden; transform: translateX(-50%); color: var(--text); background: var(--surface-raised); border: 1px solid #ff985866; border-radius: 10px; box-shadow: 0 12px 35px #0008; font-size: 12px; }
+.toast::after { content: ""; position: absolute; right: 0; bottom: 0; left: 0; height: 2px; background: var(--accent); transform-origin: left; animation: toast-life 4s linear forwards; }
+@keyframes toast-life { to { transform: scaleX(0); } }
 .chat-stage { height: 100%; min-height: 0; display: flex; flex-direction: column; padding: 34px 40px; }
 .chat-head { padding-bottom: 19px; border-bottom: 1px solid var(--line); }
 .chat-head .eyebrow { margin-bottom: 10px; }
@@ -142,7 +145,9 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
   .sidebar { order: 2; display: flex; flex: 0 0 auto; flex-direction: row; gap: 3px; padding: 6px 6px max(6px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); border-right: 0; }
   .side-caption, .side-bottom { display: none; }
   .nav-item { flex: 1 1 0; min-width: 0; min-height: 54px; flex-direction: column; justify-content: center; gap: 3px; padding: 5px 2px; border-radius: 9px; font-size: 9px; line-height: 1.1; text-align: center; }
-  .nav-glyph { width: auto; font-size: 17px; }
+  .nav-glyph { flex-basis: auto; width: auto; }
+  .nav-glyph svg { width: 19px; height: 19px; }
+  .nav-label { max-width: 100%; overflow-wrap: anywhere; }
   .trace { display: none; }
   .page-scroll { width: 100%; padding: 22px 14px 28px; }
   h1 { font-size: 28px; }

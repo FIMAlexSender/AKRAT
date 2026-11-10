@@ -9,7 +9,11 @@ use directories::ProjectDirs;
 use runtime::{SessionHandle, UiEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+const VAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const NOTICE_LIFETIME: Duration = Duration::from_secs(4);
 
 const LOGO_DATA_URI: &str = concat!(
     "data:image/png;base64,",
@@ -64,6 +68,7 @@ fn App() -> Element {
     let invitation_address = use_signal(|| "127.0.0.1:47474".to_string());
     let invitation_result = use_signal(String::new);
     let mut notice = use_signal(String::new);
+    let mut last_activity = use_signal(Instant::now);
     let mut page = use_signal(|| Page::Messages);
     let mut sessions = use_signal(HashMap::<String, SessionHandle>::new);
     let mut listen_stop = use_signal(|| None::<tokio::sync::watch::Sender<bool>>);
@@ -246,6 +251,44 @@ fn App() -> Element {
         }
     });
 
+    use_effect(move || {
+        let current_notice = notice.read().clone();
+        if !current_notice.is_empty() {
+            spawn(async move {
+                tokio::time::sleep(NOTICE_LIFETIME).await;
+                if notice.read().as_str() == current_notice {
+                    notice.set(String::new());
+                }
+            });
+        }
+    });
+
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if vault.read().is_some() && last_activity.read().elapsed() >= VAULT_IDLE_TIMEOUT {
+                if let Some(stop) = listen_stop.read().as_ref() {
+                    let _ = stop.send(true);
+                }
+                listen_stop.set(None);
+                let active_sessions = sessions.read().values().cloned().collect::<Vec<_>>();
+                for session in active_sessions {
+                    session.close();
+                }
+                sessions.write().clear();
+                active_conversation.set(None);
+                vault.set(None);
+                runtime::wipe_string(&mut passphrase.write());
+                last_activity.set(Instant::now());
+                push_trace(
+                    &mut trace,
+                    "Coffre verrouillé après 5 minutes d’inactivité".into(),
+                );
+                notice.set("Coffre verrouillé après 5 minutes sans activité.".into());
+            }
+        }
+    });
+
     let path_value = path.read().clone();
     let create_path = path_value.clone();
     let open_path = path_value.clone();
@@ -261,6 +304,11 @@ fn App() -> Element {
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" }
         style { {CSS} }
         div { class: "app-frame",
+            onpointerdown: move |_| last_activity.set(Instant::now()),
+            onpointermove: move |_| last_activity.set(Instant::now()),
+            onkeydown: move |_| last_activity.set(Instant::now()),
+            oninput: move |_| last_activity.set(Instant::now()),
+            onwheel: move |_| last_activity.set(Instant::now()),
             header { class: "topbar",
                 div { class: "brand", img { class: "brand-mark", src: LOGO_DATA_URI, alt: "Logo AKRAT" } div { "AKRAT" span { class: "brand-sub", "MESSAGERIE P2P SÉCURISÉE" } } }
                 div { class: "top-status", span { class: if opened { "status-dot live" } else { "status-dot" } } span { class: "lock-mark" } if opened { "Coffre déverrouillé" } else { "Coffre verrouillé" } }
@@ -291,10 +339,10 @@ fn App() -> Element {
                 div { class: "workspace",
                     aside { class: "sidebar",
                         div { class: "side-caption", "ESPACE" }
-                        NavItem { label: "Conversations", glyph: "▱", active: page() == Page::Messages, onclick: move |_| page.set(Page::Messages) }
-                        NavItem { label: "Réseau", glyph: "⌁", active: page() == Page::Network, onclick: move |_| page.set(Page::Network) }
-                        NavItem { label: "Identités & contacts", glyph: "♧", active: page() == Page::People, onclick: move |_| page.set(Page::People) }
-                        NavItem { label: "Coffre", glyph: "▣", active: page() == Page::Settings, onclick: move |_| page.set(Page::Settings) }
+                        NavItem { label: "Conversations", icon: "messages", active: page() == Page::Messages, onclick: move |_| page.set(Page::Messages) }
+                        NavItem { label: "Réseau", icon: "network", active: page() == Page::Network, onclick: move |_| page.set(Page::Network) }
+                        NavItem { label: "Identités & contacts", icon: "people", active: page() == Page::People, onclick: move |_| page.set(Page::People) }
+                        NavItem { label: "Coffre", icon: "vault", active: page() == Page::Settings, onclick: move |_| page.set(Page::Settings) }
                         div { class: "side-bottom", div { class: "side-caption", "ÉTAT LOCAL" } div { class: "local-card", span { class: "status-dot live" } "Chiffré sur cet appareil" p { "{identities} identité(s) · {contacts} contact(s)" } } }
                     }
                     main { class: "content",
@@ -329,11 +377,25 @@ fn App() -> Element {
 #[component]
 fn NavItem(
     label: &'static str,
-    glyph: &'static str,
+    icon: &'static str,
     active: bool,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
-    rsx! { button { class: if active { "nav-item active" } else { "nav-item" }, onclick, span { class: "nav-glyph", "{glyph}" } "{label}" } }
+    let glyph = match icon {
+        "messages" => {
+            rsx! { svg { view_box: "0 0 24 24", width: "22", height: "22", fill: "none", stroke: "currentColor", stroke_width: "1.8", stroke_linecap: "round", stroke_linejoin: "round", path { d: "M20 11.5a7.5 7.5 0 0 1-7.5 7.5H7l-3 2v-5.1a7.5 7.5 0 1 1 16-4.4Z" } path { d: "M8 11h.01M12 11h.01M16 11h.01" } } }
+        }
+        "network" => {
+            rsx! { svg { view_box: "0 0 24 24", width: "22", height: "22", fill: "none", stroke: "currentColor", stroke_width: "1.8", stroke_linecap: "round", stroke_linejoin: "round", path { d: "M2.5 8.8a15 15 0 0 1 19 0M5.8 12.2a9.8 9.8 0 0 1 12.4 0M9.2 15.6a4.6 4.6 0 0 1 5.6 0" } circle { cx: "12", cy: "19", r: "1" } } }
+        }
+        "people" => {
+            rsx! { svg { view_box: "0 0 24 24", width: "22", height: "22", fill: "none", stroke: "currentColor", stroke_width: "1.8", stroke_linecap: "round", stroke_linejoin: "round", circle { cx: "9", cy: "8", r: "3.5" } path { d: "M2.5 20v-1.3A6.5 6.5 0 0 1 9 12.2a6.5 6.5 0 0 1 6.5 6.5V20Z" } path { d: "M16 5.2a3.5 3.5 0 0 1 0 6.6M17 13a5.5 5.5 0 0 1 4.5 5.4V20h-3" } } }
+        }
+        _ => {
+            rsx! { svg { view_box: "0 0 24 24", width: "22", height: "22", fill: "none", stroke: "currentColor", stroke_width: "1.8", stroke_linecap: "round", stroke_linejoin: "round", rect { x: "4", y: "10", width: "16", height: "11", rx: "2" } path { d: "M8 10V7a4 4 0 0 1 8 0v3M12 14v3" } } }
+        }
+    };
+    rsx! { button { class: if active { "nav-item active" } else { "nav-item" }, onclick, span { class: "nav-glyph", aria_hidden: "true", {glyph} } span { class: "nav-label", "{label}" } } }
 }
 
 #[component]
@@ -699,7 +761,7 @@ fn SettingsPage(
     rsx! { section { class: "page-scroll",
         div { class: "eyebrow", "STOCKAGE LOCAL" } h1 { "Votre coffre" }
         p { class: "intro", "Les clés privées, contacts et messages sont conservés dans un fichier chiffré par votre phrase secrète." }
-        section { class: "panel settings-panel", div { class: "panel-title", "Emplacement" } p { class: "fingerprint", "{path.display()}" } div { class: "crypto-note", "Chiffrement du coffre : Argon2id + AES-256-GCM. Une phrase secrète perdue ne peut pas être récupérée." } button { class: "secondary", onclick: on_lock, "Verrouiller le coffre" } }
+        section { class: "panel settings-panel", div { class: "panel-title", "Emplacement" } p { class: "fingerprint", "{path.display()}" } div { class: "crypto-note", "Chiffrement du coffre : Argon2id + AES-256-GCM. Une phrase secrète perdue ne peut pas être récupérée." } div { class: "crypto-note", "Verrouillage automatique après 5 minutes sans toucher l’application. Les sessions réseau sont fermées en même temps." } button { class: "secondary", onclick: on_lock, "Verrouiller le coffre" } }
         p { class: "quiet", "{notice}" }
     } }
 }
