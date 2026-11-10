@@ -258,6 +258,7 @@ fn App() -> Element {
     let contacts = vault.read().as_ref().map(|v| v.contacts.len()).unwrap_or(0);
 
     rsx! {
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" }
         style { {CSS} }
         div { class: "app-frame",
             header { class: "topbar",
@@ -475,7 +476,21 @@ fn NetworkPage(
                             None => notice.set("Adresse invalide. Utilisez une IP et un port joignables.".into())
                         }
                     }, "Générer une invitation" }
-                    if !invitation_result().is_empty() { label { "À transmettre au contact" } textarea { readonly: true, value: "{invitation_result}" } }
+                    if !invitation_result().is_empty() {
+                        label { class: "invitation-label", "À transmettre au contact" }
+                        textarea { class: "invite-text", readonly: true, value: "{invitation_result}", spellcheck: false }
+                        button { class: "secondary copy-invite", onclick: move |_| {
+                            let invitation = invitation_result.read().clone();
+                            async move {
+                                if copy_to_clipboard(invitation).await {
+                                    notice.set("Invitation copiée. Collez-la dans votre messagerie sur le téléphone.".into());
+                                } else {
+                                    notice.set("Copie impossible. Maintenez le doigt sur le lien pour le sélectionner et le copier.".into());
+                                }
+                            }
+                        }, "Copier l’invitation" }
+                        p { class: "copy-hint", "Vous pouvez aussi maintenir le doigt sur le texte pour le sélectionner." }
+                    }
                 }
             }
             section { class: "panel network-panel",
@@ -515,6 +530,40 @@ fn NetworkPage(
             div { class: "callout", strong { "Une invitation ne suffit pas à établir la confiance." } p { "Comparez l’empreinte complète avec la personne, puis marquez son contact comme vérifié." } }
         }
     }
+}
+
+async fn copy_to_clipboard(text: String) -> bool {
+    let mut eval = document::eval(
+        r#"
+        const text = await dioxus.recv();
+        let copied = false;
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                copied = true;
+            }
+        } catch (_) {}
+        if (!copied) {
+            const field = document.createElement('textarea');
+            field.value = text;
+            field.setAttribute('readonly', '');
+            field.style.position = 'fixed';
+            field.style.opacity = '0';
+            field.style.fontSize = '16px';
+            document.body.appendChild(field);
+            field.focus();
+            field.select();
+            field.setSelectionRange(0, field.value.length);
+            try { copied = document.execCommand('copy'); } catch (_) {}
+            field.remove();
+        }
+        dioxus.send(copied);
+        "#,
+    );
+    if eval.send(text).is_err() {
+        return false;
+    }
+    eval.recv::<bool>().await.unwrap_or(false)
 }
 
 #[component]

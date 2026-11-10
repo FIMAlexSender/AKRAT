@@ -10,6 +10,7 @@ publisher = "AKRAT"
 identifier = "org.akrat.app"
 min_sdk = 24
 target_sdk = 35
+icon = ["crates/akrat-desktop/assets/akrat-logo.png"]
 
 [ios]
 deployment_target = "15.0"
