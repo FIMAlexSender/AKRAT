@@ -1,5 +1,10 @@
+use akrat_core::PrivateIdentity;
+use akrat_crypto::create_identity;
+use akrat_storage::{load_vault, save_vault};
 use dioxus::prelude::*;
 use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 const STYLE: &str = include_str!("style.css");
 
@@ -77,29 +82,198 @@ fn App() -> Element {
 
 #[component]
 fn IdentityView() -> Element {
+    let path = vault_path();
+    let mut vault_exists = use_signal(|| path.as_ref().is_ok_and(|value| value.exists()));
+    let mut unlocked = use_signal(|| false);
+    let mut identities = use_signal(Vec::<PrivateIdentity>::new);
+    let mut name = use_signal(String::new);
+    let mut secret = use_signal(|| Zeroizing::new(String::new()));
+    let mut confirmation = use_signal(|| Zeroizing::new(String::new()));
+    let mut error = use_signal(|| None::<String>);
+
     rsx! {
         div { class: "page-heading",
             div { class: "eyebrow", "VOTRE ESPACE" }
             h1 { "Identités" }
             p { "Des identités cryptographiques indépendantes, contrôlées localement." }
         }
-        div { class: "notice",
-            div { class: "notice-symbol", "i" }
-            div {
-                strong { "Fondation en cours" }
-                p { "Aucune identité n'a été créée. Le coffre local n'est pas encore disponible dans cette version de développement." }
+        if unlocked() {
+            div { class: "notice",
+                div { class: "notice-symbol", "✓" }
+                div {
+                    strong { "Coffre déverrouillé" }
+                    p { "Les clés privées sont chargées en mémoire. Elles seront effacées de l'état de l'application au verrouillage." }
+                }
+            }
+            div { class: "section-title",
+                div { h2 { "Toutes les identités" } p { "Identités stockées dans votre coffre local chiffré." } }
+                button {
+                    class: "primary-button",
+                    onclick: move |_| {
+                        let identity = create_identity(format!("Identité {}", identities.read().len() + 1));
+                        match identity {
+                            Ok(identity) => {
+                                identities.write().push(identity);
+                                let result = path.as_ref().map_err(|error| error.clone()).and_then(|vault_path| {
+                                    save_vault(vault_path, &identities.read(), secret.read().as_str())
+                                        .map_err(|error| error.to_string())
+                                });
+                                if let Err(message) = result {
+                                    identities.write().pop();
+                                    error.set(Some(message));
+                                } else {
+                                    error.set(None);
+                                }
+                            }
+                            Err(problem) => error.set(Some(problem.to_string()))
+                        }
+                    },
+                    span { "+" } "Créer une identité"
+                }
+            }
+            div { class: "identity-list",
+                for identity in identities.read().iter() {
+                    article { class: "identity-card",
+                        div { class: "identity-card-top",
+                            div { class: "identity-glyph", "◈" }
+                            div { class: "identity-copy",
+                                strong { "{identity.public.display_name}" }
+                                span { "{identity.public.id}" }
+                            }
+                            span { class: "active-badge", "ACTIVE" }
+                        }
+                        div { class: "fingerprint-label", "EMPREINTE PUBLIQUE" }
+                        code { class: "fingerprint", "{identity.public.fingerprint}" }
+                        div { class: "identity-key-label", "CLÉ PUBLIQUE ED25519" }
+                        code { class: "public-key", "{hex_public_key(&identity.public.public_key)}" }
+                    }
+                }
+            }
+            button {
+                class: "lock-button",
+                onclick: move |_| {
+                    identities.set(Vec::new());
+                    secret.set(Zeroizing::new(String::new()));
+                    unlocked.set(false);
+                },
+                "Verrouiller le coffre"
+            }
+        } else if vault_exists() {
+            div { class: "vault-form",
+                div { class: "vault-form-heading",
+                    div { class: "card-icon", "◇" }
+                    h2 { "Déverrouiller le coffre" }
+                    p { "Entrez la phrase secrète qui protège vos identités." }
+                }
+                label { class: "field-label", "PHRASE SECRÈTE" }
+                input {
+                    class: "text-field",
+                    r#type: "password",
+                    autocomplete: "current-password",
+                    placeholder: "Au moins 12 caractères",
+                    oninput: move |event| secret.set(Zeroizing::new(event.value()))
+                }
+                button {
+                    class: "primary-button form-submit",
+                    onclick: move |_| {
+                        let result = path.as_ref().map_err(|error| error.clone()).and_then(|vault_path| {
+                            load_vault(vault_path, secret.read().as_str()).map_err(|error| error.to_string())
+                        });
+                        match result {
+                            Ok(records) => { identities.set(records); unlocked.set(true); error.set(None); }
+                            Err(_) => error.set(Some("Impossible d'ouvrir le coffre. Vérifiez la phrase secrète et le fichier.".to_string()))
+                        }
+                    },
+                    "Déverrouiller"
+                }
+            }
+        } else {
+            div { class: "vault-form",
+                div { class: "vault-form-heading",
+                    div { class: "card-icon", "◇" }
+                    h2 { "Créer votre coffre local" }
+                    p { "Le coffre protège vos identités sur cet appareil. Choisissez une phrase secrète longue et unique." }
+                }
+                label { class: "field-label", "NOM DE LA PREMIÈRE IDENTITÉ" }
+                input {
+                    class: "text-field",
+                    r#type: "text",
+                    placeholder: "Personnel",
+                    value: "{name}",
+                    oninput: move |event| name.set(event.value())
+                }
+                label { class: "field-label field-label-spaced", "PHRASE SECRÈTE DU COFFRE" }
+                input {
+                    class: "text-field",
+                    r#type: "password",
+                    autocomplete: "new-password",
+                    placeholder: "Au moins 12 caractères",
+                    oninput: move |event| secret.set(Zeroizing::new(event.value()))
+                }
+                label { class: "field-label field-label-spaced", "CONFIRMER LA PHRASE SECRÈTE" }
+                input {
+                    class: "text-field",
+                    r#type: "password",
+                    autocomplete: "new-password",
+                    placeholder: "Saisissez-la à nouveau",
+                    oninput: move |event| confirmation.set(Zeroizing::new(event.value()))
+                }
+                button {
+                    class: "primary-button form-submit",
+                    onclick: move |_| {
+                        if secret.read().len() < 12 {
+                            error.set(Some("La phrase secrète doit contenir au moins 12 caractères.".to_string()));
+                        } else if secret.read().as_str() != confirmation.read().as_str() {
+                            error.set(Some("Les deux phrases secrètes ne correspondent pas.".to_string()));
+                        } else if name.read().trim().is_empty() {
+                            error.set(Some("Donnez un nom à votre première identité.".to_string()));
+                        } else {
+                            let result = create_identity(name.read().trim().to_string())
+                                .map_err(|problem| problem.to_string())
+                                .and_then(|identity| {
+                                    path.as_ref().map_err(|problem| problem.clone()).and_then(|vault_path| {
+                                        save_vault(
+                                            vault_path,
+                                            std::slice::from_ref(&identity),
+                                            secret.read().as_str(),
+                                        )
+                                            .map_err(|problem| problem.to_string())
+                                            .map(|_| identity)
+                                    })
+                                });
+                            match result {
+                                Ok(identity) => {
+                                    identities.set(vec![identity]);
+                                    vault_exists.set(true);
+                                    unlocked.set(true);
+                                    error.set(None);
+                                }
+                                Err(message) => error.set(Some(message))
+                            }
+                        }
+                    },
+                    "Créer le coffre et l'identité"
+                }
             }
         }
-        div { class: "section-title",
-            div { h2 { "Toutes les identités" } p { "Les identités seront stockées uniquement sur cet appareil." } }
-            button { class: "primary-button disabled", disabled: true, span { "+" } "Créer une identité" }
+        if let Some(message) = error() {
+            div { class: "error-banner", "{message}" }
         }
-        EmptyView { title: "Aucune identité pour le moment", detail: "La création sera activée avec le coffre chiffré et la génération réelle des clés." }
         div { class: "security-note",
             span { class: "lock-icon", "◇" }
-            span { strong { "La sécurité passe avant tout" } " · Les fonctionnalités cryptographiques restent désactivées tant que leur implémentation n'est pas disponible." }
+            span { strong { "Chiffrement local actif" } " · Les messages réseau et l'échange de clés ne sont pas disponibles dans cette version." }
         }
     }
+}
+
+fn vault_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "Le répertoire de données local Windows est indisponible.".to_string())?;
+    Ok(PathBuf::from(root).join("AKRAT").join("identities.vault"))
+}
+
+fn hex_public_key(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[component]

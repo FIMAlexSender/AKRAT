@@ -16,3 +16,5 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --release -p akrat-app
+      - run: cargo install cargo-audit --locked --version 0.23.0
+      - run: cargo audit

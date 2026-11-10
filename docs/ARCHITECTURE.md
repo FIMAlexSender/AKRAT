@@ -2,9 +2,9 @@
 
 ## Current implementation
 
-The Cargo workspace divides the application into six crates. `akrat-app` owns the Dioxus Desktop shell and depends on `akrat-core` for shared domain types. The other four crates are empty boundaries at this stage. There are no calls between the UI and cryptographic, networking, or storage backends because those backends do not exist yet.
+The Cargo workspace divides the application into six crates. `akrat-app` owns the Dioxus Desktop shell and identity vault flow. `akrat-core` owns identity domain types and private signing-key handling. The crypto crate creates Ed25519 identities using operating-system randomness, derives the identity ID and displayed fingerprint from SHA-256 of the public key, and verifies signatures. The storage crate serializes identity records into a bounded Argon2id-derived AES-256-GCM envelope and reads/writes vault files with a temporary-file rename. The interface connects these functions for first-time setup, multi-identity creation, locking, and unlocking. There is no protocol or network implementation.
 
-The initial core types distinguish an unknown peer, a known but unverified peer, and a manually verified peer. Local identity lifecycle states are represented separately. These are data types only; no trust decision or identity persistence logic is implemented.
+The core types distinguish an unknown peer, a known but unverified peer, and a manually verified peer. Local identity lifecycle states are represented separately. Private identity keys are not exposed by a key getter and are zeroized on drop. The vault uses Argon2id with 65,536 KiB memory, three iterations, and one lane, then AES-256-GCM; the parameters are fixed in vault version 1.
 
 ## Intended boundaries
 

@@ -1,4 +1,7 @@
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum IdentityTrust {
@@ -14,6 +17,26 @@ pub enum IdentityStatus {
     LocallyRevoked,
 }
 
+#[derive(Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+pub struct PrivateIdentity {
+    #[zeroize(skip)]
+    pub public: PublicIdentity,
+    signing_key: [u8; 32],
+}
+
+impl PrivateIdentity {
+    pub fn new(public: PublicIdentity, signing_key: Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            public,
+            signing_key: *signing_key,
+        }
+    }
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        let secret = Zeroizing::new(self.signing_key);
+        SigningKey::from_bytes(&secret).sign(message)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicIdentity {
     pub id: String,
@@ -21,6 +44,7 @@ pub struct PublicIdentity {
     pub public_key: Vec<u8>,
     pub fingerprint: String,
     pub status: IdentityStatus,
+    pub created_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

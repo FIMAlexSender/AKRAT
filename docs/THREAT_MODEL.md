@@ -12,8 +12,10 @@ No software can protect a user from a compromised endpoint while it is unlocked,
 
 ## Guarantees today
 
-None of the planned cryptographic or network guarantees are implemented. The current application has no identity keys, vault, message transport, session, or ciphertext. The UI indicates that these functions are unavailable. This repository is a development foundation and must not be used for sensitive communication.
+Identity creation, Ed25519 signatures, and encrypted vault file APIs are integrated into the Windows application. Vault files are protected by Argon2id and AES-256-GCM. A passphrase protects the records if someone reads the vault file, subject to the strength of that passphrase and the correctness of the implementation. There is no peer handshake, contact verification, message transport, session, or end-to-end message encryption. This application must not be used for messaging or sensitive communication.
 
 ## Security review required
 
 Before sensitive use, the chosen handshake construction, post-quantum implementation, persistence design, dependency set, and complete application require independent security review. Automated checks cannot establish cryptographic correctness.
+
+The current `cargo audit` report contains transitive warnings for three unmaintained crates and two unsoundness advisories in the Dioxus Desktop dependency graph. The Windows release build does not compile the GTK `glib` or `rand 0.7.3` dependency paths, but other platform builds may. The advisory output is retained in CI and is not suppressed.
