@@ -1,61 +1,71 @@
 # AKRAT
 
-AKRAT is an open source peer to peer messenger project. The repository currently contains a Rust workspace, a native desktop interface, Ed25519 identity management, and an encrypted local identity vault. An experimental hybrid handshake exists in a library, but the app has no listener, contact verification workflow, or message transport. The interface deliberately presents these capabilities as unavailable.
+AKRAT is an experimental peer-to-peer desktop messenger. Version 0.1.0 connects a Windows desktop interface to direct TCP sessions, invitation import/export, manual fingerprint verification, and encrypted local conversation history.
 
-## Current status
+## Current capabilities
 
 | Area | Status |
 | --- | --- |
-| Rust workspace and module boundaries | Implemented |
-| Dioxus Desktop shell | Implemented |
-| Identity and trust domain types | Implemented |
-| Ed25519 multi-identity creation and public fingerprints | Implemented in the desktop UI and `akrat-crypto` |
-| Argon2id and AES-256-GCM vault file API | Implemented and connected to the desktop UI |
-| Unlock, lock, and reopen local identities | Implemented |
-| Experimental authenticated hybrid session library | Implemented in `akrat-crypto`; not integrated into the desktop UI or network |
-| X25519 and ML-KEM-768 handshake | Experimental library only; ML-KEM implementation is unaudited |
-| Session AES-256-GCM message envelope | Implemented in the experimental crypto and network libraries; no app integration |
-| Direct TCP framing and hybrid handshake | Tested as a standalone library; not connected to the app |
-| Persistent conversations | Not implemented |
+| Windows Dioxus Desktop interface and encrypted vault | Implemented |
+| Multiple Ed25519 identities and locally labeled contacts | Implemented |
+| Versioned `akrat://v1/` invitation format with canonical encoding and validation | Implemented |
+| IPv4/IPv6 dual-stack TCP listener and outbound connection | Implemented; internet reachability depends on firewall, port forwarding, and NAT |
+| Manual fingerprint comparison and pinned identity key | Implemented; invitation contents alone do not verify a person |
+| Experimental X25519 + ML-KEM-768 authenticated handshake | Integrated into app, unaudited |
+| AES-256-GCM session messages, acknowledgements, bounded queues, replay ordering | Integrated; experimental protocol |
+| Encrypted local conversation history, deduplication, lock/reopen | Implemented |
+| Double Ratchet and post-compromise recovery | Not implemented; deferred |
+| Independent cryptographic audit and real internet deployment validation | Not completed |
 
-No cryptographic or network security claim should be inferred from this preview.
+Do not use this release for sensitive communications. The cryptographic construction, ML-KEM implementation, application integration, dependency tree, and Windows distribution need independent review. Direct TCP does not traverse all firewalls, NATs, or CGNAT configurations; AKRAT has no relay service.
 
-## Development
+## Build and run on Windows
 
-Requirements: stable Rust and the Windows desktop prerequisites for Dioxus Desktop, including the Microsoft C++ build tools and WebView2 runtime.
+Install stable Rust, Microsoft C++ build tools, and the WebView2 runtime. Then run:
 
 ```powershell
 cargo run -p akrat-app
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The interface uses system fonts and does not require an external service to start.
+Build a standalone Windows executable with:
 
-On Windows, the encrypted vault is stored at `%LOCALAPPDATA%\AKRAT\identities.vault`. New vault creation requires a passphrase of at least 12 characters; the storage library caps passphrases at 1024 bytes. The current vault format uses Argon2id (64 MiB, 3 passes, 1 lane) and AES-256-GCM with random 16-byte salt and 12-byte nonce. The storage library can encrypt identities, contacts, and conversation records; it is a local storage format, not the message protocol.
+```powershell
+cargo build --release -p akrat-app
+```
 
-## Project structure
+The executable is `target\release\akrat-app.exe`. It does not require Rust to run, but requires the Windows WebView2 runtime and system WebView dependencies. The vault is stored in `%LOCALAPPDATA%\AKRAT\identities.vault`.
 
-- `akrat-app` contains the Dioxus Desktop interface.
-- `akrat-core` contains shared identity and trust domain types.
-- `akrat-crypto` generates independent Ed25519 identities and signs/verifies messages.
-- `akrat-protocol` defines draft versioned handshake and message types plus bounded JSON encoding.
-- `akrat-network` provides direct TCP connect/listen, bounded framing, and an experimental handshake driver. It withholds access to the message cipher until the caller confirms the peer identity and is not wired to the UI.
-- `akrat-storage` encodes identity records in a versioned encrypted vault envelope and reads/writes vault files.
+## Two local application profiles
 
-The network crate can establish experimental encrypted sessions but has no app-level contact verification workflow or persistent messaging. It is not connected to the UI. Do not use it for sensitive messages. The Signal `libsignal` integration remains unavailable because of the previously documented API and licensing review.
+To launch two isolated copies on one Windows machine, build the app and run the helper from PowerShell 7.4 or later. It assigns separate local data directories. The listening copy can use port 49444; import its invitation into the second copy and compare fingerprints through an independent channel.
 
-## Security posture
+```powershell
+.\scripts\run-two-local-profiles.ps1
+```
 
-AKRAT is not suitable for sending messages in this state. Identity generation and local vault encryption are operational. An experimental hybrid handshake and encrypted TCP session exist in a library, but there is no contact verification workflow, conversation storage, or end-to-end message path in the desktop application. Review [the threat model](docs/THREAT_MODEL.md), [the architecture](docs/ARCHITECTURE.md), and [the protocol status](docs/PROTOCOL.md) before contributing to security-sensitive work.
+This validates two local processes only. For two separate computers, install/run the standalone executable on each, permit the chosen inbound TCP port in the host firewall, and configure router port forwarding where needed. Share the `akrat://` invitation through a trusted channel and verify its full fingerprint independently. CGNAT may prevent direct connections.
 
-`cargo audit` currently reports five transitive warnings: unmaintained `fxhash`, `paste`, and `proc-macro-error`, plus unsoundness advisories for `glib 0.18.5` and build dependency `rand 0.7.3`. They arrive through Dioxus Desktop's cross-platform Wry dependency tree. The `glib` and `rand 0.7.3` entries are not part of the Windows target build in this checkout, but affect other target dependency graphs. No advisory is suppressed; the dependency path needs follow-up as the desktop stack evolves.
+Create a portable Windows ZIP using `scripts\build-windows-package.ps1`. This environment does not have WiX, Inno Setup, or the Dioxus CLI, so it cannot generate or validate an MSI/installer. The ZIP contains the standalone executable, README, license, and security/architecture documents; it does not bundle WebView2.
 
-## Third-party protocol integration
+## Checks
 
-Signal's `libsignal` is currently distributed under AGPL-3.0-only and its repository does not offer a simple stable Rust library interface matching this desktop application's requirements. Any future adoption requires an explicit compatibility and maintenance review. No Double Ratchet guarantee is present today.
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --release -p akrat-app
+cargo audit
+```
+
+`cargo audit` currently reports five transitive advisories in the Dioxus desktop dependency graph. They are not suppressed; details and reachability are documented in [the security review](docs/SECURITY_REVIEW.md).
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Protocol status](docs/PROTOCOL.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Dependency and security review](docs/SECURITY_REVIEW.md)
 
 ## License
 
-This project is licensed under AGPL-3.0-only. See [LICENSE](LICENSE).
+AGPL-3.0-only. See [LICENSE](LICENSE).

@@ -11,5 +11,11 @@ dioxus-desktop = "0.7.10"
 akrat-core = { path = "../akrat-core" }
 akrat-crypto = { path = "../akrat-crypto" }
 akrat-storage = { path = "../akrat-storage" }
+akrat-protocol = { path = "../akrat-protocol" }
+akrat-network = { path = "../akrat-network" }
+tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true
+getrandom.workspace = true
 zeroize.workspace = true
 

@@ -2,20 +2,24 @@
 
 ## Intended adversary
 
-The design treats the network as hostile. A network adversary may observe, modify, delay, block, replay, or inject traffic. An IP address is a routing hint, not an identity. A first-seen identity must remain unverified until people compare a fingerprint over an independent channel. A changed key must not silently inherit a verified state.
+The network is hostile: an adversary may observe, delay, block, modify, replay, or inject traffic. An IP address is only a routing hint. A first-seen key remains unverified until the user compares the complete fingerprint over a trusted independent channel. A changed key is rejected instead of inheriting the stored trust decision.
 
-The project also intends to protect stored conversation content and identity private keys from someone who can read the local data files but does not know the vault secret.
+The encrypted vault is intended to protect identity private keys, contacts, and local conversation history from someone who can read the vault file but does not know the passphrase. It does not protect data while the app is unlocked from malware, a compromised operating system, memory inspection, screenshots, or another process with access to the user account.
 
-## Out of scope
+## Implemented behavior
 
-No software can protect a user from a compromised endpoint while it is unlocked, screen capture, coercion, malware with process access, or denial of service. Direct IP connectivity does not promise reachability through NATs or firewalls. Traffic analysis and metadata protection are not specified.
+The Windows app can create and select Ed25519 identities, import/export versioned invitations, listen and connect over TCP, require manual fingerprint verification on first contact, exchange encrypted session messages, and store conversation text in the encrypted local vault. Outgoing text is persisted before transport enqueue. Incoming text is authenticated, deduplicated and persisted before the application acknowledgement is sent. TCP write completion is labeled as transmission, not receipt. Acknowledgement state is persisted separately. After a disconnect or restart, pending/transmitted outgoing messages become unconfirmed and may be retried with the same ID. Session keys are not saved; reconnect performs a fresh handshake.
 
-## Guarantees today
+## Known limitations
 
-Identity creation, Ed25519 signatures, and encrypted vault file APIs are integrated into the Windows application. Vault files are protected by Argon2id and AES-256-GCM. A passphrase protects the records if someone reads the vault file, subject to the strength of that passphrase and the correctness of the implementation. Experimental handshake and session message encryption code exists in libraries with a localhost TCP integration test, but there is no app contact verification, conversation persistence, or message path in the UI. ML-KEM is implemented by a crate that has not been independently audited. This application must not be used for messaging or sensitive communication.
+The X25519 + ML-KEM-768 handshake, key schedule, session state machine, message actor, and application integration are experimental and have not received independent security review. The ML-KEM crate has no independent audit claim. No Double Ratchet or post-compromise recovery is implemented. Fresh keys per connection are not equivalent to a Double Ratchet. The protocol expects ordered TCP delivery and does not support offline messages, out-of-order delivery, or a relay.
 
-## Security review required
+Direct IP reachability depends on local firewall settings, router port forwarding, ISP policy, and NAT/CGNAT. AKRAT cannot guarantee connectivity between arbitrary computers. The UI stores plaintext message content only in the authenticated encrypted vault; text necessarily exists in process memory while displayed or sent. File and network denial-of-service risks remain subject to operational limits and review.
 
-Before sensitive use, the chosen handshake construction, post-quantum implementation, persistence design, dependency set, and complete application require independent security review. Automated checks cannot establish cryptographic correctness.
+## Dependency advisories
 
-The current `cargo audit` report contains transitive warnings for three unmaintained crates and two unsoundness advisories in the Dioxus Desktop dependency graph. The Windows release build does not compile the GTK `glib` or `rand 0.7.3` dependency paths, but other platform builds may. The advisory output is retained in CI and is not suppressed.
+`cargo audit` reports five transitive advisories in the desktop dependency graph. No advisory is ignored or allowed through an audit exception. Details and current target reachability are in [SECURITY_REVIEW.md](SECURITY_REVIEW.md). These findings do not establish a vulnerability in AKRAT's cryptographic message path, but they remain dependency maintenance and platform risks.
+
+## Release posture
+
+Do not use AKRAT 0.1.0 for sensitive communications. Independent cryptographic review, dependency remediation or documented acceptance, installer validation, and two-computer network testing remain necessary before a security-sensitive release.

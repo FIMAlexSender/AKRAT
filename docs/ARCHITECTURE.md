@@ -1,18 +1,17 @@
 # Architecture
 
-## Current implementation
+The workspace has six crates. `akrat-app` provides the Dioxus Desktop interface and coordinates identity selection, network events, contact trust decisions, messages, and vault persistence. `akrat-core` defines identities, contacts, conversations, message direction, and delivery state. `akrat-crypto` provides Ed25519 identity signatures and an experimental X25519 plus ML-KEM-768 handshake/session cipher. `akrat-protocol` defines invitation, handshake, frame, and session payload types. `akrat-network` provides dual-stack TCP listening, outbound connect, bounded JSON framing, handshake execution, and session actors. `akrat-storage` stores identities, contacts, conversations, and message text in an authenticated encrypted vault.
 
-The Cargo workspace divides the application into six crates. `akrat-app` owns the Dioxus Desktop shell and identity vault flow. `akrat-core` owns identity, contact, conversation, and private-signing-key types. The crypto crate creates Ed25519 identities using operating-system randomness, derives the identity ID and displayed fingerprint from SHA-256 of the public key, verifies signatures, and contains an experimental X25519 plus ML-KEM-768 session implementation. The protocol crate defines version 1 JSON structures with a 256 KiB frame cap. The network crate provides direct TCP connect/listen, length-prefixed JSON framing with a 30-second I/O deadline, and an experimental handshake driver. The storage crate serializes identity, contact, and conversation records into a bounded Argon2id-derived AES-256-GCM envelope and reads/writes vault files with a temporary-file rename. The interface connects identity and vault functions only; session, protocol, and network functions are not used by the app.
+## Application flow
 
-The core types distinguish an unknown peer, a known but unverified peer, and a manually verified peer. Local identity lifecycle states are represented separately. Conversation records bind a history to one local identity and one remote contact. Private identity keys are not exposed by a key getter and are zeroized on drop. The vault uses Argon2id with 65,536 KiB memory, three iterations, and one lane, then AES-256-GCM; the parameters are fixed in vault version 1.
+The user unlocks a vault and selects a local identity. An invitation is parsed and validated before its contact record is saved as known but unverified, or as manually verified only after the user enters the matching complete fingerprint. Outbound connections pin the expected contact key during handshake. Inbound peers remain pending and do not open a message session until the user verifies the full fingerprint and the handshake identity matches that key. A changed key is rejected and cannot replace the stored contact key.
 
-## Intended boundaries
+Each conversation is keyed by a local identity and a remote contact. The session actor handles encrypted text and acknowledgements over a single reliable TCP stream. The app persists outgoing text before enqueueing it, persists incoming text before acknowledging it, and deduplicates message IDs in the encrypted vault. TCP transmission is not treated as application receipt. Unacknowledged messages are marked uncertain after disconnection or restart and can be retried with the same ID. Session keys are ephemeral and are not stored; a reconnect performs a fresh handshake.
 
-- `akrat-core`: identity, contact, and conversation domain models and application-level interfaces.
-- `akrat-crypto`: identity key handling, authenticated hybrid key establishment, key derivation, and authenticated encryption.
-- `akrat-protocol`: bounded, versioned wire messages independent of the transport.
-- `akrat-network`: direct TCP connections, framing, and deadlines. It drives the experimental handshake and returns an `UnverifiedSession` whose API withholds the message cipher until the caller confirms the expected peer identity ID and public key. It must handle ciphertext only after that transition. Current primitives do not include conversation multiplexing, persistence, or a message queue.
-- `akrat-storage`: encrypted local records and transactional persistence.
-- `akrat-app`: user interaction and explicit presentation of trust and connection states.
+The vault file uses Argon2id (64 MiB, three passes, one lane) and AES-256-GCM. Unlock derives a key kept in memory for subsequent writes; each write uses a fresh random nonce and the vault format's fixed salt until the next unlock. The in-memory key is discarded when locking. Vault updates use a temporary file, flush the file, then rename it into place.
 
-Future implementations must define and review their protocol before enabling message sending. UI states must come from real backend results, never canned demo data.
+## Limits
+
+The TCP protocol is experimental and not yet an interoperability specification. IPv4 and IPv6 dual-stack listening is attempted with a dual-stack IPv6 socket; actual route availability is operating-system and network dependent. The app has no relay, NAT traversal, or guaranteed firewall configuration. Inbound listener identity is fixed when listening starts; outbound sessions use the currently selected identity. The UI runs persistence operations synchronously and may briefly pause during larger vault rewrites.
+
+The session actor expects reliable, ordered TCP delivery and rejects sequence gaps or replays. Message acknowledgements are application events; there is no durable server-side queue. There is no Double Ratchet, skipped-message key handling, forward secrecy between messages, or post-compromise recovery beyond fresh keys on reconnect.

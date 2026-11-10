@@ -18,3 +18,10 @@ jobs:
       - run: cargo build --release -p akrat-app
       - run: cargo install cargo-audit --locked --version 0.23.0
       - run: cargo audit
+      - run: pwsh ./scripts/build-windows-package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AKRAT-0.1.0-windows-x64
+          path: dist/AKRAT-0.1.0-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

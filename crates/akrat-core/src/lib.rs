@@ -53,6 +53,7 @@ pub struct Contact {
     pub display_name: String,
     pub public_key: Vec<u8>,
     pub fingerprint: String,
+    pub addresses: Vec<String>,
     pub trust: IdentityTrust,
     pub blocked: bool,
     pub created_at_unix: u64,
@@ -69,7 +70,10 @@ pub enum MessageDirection {
 pub enum MessageDelivery {
     Pending,
     Transmitted,
+    Acknowledged,
     Received,
+    Failed,
+    Unconfirmed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
