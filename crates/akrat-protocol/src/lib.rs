@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::net::SocketAddr;
 
-pub const VERSION: u16 = 1;
-pub const SUITE: &str = "AKRAT_X25519_MLKEM768_HKDFSHA256_ED25519_AES256GCM_V1";
+pub const VERSION: u16 = 2;
+pub const SUITE: &str = "AKRAT_X25519_MLKEM768_HKDFSHA256_ED25519_AES256GCM_V2";
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 
 const INVITATION_PREFIX: &str = "akrat://v1/";
@@ -151,6 +151,7 @@ impl Invitation {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     pub version: u16,
     pub suite: String,
@@ -163,6 +164,7 @@ pub struct Hello {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     pub version: u16,
     pub suite: String,
@@ -176,6 +178,7 @@ pub struct Response {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finish {
     pub session_id: Vec<u8>,
     pub authenticator: Vec<u8>,
@@ -191,6 +194,7 @@ pub enum HandshakeFrame {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedMessage {
     pub session_id: Vec<u8>,
     pub sender_id: String,
@@ -235,7 +239,11 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Fra
 
 #[cfg(test)]
 mod tests {
-    use super::{EncryptedMessage, FrameError, decode_frame, encode_frame};
+    use super::{
+        EncryptedMessage, FrameError, HandshakeFrame, Invitation, SessionPayload, decode_frame,
+        encode_frame,
+    };
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 
     #[test]
     fn message_frame_round_trip() {
@@ -261,6 +269,26 @@ mod tests {
             decode_frame::<EncryptedMessage>(&oversized),
             Err(FrameError::TooLarge)
         ));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(0x414b_5241_545f_5632),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_frame_bytes_never_panic(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let _ = decode_frame::<EncryptedMessage>(&bytes);
+            let _ = decode_frame::<HandshakeFrame>(&bytes);
+            let _ = decode_frame::<SessionPayload>(&bytes);
+        }
+
+        #[test]
+        fn arbitrary_invitation_text_never_panics(uri in ".{0,8192}") {
+            let _ = Invitation::from_uri(&uri);
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use akrat_core::PrivateIdentity;
-use akrat_crypto::session::{Session, SessionError, respond_to_handshake, start_handshake};
+use akrat_crypto::session::{
+    Session, SessionEngine, SessionError, respond_to_handshake, start_handshake,
+};
 use akrat_protocol::{
     EncryptedMessage, FrameError, HandshakeFrame, MAX_FRAME_SIZE, SessionPayload, decode_frame,
     encode_frame,
@@ -23,7 +25,7 @@ pub enum NetworkError {
     Io(#[from] std::io::Error),
     #[error("protocol frame is invalid")]
     Frame(#[from] FrameError),
-    #[error("cryptographic handshake failed")]
+    #[error("cryptographic handshake failed: {0}")]
     Handshake(#[from] SessionError),
     #[error("unexpected protocol message")]
     UnexpectedMessage,
@@ -329,7 +331,7 @@ where
 
 pub fn start_message_session(
     stream: std::net::TcpStream,
-    session: Session,
+    session: impl SessionEngine + 'static,
 ) -> (SessionHandle, mpsc::Receiver<SessionEvent>) {
     let (command_tx, command_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(64);
@@ -361,9 +363,9 @@ pub fn start_message_session(
     )
 }
 
-async fn run_message_session(
+async fn run_message_session<S: SessionEngine>(
     stream: TcpStream,
-    mut session: Session,
+    mut session: S,
     mut commands: mpsc::Receiver<SessionCommand>,
     events: mpsc::Sender<SessionEvent>,
 ) {
@@ -483,10 +485,11 @@ async fn run_message_session(
             }
         }
     }
+    session.close();
 }
 
-fn encrypt_payload(
-    session: &mut Session,
+fn encrypt_payload<S: SessionEngine>(
+    session: &mut S,
     payload: &SessionPayload,
 ) -> Result<EncryptedMessage, NetworkError> {
     let plaintext = serde_json::to_vec(payload).map_err(|_| NetworkError::InvalidPayload)?;
@@ -662,7 +665,10 @@ mod tests {
                 .verify_peer_identity(&alice_id, &alice_key)
                 .expect("peer identity confirmation");
             let incoming: EncryptedMessage = receive_frame(&mut stream).await.expect("frame");
-            assert_eq!(session.decrypt(&incoming).expect("decrypt"), b"hello Bob");
+            assert_eq!(
+                session.decrypt(&incoming).expect("decrypt").as_slice(),
+                b"hello Bob"
+            );
             let reply = session.encrypt(b"hello Alice").expect("encrypt");
             send_frame(&mut stream, &reply).await.expect("reply");
         });
@@ -676,7 +682,10 @@ mod tests {
         let outgoing = session.encrypt(b"hello Bob").expect("encrypt");
         send_frame(&mut stream, &outgoing).await.expect("send");
         let reply: EncryptedMessage = receive_frame(&mut stream).await.expect("reply");
-        assert_eq!(session.decrypt(&reply).expect("decrypt"), b"hello Alice");
+        assert_eq!(
+            session.decrypt(&reply).expect("decrypt").as_slice(),
+            b"hello Alice"
+        );
         server.await.expect("server task");
     }
 

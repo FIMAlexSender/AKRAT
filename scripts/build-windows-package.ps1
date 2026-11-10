@@ -10,8 +10,8 @@ try {
     Pop-Location
 }
 
-$packageRoot = Join-Path $repo 'dist\AKRAT-0.1.1-windows-x64'
-$archive = Join-Path $repo 'dist\AKRAT-0.1.1-windows-x64.zip'
+$packageRoot = Join-Path $repo 'dist\AKRAT-0.1.2-windows-x64'
+$archive = Join-Path $repo 'dist\AKRAT-0.1.2-windows-x64.zip'
 New-Item -ItemType Directory -Force $packageRoot | Out-Null
 Copy-Item (Join-Path $repo 'target\release\akrat-app.exe') $packageRoot -Force
 Copy-Item (Join-Path $repo 'README.md') $packageRoot -Force

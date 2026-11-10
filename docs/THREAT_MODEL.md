@@ -22,4 +22,4 @@ Direct IP reachability depends on local firewall settings, router port forwardin
 
 ## Release posture
 
-Do not use AKRAT 0.1.1 for sensitive communications. Independent cryptographic review, dependency remediation or documented acceptance, installer validation, and two-computer network testing remain necessary before a security-sensitive release.
+Do not use AKRAT 0.1.2 for sensitive communications. Independent cryptographic review, dependency remediation or documented acceptance, installer validation, and two-computer network testing remain necessary before a security-sensitive release.

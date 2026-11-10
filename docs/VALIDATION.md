@@ -1,4 +1,4 @@
-# Validation for v0.1.1
+# Validation for v0.1.2
 
 ## Automated checks
 
@@ -13,30 +13,26 @@ cargo audit
 pwsh ./scripts/build-windows-package.ps1
 ```
 
-The workspace tests cover trust-state distinctions, handshake key pinning, tampered ciphertext, sequence ordering, bounded framing, the 10 KiB worst-case control-character payload, localhost bidirectional TCP exchange, and independent encrypted vaults. The vault integration test sends messages both ways, reconnects with fresh session keys, resends the same logical message ID, confirms recipient deduplication, and reopens both vaults.
+The workspace test run retains all 27 v0.1.1 tests and adds handshake V2 signature/transcript and downgrade failures, nonces/sequences, out-of-order and replay rejection, key clearing on close, stale-message rejection after a new handshake, and the fresh-handshake recovery policy. The protocol parser tests use fixed-seed `proptest` cases for arbitrary length-bounded frame bytes, handshake/message frames, session payloads, and invitation text. Size caps are enforced before parsing or allocation.
 
-In the v0.1.1 manual Windows run, two independently configured profiles were opened from the portable ZIP with Rust tool directories removed from `PATH`. The native **Copier l'invitation** action was pasted into the other instance and validated. The receiving instance displayed the complete incoming fingerprint; after comparison with the initiating profile, confirmation created a manually verified contact and opened the channel. A message in each direction appeared as **Reçu et authentifié** and **Reçu et confirmé par le pair**. Closing the initiating window left the other profile offline with both messages visible in its local history. Both windows were then closed. The GUI was not relaunched after that full close in this run; vault reopen is covered by the integration test above.
+`cargo fuzz` is not installed in the Windows environment. No libFuzzer run is claimed. The proptest parser checks are repeatable property tests with 256 fixed-seed cases per property; they are not a substitute for sustained coverage-guided fuzzing or an external security review.
 
-The protocol uses an encrypted JSON vault, not SQLite. Atomic replacement and authenticated decryption are tested; SQLite transactions do not apply. The tests do not inject a process kill at each instruction boundary around socket writes and acknowledgement persistence. Their crash-recovery guarantee is therefore reasoned from persisted states and the retry/deduplication tests, not demonstrated by exhaustive fault injection.
+The two-vault localhost integration test still covers bidirectional message delivery, fresh handshake after reconnect, retry with the same logical ID, receiver deduplication, and reopening both encrypted JSON vaults. The 0.1.2 source-level V2 protocol runs in this integration test. It is not a two-computer network test.
 
-## Two-profile GUI scenario
+## Session recovery boundaries
 
-Launch two independent application instances with distinct `LOCALAPPDATA` values:
+No session key, nonce counter, or Ratchet state is serialized. A live session cannot be restored; after failure or process restart the app must establish a new authenticated V2 session. The tests check that an old session's ciphertext is rejected after a new handshake and that closing a session zeroizes its directional keys. There is no process-kill injection at every instruction or filesystem boundary. The precise state/receipt analysis and its limitations are in [SESSION_DESIGN.md](SESSION_DESIGN.md).
 
-```powershell
-pwsh ./scripts/run-two-local-profiles.ps1
-```
+The vault is an encrypted JSON document, not SQLite. Atomic replacement and authenticated decryption are tested; SQLite transactions do not apply. Crash recovery around network writes and acknowledgements is covered through logical retry/deduplication and vault-reopen integration, not exhaustive power-loss injection.
 
-In the first window, create a vault and identity, go to **Connexion**, start TCP listening, choose the detected private IPv4 address, create and copy an invitation. In the second window, create a separate vault and identity, paste and validate the invitation, compare the displayed full fingerprint against the first window through an independent channel, mark the contact as verified, and connect. Exchange one message in each direction, disconnect, reconnect, retry an unconfirmed message, then close and reopen each vault to confirm the conversations remain.
+## Graphical and physical network checks
 
-This scenario validates two app processes on one Windows computer and loopback/local-host routing only. It does not prove connectivity between two physical computers. The current stylesheet contains one dark theme; no second theme or theme switch is implemented in v0.1.1.
+The complete two-profile GUI workflow (independent vaults, invitation copy/import, fingerprint comparison, bidirectional exchange and offline history after closing one window) was manually run with v0.1.1. The v0.1.2 changes its handshake transcript and session engine; the GUI has not yet been manually re-run against two v0.1.2 instances. The current automated TCP integration uses the v0.1.2 code. Only one dark theme exists.
 
-## Physical network checks
+For a LAN check, use two separate computers on the same trusted network. Start listening on the receiving computer, import the invitation on the sender, compare the full fingerprint through an independent channel, verify and connect. Then repeat in the opposite direction. A localhost test does not demonstrate physical LAN reachability.
 
-For a LAN check, use two separate computers on the same trusted network. On the receiving computer, allow the chosen inbound TCP port on its private network profile and start listening. Put its LAN address and port into the invitation. Import it on the sending computer, compare the complete identity fingerprint using a separate trusted channel, verify the contact, and connect. Repeat in the opposite direction with the roles reversed.
-
-For an Internet check, first confirm the LAN case. Then configure an inbound port-forward on the receiving router or use a globally reachable IPv6 address with a matching firewall rule. Share the advertised public address and port, and attempt the connection from a separate network such as a mobile hotspot. Record the router, firewall profile, address family, and whether the ISP uses CGNAT. A successful local test is not evidence of Internet reachability.
+For an Internet check, first confirm the LAN case. Then configure inbound port forwarding or a globally reachable IPv6 address and matching firewall rule, and attempt from a separate network. Record address family, router and firewall configuration, and CGNAT status. No Internet reachability is implied by local tests.
 
 ## Portable ZIP
 
-The archive contains `akrat-app.exe` and documentation; it does not bundle Rust or WebView2. Install the Microsoft Edge WebView2 Runtime on the target computer. The ZIP launch check must be performed with Rust tool directories removed from `PATH`; an installed WebView2 runtime remains an operating-system prerequisite.
+The archive contains `akrat-app.exe` and documentation; it does not bundle Rust or WebView2. Install the Microsoft Edge WebView2 Runtime on the target computer. The launch check should use a `PATH` without Rust tool directories; WebView2 remains an operating-system prerequisite.

@@ -1,6 +1,6 @@
 # AKRAT
 
-AKRAT is an experimental peer-to-peer desktop messenger. Version 0.1.1 connects a Windows desktop interface to direct TCP sessions, invitation import/export, manual fingerprint verification, and encrypted local conversation history.
+AKRAT is an experimental peer-to-peer desktop messenger. Version 0.1.2 connects a Windows desktop interface to direct TCP sessions, invitation import/export, manual fingerprint verification, and encrypted local conversation history. The session protocol has an explicit V2 suite and still has no per-message ratchet.
 
 ## Current capabilities
 
@@ -66,6 +66,7 @@ cargo audit
 - [Threat model](docs/THREAT_MODEL.md)
 - [Dependency and security review](docs/SECURITY_REVIEW.md)
 - [Validation procedure and limits](docs/VALIDATION.md)
+- [Session architecture and Ratchet decision](docs/SESSION_DESIGN.md)
 
 ## License
 

@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_PLAINTEXT_SIZE: usize = 64 * 1024;
 const MAX_SEQUENCE: u64 = u64::MAX - 1;
@@ -21,6 +21,8 @@ const MAX_SEQUENCE: u64 = u64::MAX - 1;
 pub enum SessionError {
     #[error("handshake parameters are unsupported")]
     Parameters,
+    #[error("protocol version or cryptographic suite is unsupported")]
+    UnsupportedProtocol,
     #[error("peer identity is invalid")]
     Identity,
     #[error("handshake signature is invalid")]
@@ -41,6 +43,8 @@ pub enum SessionError {
     Authentication,
     #[error("session sequence space is exhausted")]
     Exhausted,
+    #[error("session is closed")]
+    Closed,
 }
 
 impl From<IdentityError> for SessionError {
@@ -72,6 +76,20 @@ pub struct Session {
     receive_key: Zeroizing<[u8; 32]>,
     send_sequence: u64,
     receive_sequence: u64,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRecoveryPolicy {
+    FreshAuthenticatedHandshakeRequired,
+}
+
+pub trait SessionEngine: Send {
+    fn session_id(&self) -> &[u8; 16];
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedMessage, SessionError>;
+    fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Zeroizing<Vec<u8>>, SessionError>;
+    fn recovery_policy(&self) -> SessionRecoveryPolicy;
+    fn close(&mut self);
 }
 
 struct SessionKeys {
@@ -94,6 +112,7 @@ struct HelloSigning<'a> {
 
 #[derive(Serialize)]
 struct ResponseCore<'a> {
+    domain: &'static str,
     version: u16,
     suite: &'a str,
     identity_id: &'a str,
@@ -113,7 +132,9 @@ struct FinishSigning<'a> {
 
 #[derive(Serialize)]
 struct MessageAad<'a> {
+    domain: &'static str,
     version: u16,
+    suite: &'static str,
     session_id: &'a [u8],
     sender_id: &'a str,
     recipient_id: &'a str,
@@ -340,6 +361,7 @@ impl Session {
             receive_key,
             send_sequence: 0,
             receive_sequence: 0,
+            closed: false,
         }
     }
 
@@ -348,6 +370,9 @@ impl Session {
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedMessage, SessionError> {
+        if self.closed {
+            return Err(SessionError::Closed);
+        }
         if plaintext.len() > MAX_PLAINTEXT_SIZE {
             return Err(SessionError::TooLarge);
         }
@@ -389,7 +414,13 @@ impl Session {
         })
     }
 
-    pub fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Vec<u8>, SessionError> {
+    pub fn decrypt(
+        &mut self,
+        message: &EncryptedMessage,
+    ) -> Result<Zeroizing<Vec<u8>>, SessionError> {
+        if self.closed {
+            return Err(SessionError::Closed);
+        }
         if message.session_id != self.session_id
             || message.sender_id != self.remote_identity_id
             || message.recipient_id != self.local_identity_id
@@ -428,14 +459,43 @@ impl Session {
             .receive_sequence
             .checked_add(1)
             .ok_or(SessionError::Exhausted)?;
-        Ok(plaintext.to_vec())
+        Ok(plaintext)
+    }
+
+    pub fn close(&mut self) {
+        self.send_key.zeroize();
+        self.receive_key.zeroize();
+        self.closed = true;
+    }
+}
+
+impl SessionEngine for Session {
+    fn session_id(&self) -> &[u8; 16] {
+        Session::session_id(self)
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedMessage, SessionError> {
+        Session::encrypt(self, plaintext)
+    }
+
+    fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Zeroizing<Vec<u8>>, SessionError> {
+        Session::decrypt(self, message)
+    }
+
+    fn recovery_policy(&self) -> SessionRecoveryPolicy {
+        SessionRecoveryPolicy::FreshAuthenticatedHandshakeRequired
+    }
+
+    fn close(&mut self) {
+        Session::close(self);
     }
 }
 
 fn validate_hello(hello: &Hello) -> Result<(), SessionError> {
-    if hello.version != VERSION
-        || hello.suite != SUITE
-        || hello.nonce.len() != 32
+    if hello.version != VERSION || hello.suite != SUITE {
+        return Err(SessionError::UnsupportedProtocol);
+    }
+    if hello.nonce.len() != 32
         || hello.x25519_public_key.len() != 32
         || hello.signing_public_key.len() != 32
         || hello.signature.len() != 64
@@ -448,9 +508,10 @@ fn validate_hello(hello: &Hello) -> Result<(), SessionError> {
 }
 
 fn validate_response(response: &Response) -> Result<(), SessionError> {
-    if response.version != VERSION
-        || response.suite != SUITE
-        || response.nonce.len() != 32
+    if response.version != VERSION || response.suite != SUITE {
+        return Err(SessionError::UnsupportedProtocol);
+    }
+    if response.nonce.len() != 32
         || response.x25519_public_key.len() != 32
         || response.signing_public_key.len() != 32
         || response.signature.len() != 64
@@ -469,7 +530,7 @@ fn identity_id_matches(identity_id: &str, public_key: &[u8]) -> bool {
 
 fn hello_signing_bytes(hello: &Hello) -> Result<Vec<u8>, SessionError> {
     serde_json::to_vec(&HelloSigning {
-        domain: "AKRAT-HANDSHAKE-HELLO-V1",
+        domain: "AKRAT-HANDSHAKE-HELLO-V2",
         version: hello.version,
         suite: &hello.suite,
         identity_id: &hello.identity_id,
@@ -483,6 +544,7 @@ fn hello_signing_bytes(hello: &Hello) -> Result<Vec<u8>, SessionError> {
 
 fn response_core_bytes(response: &Response) -> Result<Vec<u8>, SessionError> {
     serde_json::to_vec(&ResponseCore {
+        domain: "AKRAT-HANDSHAKE-RESPONSE-V2",
         version: response.version,
         suite: &response.suite,
         identity_id: &response.identity_id,
@@ -497,15 +559,20 @@ fn response_core_bytes(response: &Response) -> Result<Vec<u8>, SessionError> {
 fn transcript_hash(hello: &Hello, response: &Response) -> Result<[u8; 32], SessionError> {
     let hello = hello_signing_bytes(hello)?;
     let response = response_core_bytes(response)?;
-    let mut transcript = Vec::with_capacity(hello.len() + response.len() + 1);
-    transcript.extend_from_slice(&hello);
+    let mut transcript = Vec::with_capacity(40 + hello.len() + response.len());
+    transcript.extend_from_slice(b"AKRAT-HANDSHAKE-TRANSCRIPT-V2");
     transcript.push(0);
+    transcript.push(b'I');
+    transcript.extend_from_slice(&(hello.len() as u32).to_be_bytes());
+    transcript.extend_from_slice(&hello);
+    transcript.push(b'R');
+    transcript.extend_from_slice(&(response.len() as u32).to_be_bytes());
     transcript.extend_from_slice(&response);
     Ok(Sha256::digest(transcript).into())
 }
 
 fn response_signature_bytes(transcript_hash: &[u8; 32], confirmation: &[u8]) -> Vec<u8> {
-    let mut bytes = b"AKRAT-RESPONSE-SIGNATURE-V1".to_vec();
+    let mut bytes = b"AKRAT-RESPONSE-SIGNATURE-V2".to_vec();
     bytes.extend_from_slice(transcript_hash);
     bytes.extend_from_slice(confirmation);
     bytes
@@ -517,7 +584,7 @@ fn finish_signing_bytes(
     authenticator: &[u8],
 ) -> Result<Vec<u8>, SessionError> {
     serde_json::to_vec(&FinishSigning {
-        domain: "AKRAT-HANDSHAKE-FINISH-V1",
+        domain: "AKRAT-HANDSHAKE-FINISH-V2",
         transcript_hash,
         session_id,
         authenticator,
@@ -530,19 +597,30 @@ fn derive_session_keys(
     x25519_shared: &[u8],
     mlkem_shared: &[u8],
 ) -> Result<SessionKeys, SessionError> {
-    let mut ikm = Zeroizing::new(Vec::with_capacity(x25519_shared.len() + mlkem_shared.len()));
+    let mut ikm = Zeroizing::new(Vec::with_capacity(
+        40 + x25519_shared.len() + mlkem_shared.len(),
+    ));
+    ikm.extend_from_slice(b"AKRAT-HYBRID-IKM-V2");
+    ikm.extend_from_slice(&(x25519_shared.len() as u16).to_be_bytes());
     ikm.extend_from_slice(x25519_shared);
+    ikm.extend_from_slice(&(mlkem_shared.len() as u16).to_be_bytes());
     ikm.extend_from_slice(mlkem_shared);
     let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), ikm.as_slice());
-    let mut output = Zeroizing::new([0u8; 80]);
-    hkdf.expand(b"AKRAT-HYBRID-SESSION-KEYS-V1", output.as_mut())
-        .map_err(|_| SessionError::KeyMaterial)?;
     let mut session_id = [0u8; 16];
     let mut initiator_to_responder = Zeroizing::new([0u8; 32]);
     let mut responder_to_initiator = Zeroizing::new([0u8; 32]);
-    session_id.copy_from_slice(&output[..16]);
-    initiator_to_responder.copy_from_slice(&output[16..48]);
-    responder_to_initiator.copy_from_slice(&output[48..80]);
+    hkdf.expand(b"AKRAT-V2-SESSION-ID", &mut session_id)
+        .map_err(|_| SessionError::KeyMaterial)?;
+    hkdf.expand(
+        b"AKRAT-V2-INITIATOR-TO-RESPONDER-AES-256-GCM",
+        initiator_to_responder.as_mut(),
+    )
+    .map_err(|_| SessionError::KeyMaterial)?;
+    hkdf.expand(
+        b"AKRAT-V2-RESPONDER-TO-INITIATOR-AES-256-GCM",
+        responder_to_initiator.as_mut(),
+    )
+    .map_err(|_| SessionError::KeyMaterial)?;
     Ok(SessionKeys {
         session_id,
         initiator_to_responder,
@@ -553,7 +631,7 @@ fn derive_session_keys(
 fn confirmation_tag(key: &[u8; 32], transcript_hash: &[u8; 32], role: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(key)
         .expect("HMAC accepts a 32-byte key");
-    mac.update(b"AKRAT-KEY-CONFIRMATION-V1");
+    mac.update(b"AKRAT-KEY-CONFIRMATION-V2");
     mac.update(transcript_hash);
     mac.update(role);
     mac.finalize().into_bytes().to_vec()
@@ -568,7 +646,7 @@ fn verify_confirmation(
     let Ok(mut mac) = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(key) else {
         return false;
     };
-    mac.update(b"AKRAT-KEY-CONFIRMATION-V1");
+    mac.update(b"AKRAT-KEY-CONFIRMATION-V2");
     mac.update(transcript_hash);
     mac.update(role);
     mac.verify_slice(tag).is_ok()
@@ -588,7 +666,9 @@ fn message_aad(
     sequence: u64,
 ) -> Result<Vec<u8>, SessionError> {
     serde_json::to_vec(&MessageAad {
+        domain: "AKRAT-MESSAGE-AAD-V2",
         version: VERSION,
+        suite: SUITE,
         session_id,
         sender_id,
         recipient_id,
@@ -599,7 +679,9 @@ fn message_aad(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionError, respond_to_handshake, start_handshake};
+    use super::{
+        SessionEngine, SessionError, SessionRecoveryPolicy, respond_to_handshake, start_handshake,
+    };
     use crate::create_identity;
 
     #[test]
@@ -620,7 +702,7 @@ mod tests {
             .encrypt(b"message from Alice")
             .expect("encrypt");
         assert_eq!(
-            bob_session.decrypt(&first).expect("decrypt"),
+            bob_session.decrypt(&first).expect("decrypt").as_slice(),
             b"message from Alice"
         );
         assert!(matches!(
@@ -646,7 +728,7 @@ mod tests {
 
         let reply = bob_session.encrypt(b"message from Bob").expect("encrypt");
         assert_eq!(
-            alice_session.decrypt(&reply).expect("decrypt"),
+            alice_session.decrypt(&reply).expect("decrypt").as_slice(),
             b"message from Bob"
         );
     }
@@ -685,7 +767,10 @@ mod tests {
             bob_session.decrypt(&tampered),
             Err(SessionError::Authentication)
         ));
-        assert_eq!(bob_session.decrypt(&message).expect("decrypt"), b"private");
+        assert_eq!(
+            bob_session.decrypt(&message).expect("decrypt").as_slice(),
+            b"private"
+        );
         assert!(matches!(
             bob_session.decrypt(&message),
             Err(SessionError::Sequence)
@@ -701,5 +786,125 @@ mod tests {
             super::respond_to_handshake(&create_identity("Bob".to_string()).expect("Bob"), &hello),
             Err(SessionError::Signature)
         ));
+    }
+
+    #[test]
+    fn response_transcript_modification_and_invalid_signature_are_rejected() {
+        let alice = create_identity("Alice".to_string()).expect("Alice identity");
+        let bob = create_identity("Bob".to_string()).expect("Bob identity");
+        let (hello, alice_pending) = start_handshake(&alice).expect("hello");
+        let (mut response, _) = respond_to_handshake(&bob, &hello).expect("response");
+        response.nonce[0] ^= 1;
+
+        assert!(matches!(
+            alice_pending.complete(&alice, &response, Some(&bob.public.public_key)),
+            Err(SessionError::Signature)
+        ));
+
+        let (hello, alice_pending) = start_handshake(&alice).expect("hello");
+        let (mut response, _) = respond_to_handshake(&bob, &hello).expect("response");
+        response.signature[0] ^= 1;
+
+        assert!(matches!(
+            alice_pending.complete(&alice, &response, Some(&bob.public.public_key)),
+            Err(SessionError::Signature)
+        ));
+    }
+
+    #[test]
+    fn protocol_downgrade_is_rejected_without_fallback() {
+        let alice = create_identity("Alice".to_string()).expect("Alice identity");
+        let (mut hello, _) = start_handshake(&alice).expect("hello");
+        hello.version = 1;
+
+        assert!(matches!(
+            respond_to_handshake(&create_identity("Bob".to_string()).expect("Bob"), &hello),
+            Err(SessionError::UnsupportedProtocol)
+        ));
+    }
+
+    #[test]
+    fn messages_must_arrive_in_order_and_bad_metadata_does_not_advance_state() {
+        let alice = create_identity("Alice".to_string()).expect("Alice identity");
+        let bob = create_identity("Bob".to_string()).expect("Bob identity");
+        let (hello, alice_pending) = start_handshake(&alice).expect("hello");
+        let (response, bob_pending) = respond_to_handshake(&bob, &hello).expect("response");
+        let (finish, mut alice_session) = alice_pending
+            .complete(&alice, &response, Some(&bob.public.public_key))
+            .expect("initiator completion");
+        let mut bob_session = bob_pending
+            .accept_finish(&finish)
+            .expect("responder completion");
+        let first = alice_session.encrypt(b"first").expect("first message");
+        let second = alice_session.encrypt(b"second").expect("second message");
+        let mut invalid_nonce = first.clone();
+        invalid_nonce.nonce[0] ^= 1;
+
+        assert!(matches!(
+            bob_session.decrypt(&invalid_nonce),
+            Err(SessionError::Sequence)
+        ));
+        assert!(matches!(
+            bob_session.decrypt(&second),
+            Err(SessionError::Sequence)
+        ));
+        assert_eq!(
+            bob_session.decrypt(&first).expect("first").as_slice(),
+            b"first"
+        );
+        assert_eq!(
+            bob_session.decrypt(&second).expect("second").as_slice(),
+            b"second"
+        );
+        assert!(matches!(
+            bob_session.decrypt(&first),
+            Err(SessionError::Sequence)
+        ));
+    }
+
+    #[test]
+    fn interrupted_session_is_not_restorable_and_old_messages_fail_after_rehandshake() {
+        let alice = create_identity("Alice".to_string()).expect("Alice identity");
+        let bob = create_identity("Bob".to_string()).expect("Bob identity");
+        let (hello, alice_pending) = start_handshake(&alice).expect("hello");
+        let (response, bob_pending) = respond_to_handshake(&bob, &hello).expect("response");
+        let (finish, mut alice_session) = alice_pending
+            .complete(&alice, &response, Some(&bob.public.public_key))
+            .expect("initiator completion");
+        let bob_session = bob_pending
+            .accept_finish(&finish)
+            .expect("responder completion");
+        let old_message = alice_session
+            .encrypt(b"before interruption")
+            .expect("encrypt");
+        let old_session_id = *alice_session.session_id();
+
+        assert_eq!(
+            alice_session.recovery_policy(),
+            SessionRecoveryPolicy::FreshAuthenticatedHandshakeRequired
+        );
+        alice_session.close();
+        assert!(matches!(
+            alice_session.encrypt(b"after close"),
+            Err(SessionError::Closed)
+        ));
+        assert!(alice_session.send_key.iter().all(|byte| *byte == 0));
+        assert!(alice_session.receive_key.iter().all(|byte| *byte == 0));
+
+        let (hello, alice_pending) = start_handshake(&alice).expect("new hello");
+        let (response, bob_pending) = respond_to_handshake(&bob, &hello).expect("new response");
+        let (finish, new_alice_session) = alice_pending
+            .complete(&alice, &response, Some(&bob.public.public_key))
+            .expect("new initiator completion");
+        let mut new_bob_session = bob_pending
+            .accept_finish(&finish)
+            .expect("new responder completion");
+
+        assert_ne!(new_alice_session.session_id(), &old_session_id);
+        assert!(matches!(
+            new_bob_session.decrypt(&old_message),
+            Err(SessionError::Sequence)
+        ));
+        assert_eq!(bob_session.session_id(), &old_session_id);
     }
 }

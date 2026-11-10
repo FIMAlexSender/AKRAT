@@ -1,4 +1,10 @@
-# Dependency security review
+# Security and dependency review for v0.1.2
+
+The protocol audit and the decision not to claim Ratchet protections are recorded in [SESSION_DESIGN.md](SESSION_DESIGN.md), [PROTOCOL.md](PROTOCOL.md), and [THREAT_MODEL.md](THREAT_MODEL.md). The V2 handshake binds both identities, participant roles, protocol version, suite, ephemeral keys, and the authenticated transcript into signature and key derivation. Initiator and responder traffic use independently derived AES-256-GCM keys; the protocol rejects unknown versions and suites without fallback. Tests exercise transcript/signature alteration, downgrade, replay, sequencing, malformed payloads, close-time key clearing, and fresh-handshake recovery.
+
+This is an implementation review, not an independent cryptographic audit. The hybrid handshake, ML-KEM integration, cryptographic implementation, UI trust workflow, and operating-system behavior remain unaudited externally. No Double, Sparse Post-Quantum, or Triple Ratchet is implemented. The session engine abstraction is not evidence of forward secrecy or post-compromise recovery within a session.
+
+The protocol parser now has fixed-seed property tests via `proptest`; these complement deterministic unit and integration tests, but do not provide coverage-guided fuzzing. `cargo fuzz` is unavailable in the current Windows environment. See [VALIDATION.md](VALIDATION.md) for exact validation boundaries.
 
 Checked with `cargo audit`, `cargo tree --target all`, and target-specific feature trees on 2026-11-10. The current lockfile has five transitive RustSec advisories. None is configured as ignored, and no advisory is suppressed. The shipped application target is `x86_64-pc-windows-msvc`.
 

@@ -146,7 +146,7 @@ fn App() -> Element {
                         span { class: if app_state.listener.read().is_some() || !app_state.active_sessions.read().is_empty() { "status-dot" } else { "status-dot offline" } }
                         span { "{application_status(&app_state)}" }
                     }
-                    div { class: "version", "VERSION 0.1.1 · EXPÉRIMENTAL" }
+                    div { class: "version", "VERSION 0.1.2 · EXPÉRIMENTAL" }
                 }
             }
             section { class: "main-panel",
@@ -1302,7 +1302,9 @@ fn handle_network_event(app_state: &mut AppState, event: AppNetworkEvent) {
 
 fn readable_network_problem(problem: &str) -> String {
     let normalized = problem.to_ascii_lowercase();
-    if normalized.contains("10048") || normalized.contains("address already in use") {
+    if normalized.contains("protocol version or cryptographic suite is unsupported") {
+        "Le correspondant utilise une version incompatible du protocole. Mettez AKRAT à jour des deux côtés, puis reconnectez le contact déjà vérifié; les historiques locaux restent disponibles.".to_string()
+    } else if normalized.contains("10048") || normalized.contains("address already in use") {
         "Ce port TCP est déjà utilisé. Choisissez un autre port ou arrêtez le service qui l'occupe."
             .to_string()
     } else if normalized.contains("10013")
@@ -2050,8 +2052,8 @@ fn SettingsView() -> Element {
         }
         div { class: "settings-card",
             div { class: "setting-row",
-                div { strong { "Version" } p { "Version 0.1.1 · messagerie directe expérimentale." } }
-                span { class: "setting-value", "0.1.1" }
+                div { strong { "Version" } p { "Version 0.1.2 · messagerie directe expérimentale." } }
+                span { class: "setting-value", "0.1.2" }
             }
             div { class: "setting-row",
                 div { strong { "Réseau" } p { "TCP direct IPv4/IPv6 selon votre réseau; aucun relais." } }
