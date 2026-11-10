@@ -4,21 +4,45 @@ use akrat_core::{
     Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData, load_vault, save_vault,
 };
 use dioxus::prelude::*;
+#[cfg(not(target_os = "android"))]
 use directories::ProjectDirs;
 use runtime::{SessionHandle, UiEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+const LOGO_DATA_URI: &str = concat!(
+    "data:image/png;base64,",
+    include_str!("../assets/akrat-logo.b64")
+);
+
+#[cfg(all(
+    feature = "desktop",
+    not(feature = "mobile"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
 fn main() {
-    use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
+    use dioxus_desktop::{Config, LogicalSize, WindowBuilder, tao::window::Icon};
+    let icon = dioxus_desktop::icon_from_memory::<Icon>(include_bytes!("../assets/akrat-logo.png"))
+        .expect("Le logo AKRAT doit être une image PNG valide");
     let window = WindowBuilder::new()
         .with_title("AKRAT · Réseau direct")
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
-        .with_min_inner_size(LogicalSize::new(1000.0, 680.0));
+        .with_min_inner_size(LogicalSize::new(1000.0, 680.0))
+        .with_window_icon(Some(icon.clone()));
+    #[cfg(target_os = "windows")]
+    let window = {
+        use dioxus_desktop::tao::platform::windows::WindowBuilderExtWindows;
+        window.with_taskbar_icon(Some(icon))
+    };
     dioxus::LaunchBuilder::desktop()
         .with_cfg(Config::new().with_menu(None).with_window(window))
         .launch(App);
+}
+
+#[cfg(any(feature = "mobile", target_os = "android", target_os = "ios"))]
+fn main() {
+    dioxus::LaunchBuilder::mobile().launch(App);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -237,8 +261,8 @@ fn App() -> Element {
         style { {CSS} }
         div { class: "app-frame",
             header { class: "topbar",
-                div { class: "brand", span { class: "brand-mark", "A" } div { "AKRAT" span { class: "brand-sub", "RÉSEAU DIRECT · LOCAL D’ABORD" } } }
-                div { class: "top-status", span { class: if opened { "status-dot live" } else { "status-dot" } } if opened { "Coffre déverrouillé" } else { "Coffre verrouillé" } }
+                div { class: "brand", img { class: "brand-mark", src: LOGO_DATA_URI, alt: "Logo AKRAT" } div { "AKRAT" span { class: "brand-sub", "MESSAGERIE P2P SÉCURISÉE" } } }
+                div { class: "top-status", span { class: if opened { "status-dot live" } else { "status-dot" } } span { class: "lock-mark" } if opened { "Coffre déverrouillé" } else { "Coffre verrouillé" } }
             }
             if !opened {
                 section { class: "gate",
@@ -266,15 +290,15 @@ fn App() -> Element {
                 div { class: "workspace",
                     aside { class: "sidebar",
                         div { class: "side-caption", "ESPACE" }
-                        NavItem { label: "Conversations", glyph: "◌", active: page() == Page::Messages, onclick: move |_| page.set(Page::Messages) }
+                        NavItem { label: "Conversations", glyph: "▱", active: page() == Page::Messages, onclick: move |_| page.set(Page::Messages) }
                         NavItem { label: "Réseau", glyph: "⌁", active: page() == Page::Network, onclick: move |_| page.set(Page::Network) }
-                        NavItem { label: "Identités & contacts", glyph: "◇", active: page() == Page::People, onclick: move |_| page.set(Page::People) }
-                        NavItem { label: "Coffre", glyph: "▤", active: page() == Page::Settings, onclick: move |_| page.set(Page::Settings) }
+                        NavItem { label: "Identités & contacts", glyph: "♧", active: page() == Page::People, onclick: move |_| page.set(Page::People) }
+                        NavItem { label: "Coffre", glyph: "▣", active: page() == Page::Settings, onclick: move |_| page.set(Page::Settings) }
                         div { class: "side-bottom", div { class: "side-caption", "ÉTAT LOCAL" } div { class: "local-card", span { class: "status-dot live" } "Chiffré sur cet appareil" p { "{identities} identité(s) · {contacts} contact(s)" } } }
                     }
                     main { class: "content",
                         match page() {
-                            Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace } },
+                            Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace, setup_label: (if identities == 0 { "Créer une identité" } else { "Ajouter un contact" }).to_string(), on_setup: move |_| page.set(if identities == 0 { Page::People } else { Page::Network }) } },
                             Page::Network => rsx! { NetworkPage { notice, invitation_address, invitation_result, vault, event_sender, listen_stop } },
                             Page::People => rsx! { PeoplePage { vault, passphrase, path: path_value, identity_name, import_uri, contact_name, notice } },
                             Page::Settings => rsx! { SettingsPage { path: path_value, notice, on_lock: move |_| {
@@ -503,6 +527,8 @@ fn ChatPage(
     draft: Signal<String>,
     notice: Signal<String>,
     mut trace: Signal<Vec<String>>,
+    setup_label: String,
+    on_setup: EventHandler<MouseEvent>,
 ) -> Element {
     let conversation = active_conversation.read().clone();
     let stored = vault.read();
@@ -554,7 +580,13 @@ fn ChatPage(
                 match sessions.read().get(&key).cloned().map(|session| session.send_text(id.clone(), text)) { Some(Ok(())) => {}, Some(Err(error)) => update_message_status(&path, &phrase, vault, (&key, &id), DeliveryState::Unconfirmed, &mut notice, error), None => update_message_status(&path, &phrase, vault, (&key, &id), DeliveryState::Unconfirmed, &mut notice, "Session hors ligne".into()) }
             }, "Envoyer" } }
         } else {
-            div { class: "chat-empty-state", div { class: "eyebrow", "MESSAGERIE PAIR À PAIR" } h1 { "La parole circule." } p { "Choisissez un contact vérifié dans Réseau pour établir une session directe. Les étapes apparaîtront dans le journal." } }
+            div { class: "chat-empty-state",
+                div { class: "message-illustration", span { class: "bubble bubble-back" } span { class: "bubble bubble-front", span { "•••" } } }
+                div { class: "eyebrow", "MESSAGERIE PAIR À PAIR" }
+                h1 { "La parole circule." }
+                p { "Choisissez un contact vérifié dans Réseau pour établir une session directe. Les étapes apparaîtront dans le journal." }
+                button { class: "primary empty-action", onclick: on_setup, span { class: "lock-mark" } "{setup_label}" }
+            }
         }
     } }
 }
@@ -627,6 +659,11 @@ fn default_vault_path() -> PathBuf {
     if let Some(path) = std::env::var_os("AKRAT_VAULT_PATH") {
         return PathBuf::from(path);
     }
+    #[cfg(target_os = "android")]
+    {
+        return PathBuf::from("/data/user/0/org.akrat.app/files/vault.akrat");
+    }
+    #[cfg(not(target_os = "android"))]
     ProjectDirs::from("org", "Akrat", "AKRAT")
         .map(|dirs| dirs.data_local_dir().join("vault.akrat"))
         .unwrap_or_else(|| PathBuf::from("vault.akrat"))

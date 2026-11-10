@@ -1,0 +1,21 @@
+[application]
+name = "AKRAT"
+sub_package = "akrat-desktop"
+
+[bundle]
+identifier = "org.akrat.app"
+publisher = "AKRAT"
+
+[android]
+identifier = "org.akrat.app"
+min_sdk = 24
+target_sdk = 35
+
+[ios]
+deployment_target = "15.0"
+
+[ios.plist]
+NSLocalNetworkUsageDescription = "AKRAT utilise le réseau local pour établir des conversations directes et chiffrées avec vos contacts."
+
+[macos.plist]
+NSLocalNetworkUsageDescription = "AKRAT utilise le réseau local pour établir des conversations directes et chiffrées avec vos contacts."

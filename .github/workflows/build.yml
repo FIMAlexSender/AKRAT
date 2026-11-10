@@ -1,0 +1,121 @@
+name: Build AKRAT
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: akrat-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x64
+            app: target/release/akrat-desktop.exe
+            cli: target/release/akrat.exe
+          - os: ubuntu-24.04
+            artifact: linux-x64
+            app: target/release/akrat-desktop
+            cli: target/release/akrat
+          - os: macos-latest
+            artifact: macos
+            app: target/release/akrat-desktop
+            cli: target/release/akrat
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl file libayatana-appindicator3-dev \
+            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build desktop app and CLI
+        run: |
+          cargo build --locked --release -p akrat-desktop --features desktop
+          cargo build --locked --release -p akrat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: akrat-${{ matrix.artifact }}
+          path: |
+            ${{ matrix.app }}
+            ${{ matrix.cli }}
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android · APK de test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Dioxus CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10"
+          curl --fail --location --silent --show-error "$base_url/dx-x86_64-unknown-linux-gnu.tar.gz" -o "$RUNNER_TEMP/dx.tar.gz"
+          curl --fail --location --silent --show-error "$base_url/dx-x86_64-unknown-linux-gnu.sha256" -o "$RUNNER_TEMP/dx.sha256"
+          expected="$(awk '$2 == "dx-x86_64-unknown-linux-gnu.tar.gz" {print $1}' "$RUNNER_TEMP/dx.sha256")"
+          test -n "$expected"
+          echo "$expected  $RUNNER_TEMP/dx.tar.gz" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/dx"
+          tar -xzf "$RUNNER_TEMP/dx.tar.gz" -C "$RUNNER_TEMP/dx"
+          sudo install -m 0755 "$RUNNER_TEMP/dx/dx" /usr/local/bin/dx
+          dx --version
+
+      - name: Build installable Android test APK
+        run: >-
+          dx bundle --platform android --target aarch64-linux-android --package akrat-desktop
+          --release --no-default-features --features mobile --package-types apk
+          --out-dir dist/android
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: akrat-android-apk
+          path: dist/android/*.apk
+          if-no-files-found: error
+          retention-days: 14
