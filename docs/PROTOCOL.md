@@ -1,6 +1,6 @@
 # Protocol status
 
-Protocol structures for a draft version 1 exchange exist in `akrat-protocol`. `akrat-network` implements standalone TCP listening/connecting and a 4-byte big-endian length prefix around bounded JSON frames, with a 30-second I/O deadline. The framing is not integrated with handshake/session state and the structures are not yet an interoperability specification. The local encrypted vault envelope is version 1 and is separate from the network protocol.
+Protocol structures for a draft version 1 exchange exist in `akrat-protocol`. `akrat-network` implements TCP listening/connecting and a 4-byte big-endian length prefix around bounded JSON frames, with a 30-second I/O deadline. It can carry the experimental three-message handshake. It returns an `UnverifiedSession`; the caller must confirm the expected peer identity ID and public key before it can access the message cipher. This caller confirmation must be backed by a fingerprint comparison through an independent channel for a first contact. These structures are not yet an interoperability specification. The local encrypted vault envelope is version 1 and separate from the network protocol.
 
 The draft uses a fixed version and suite identifier. Follow-up work still needs authenticated connection state, manual fingerprint verification, and fail-closed handling in a real transport. The app must not accept a session as verified based on the handshake alone; people must compare fingerprints over an independent channel.
 

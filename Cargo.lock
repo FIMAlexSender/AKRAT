@@ -98,6 +98,8 @@ dependencies = [
 name = "akrat-network"
 version = "0.1.0"
 dependencies = [
+ "akrat-core",
+ "akrat-crypto",
  "akrat-protocol",
  "serde",
  "thiserror 2.0.21",

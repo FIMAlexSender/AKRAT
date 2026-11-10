@@ -37,6 +37,14 @@ pub struct Finish {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum HandshakeFrame {
+    Hello(Hello),
+    Response(Response),
+    Finish(Finish),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EncryptedMessage {
     pub session_id: Vec<u8>,
     pub sender_id: String,

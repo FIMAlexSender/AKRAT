@@ -12,7 +12,7 @@ No software can protect a user from a compromised endpoint while it is unlocked,
 
 ## Guarantees today
 
-Identity creation, Ed25519 signatures, and encrypted vault file APIs are integrated into the Windows application. Vault files are protected by Argon2id and AES-256-GCM. A passphrase protects the records if someone reads the vault file, subject to the strength of that passphrase and the correctness of the implementation. Experimental handshake and session message encryption code exists in an isolated library, but there is no peer connection, contact verification, message transport, or message path in the app. ML-KEM is implemented by a crate that has not been independently audited. This application must not be used for messaging or sensitive communication.
+Identity creation, Ed25519 signatures, and encrypted vault file APIs are integrated into the Windows application. Vault files are protected by Argon2id and AES-256-GCM. A passphrase protects the records if someone reads the vault file, subject to the strength of that passphrase and the correctness of the implementation. Experimental handshake and session message encryption code exists in libraries with a localhost TCP integration test, but there is no app contact verification, conversation persistence, or message path in the UI. ML-KEM is implemented by a crate that has not been independently audited. This application must not be used for messaging or sensitive communication.
 
 ## Security review required
 

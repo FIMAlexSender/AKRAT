@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+akrat-core = { path = "../akrat-core" }
+akrat-crypto = { path = "../akrat-crypto" }
 akrat-protocol = { path = "../akrat-protocol" }
 serde.workspace = true
 thiserror.workspace = true

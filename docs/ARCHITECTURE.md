@@ -11,7 +11,7 @@ The core types distinguish an unknown peer, a known but unverified peer, and a m
 - `akrat-core`: identity, contact, and conversation domain models and application-level interfaces.
 - `akrat-crypto`: identity key handling, authenticated hybrid key establishment, key derivation, and authenticated encryption.
 - `akrat-protocol`: bounded, versioned wire messages independent of the transport.
-- `akrat-network`: direct TCP connections, framing, and deadlines; it must handle ciphertext only. Current primitives do not include peer authentication, multiplexing, or a message queue.
+- `akrat-network`: direct TCP connections, framing, and deadlines. It drives the experimental handshake and returns an `UnverifiedSession` whose API withholds the message cipher until the caller confirms the expected peer identity ID and public key. It must handle ciphertext only after that transition. Current primitives do not include conversation multiplexing, persistence, or a message queue.
 - `akrat-storage`: encrypted local records and transactional persistence.
 - `akrat-app`: user interaction and explicit presentation of trust and connection states.
 
