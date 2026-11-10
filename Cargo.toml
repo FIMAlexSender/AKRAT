@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/akrat-app",
+    "crates/akrat-core",
+    "crates/akrat-crypto",
+    "crates/akrat-network",
+    "crates/akrat-protocol",
+    "crates/akrat-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+
