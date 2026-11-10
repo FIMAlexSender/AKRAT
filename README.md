@@ -33,7 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The interface uses system fonts and does not require an external service to start.
 
-On Windows, the encrypted vault is stored at `%LOCALAPPDATA%\AKRAT\identities.vault`. New vault creation requires a passphrase of at least 12 characters; the storage library caps passphrases at 1024 bytes. The current vault format uses Argon2id (64 MiB, 3 passes, 1 lane) and AES-256-GCM with random 16-byte salt and 12-byte nonce. It is a local storage format, not the message protocol.
+On Windows, the encrypted vault is stored at `%LOCALAPPDATA%\AKRAT\identities.vault`. New vault creation requires a passphrase of at least 12 characters; the storage library caps passphrases at 1024 bytes. The current vault format uses Argon2id (64 MiB, 3 passes, 1 lane) and AES-256-GCM with random 16-byte salt and 12-byte nonce. The storage library can encrypt identities, contacts, and conversation records; it is a local storage format, not the message protocol.
 
 ## Project structure
 

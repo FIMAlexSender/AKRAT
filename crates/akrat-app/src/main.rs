@@ -68,7 +68,7 @@ fn App() -> Element {
                     if section() == "Identités" {
                         IdentityView {}
                     } else if section() == "Conversations" {
-                        EmptyView { title: "Aucune conversation", detail: "Les conversations apparaîtront ici après l'implémentation du protocole et du stockage local." }
+                        EmptyView { title: "Aucune conversation", detail: "La création et la consultation des conversations ne sont pas encore intégrées à l'application." }
                     } else if section() == "Connexion" {
                         ConnectionView {}
                     } else {
@@ -261,7 +261,7 @@ fn IdentityView() -> Element {
         }
         div { class: "security-note",
             span { class: "lock-icon", "◇" }
-            span { strong { "Chiffrement local actif" } " · Les messages réseau et l'échange de clés ne sont pas disponibles dans cette version." }
+            span { strong { "Chiffrement local actif" } " · La messagerie réseau n'est pas intégrée à l'application." }
         }
     }
 }
@@ -282,13 +282,13 @@ fn ConnectionView() -> Element {
         div { class: "page-heading",
             div { class: "eyebrow", "RÉSEAU DIRECT" }
             h1 { "Connexion" }
-            p { "Les connexions seront établies directement par adresse IP et port." }
+            p { "Les connexions directes seront configurées ici lorsqu'elles seront intégrées à l'application." }
         }
         div { class: "connection-card",
             div { class: "card-icon", "↔" }
-            h2 { "Écoute et invitations indisponibles" }
-            p { "Le transport réseau n'est pas encore implémenté. Cette application n'ouvre aucun port et ne prétend pas accepter de connexions." }
-            div { class: "feature-row", span { "À venir dans les prochaines phases" } }
+            h2 { "Écoute et invitations non intégrées" }
+            p { "Le moteur TCP et le handshake expérimental sont testés dans les bibliothèques Rust. L'interface ne lance pas d'écoute et n'accepte pas de connexions." }
+            div { class: "feature-row", span { "Intégration à l'application à venir" } }
             div { class: "feature-list",
                 div { span { "01" } "Écoute sur une adresse choisie" }
                 div { span { "02" } "Invitation avec identité publique" }
@@ -316,7 +316,7 @@ fn SettingsView() -> Element {
                 span { class: "setting-value quiet", "PAIR-À-PAIR DIRECT" }
             }
             div { class: "setting-row",
-                div { strong { "État de sécurité" } p { "Aucun chiffrement de messages n'est encore disponible." } }
+                div { strong { "État de sécurité" } p { "Le moteur de session expérimental n'est pas connecté à la messagerie de l'application." } }
                 span { class: "setting-value pending", "NON DISPONIBLE" }
             }
         }

@@ -50,10 +50,45 @@ pub struct PublicIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Contact {
     pub id: String,
+    pub display_name: String,
     pub public_key: Vec<u8>,
     pub fingerprint: String,
     pub trust: IdentityTrust,
     pub blocked: bool,
+    pub created_at_unix: u64,
+    pub last_seen_at_unix: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum MessageDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum MessageDelivery {
+    Pending,
+    Transmitted,
+    Received,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredMessage {
+    pub id: String,
+    pub sender_identity_id: String,
+    pub sent_at_unix: u64,
+    pub direction: MessageDirection,
+    pub delivery: MessageDelivery,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Conversation {
+    pub id: String,
+    pub local_identity_id: String,
+    pub remote_identity_id: String,
+    pub created_at_unix: u64,
+    pub messages: Vec<StoredMessage>,
 }
 
 #[cfg(test)]
