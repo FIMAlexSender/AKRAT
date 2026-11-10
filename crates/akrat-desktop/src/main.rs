@@ -17,7 +17,7 @@ fn main() {
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(1000.0, 680.0));
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(window))
+        .with_cfg(Config::new().with_menu(None).with_window(window))
         .launch(App);
 }
 
