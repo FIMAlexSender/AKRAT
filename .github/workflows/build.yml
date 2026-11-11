@@ -103,11 +103,10 @@ jobs:
             throw "NSIS archive SHA-256 mismatch: $actualHash"
           }
           Expand-Archive -Path $nsisZip -DestinationPath $nsisRoot -Force
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
           $makensis = Join-Path $nsisRoot 'nsis-3.13\makensis.exe'
           & $makensis /V2 "/DAKRAT_VERSION=$version" 'packaging\windows\akrat-installer.nsi'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Test-Path "dist\AKRAT-Setup-v$version.exe")) { throw 'Windows installer was not created.' }
+          if (-not (Test-Path "target\release\AKRAT-Setup-v$version.exe")) { throw 'Windows installer was not created.' }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -115,7 +114,7 @@ jobs:
           path: |
             target/release/akrat-desktop.exe
             target/release/akrat.exe
-            dist/AKRAT-Setup-*.exe
+            target/release/AKRAT-Setup-*.exe
           if-no-files-found: error
           retention-days: 14
 

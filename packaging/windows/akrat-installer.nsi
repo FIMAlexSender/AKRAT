@@ -7,7 +7,7 @@ Unicode true
 !include "MUI2.nsh"
 
 Name "AKRAT ${AKRAT_VERSION}"
-OutFile "..\..\dist\AKRAT-Setup-v${AKRAT_VERSION}.exe"
+OutFile "..\..\target\release\AKRAT-Setup-v${AKRAT_VERSION}.exe"
 InstallDir "$LOCALAPPDATA\Programs\AKRAT"
 InstallDirRegKey HKCU "Software\AKRAT" "InstallDir"
 RequestExecutionLevel user
