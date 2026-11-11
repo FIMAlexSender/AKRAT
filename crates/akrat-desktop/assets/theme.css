@@ -77,6 +77,12 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
 .callout { max-width: 680px; padding: 14px 17px; color: var(--text); background: #ff98580d; border: 1px solid #ff985844; border-radius: 12px; font-size: 12px; }
 .callout p { margin-bottom: 0; color: var(--muted); line-height: 1.6; }
 .settings-panel { max-width: 700px; }
+.update-ready { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.update-ready p { margin: 0; line-height: 1.55; }
+.update-check { margin-top: 13px; }
+.update-link { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; margin: 6px 0; text-decoration: none; }
+.release-link { margin-top: 7px; color: var(--accent-soft); font-size: 12px; }
+.update-error { color: #ffae8f; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .crypto-note { margin: 18px 0; padding: 13px; color: var(--muted); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 9px; font-size: 11px; line-height: 1.6; }
 .trace { display: flex; flex-direction: column; overflow: auto; padding: 24px 25px; color: var(--text); background: #10141b; border-left: 1px solid var(--line); }
 .trace-head { display: flex; align-items: center; gap: 11px; padding: 8px 0 17px; color: var(--text); border-bottom: 1px solid var(--line); font: 750 14px var(--sans); letter-spacing: 0; text-transform: none; }

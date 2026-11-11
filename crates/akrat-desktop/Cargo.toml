@@ -12,12 +12,17 @@ dioxus-desktop = { workspace = true, optional = true }
 directories.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+zip = { workspace = true, optional = true }
+self-replace = { version = "1.5.1", optional = true }
 
 [features]
 default = ["desktop"]
-desktop = ["dioxus/desktop", "dep:dioxus-desktop"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:self-replace", "dep:zip"]
 mobile = ["dioxus/mobile"]

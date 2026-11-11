@@ -1,4 +1,5 @@
 mod runtime;
+mod updater;
 
 use akrat_core::{
     Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData, load_vault, save_vault,
@@ -69,6 +70,7 @@ fn App() -> Element {
     let invitation_result = use_signal(String::new);
     let mut notice = use_signal(String::new);
     let mut last_activity = use_signal(Instant::now);
+    let mut update_status = use_signal(|| updater::UpdateStatus::Checking);
     let mut page = use_signal(|| Page::Messages);
     let mut sessions = use_signal(HashMap::<String, SessionHandle>::new);
     let mut listen_stop = use_signal(|| None::<tokio::sync::watch::Sender<bool>>);
@@ -88,6 +90,20 @@ fn App() -> Element {
         )
     });
     let event_sender = use_signal(|| sender);
+
+    use_future(move || async move {
+        match updater::check_latest().await {
+            Ok(Some(release)) => {
+                notice.set(format!(
+                    "AKRAT v{} est disponible · Coffre > Mises à jour",
+                    release.version
+                ));
+                update_status.set(updater::UpdateStatus::Available(release));
+            }
+            Ok(None) => update_status.set(updater::UpdateStatus::Current),
+            Err(error) => update_status.set(updater::UpdateStatus::Failed(error)),
+        }
+    });
 
     use_future(move || {
         let receiver = receiver.clone();
@@ -350,7 +366,28 @@ fn App() -> Element {
                             Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace, setup_label: (if identities == 0 { "Créer une identité" } else { "Ajouter un contact" }).to_string(), on_setup: move |_| page.set(if identities == 0 { Page::People } else { Page::Network }) } },
                             Page::Network => rsx! { NetworkPage { notice, invitation_address, invitation_result, vault, event_sender, listen_stop } },
                             Page::People => rsx! { PeoplePage { vault, passphrase, path: path_value, identity_name, import_uri, contact_name, notice } },
-                            Page::Settings => rsx! { SettingsPage { path: path_value, notice, on_lock: move |_| {
+                            Page::Settings => rsx! { SettingsPage { path: path_value, notice, update_status,
+                                on_check_updates: move |_| {
+                                    update_status.set(updater::UpdateStatus::Checking);
+                                    spawn(async move {
+                                        match updater::check_latest().await {
+                                            Ok(Some(release)) => update_status.set(updater::UpdateStatus::Available(release)),
+                                            Ok(None) => update_status.set(updater::UpdateStatus::Current),
+                                            Err(error) => update_status.set(updater::UpdateStatus::Failed(error)),
+                                        }
+                                    });
+                                },
+                                on_install_update: move |_| {
+                                    let updater::UpdateStatus::Available(release) = update_status.read().clone() else { return; };
+                                    update_status.set(updater::UpdateStatus::Installing);
+                                    spawn(async move {
+                                        match updater::install(release).await {
+                                            Ok(()) => {},
+                                            Err(error) => update_status.set(updater::UpdateStatus::Failed(error)),
+                                        }
+                                    });
+                                },
+                                on_lock: move |_| {
                                 if let Some(stop) = listen_stop.read().as_ref() { let _ = stop.send(true); }
                                 listen_stop.set(None);
                                 for session in sessions.read().values() { session.close(); }
@@ -756,12 +793,45 @@ fn update_message_status(
 fn SettingsPage(
     path: PathBuf,
     notice: Signal<String>,
+    update_status: Signal<updater::UpdateStatus>,
+    on_check_updates: EventHandler<MouseEvent>,
+    on_install_update: EventHandler<MouseEvent>,
     on_lock: EventHandler<MouseEvent>,
 ) -> Element {
+    let current_version = env!("CARGO_PKG_VERSION");
+    let update_view = match update_status.read().clone() {
+        updater::UpdateStatus::Checking => {
+            rsx! { p { class: "quiet", "Recherche de mises à jour…" } }
+        }
+        updater::UpdateStatus::Current => {
+            rsx! { p { class: "quiet", "AKRAT est à jour · v{current_version}" } }
+        }
+        updater::UpdateStatus::Available(release) => rsx! {
+            div { class: "update-ready",
+                strong { "AKRAT v{release.version} est disponible" }
+                p { class: "quiet", "La mise à jour est téléchargée depuis GitHub et vérifiée avant installation." }
+                if cfg!(target_os = "android") {
+                    a { class: "secondary update-link", href: "{release.download_url}", target: "_blank", "Télécharger l’APK" }
+                    p { class: "copy-hint", "Android demande une confirmation. Les APK de test n’ont pas encore de signature stable ; une mise à jour peut être refusée par-dessus une ancienne installation. Ne désinstallez pas AKRAT si le coffre contient des données importantes." }
+                } else {
+                    p { class: "quiet", "AKRAT remplacera son exécutable puis redémarrera. Le coffre restera chiffré." }
+                    button { class: "primary", onclick: on_install_update, "Installer et redémarrer" }
+                }
+                a { class: "release-link", href: "{release.release_url}", target: "_blank", "Voir la release sur GitHub" }
+            }
+        },
+        updater::UpdateStatus::Installing => {
+            rsx! { p { class: "quiet", "Téléchargement, vérification et installation en cours…" } }
+        }
+        updater::UpdateStatus::Failed(error) => {
+            rsx! { p { class: "update-error", "Mise à jour indisponible : {error}" } }
+        }
+    };
     rsx! { section { class: "page-scroll",
         div { class: "eyebrow", "STOCKAGE LOCAL" } h1 { "Votre coffre" }
         p { class: "intro", "Les clés privées, contacts et messages sont conservés dans un fichier chiffré par votre phrase secrète." }
         section { class: "panel settings-panel", div { class: "panel-title", "Emplacement" } p { class: "fingerprint", "{path.display()}" } div { class: "crypto-note", "Chiffrement du coffre : Argon2id + AES-256-GCM. Une phrase secrète perdue ne peut pas être récupérée." } div { class: "crypto-note", "Verrouillage automatique après 5 minutes sans toucher l’application. Les sessions réseau sont fermées en même temps." } button { class: "secondary", onclick: on_lock, "Verrouiller le coffre" } }
+        section { class: "panel settings-panel", div { class: "panel-title", "Mises à jour" } {update_view} button { class: "secondary update-check", onclick: on_check_updates, "Rechercher à nouveau" } }
         p { class: "quiet", "{notice}" }
     } }
 }
