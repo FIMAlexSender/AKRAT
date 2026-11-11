@@ -62,6 +62,12 @@ enum Page {
     Settings,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum VaultGateTab {
+    Existing,
+    Create,
+}
+
 #[component]
 fn App() -> Element {
     let path = use_signal(default_vault_path);
@@ -99,6 +105,15 @@ fn App() -> Element {
 
     use_effect(move || {
         let snapshot = vault.read().as_ref().map(|data| {
+            let retry_targets = data
+                .messages
+                .iter()
+                .filter(|message| message.outgoing && message.delivery.needs_delivery())
+                .filter_map(|message| {
+                    let (identity_id, fingerprint) = message.conversation.split_once(':')?;
+                    Some((identity_id.to_string(), fingerprint.to_string()))
+                })
+                .collect::<std::collections::HashSet<_>>();
             (
                 data.identities
                     .iter()
@@ -109,9 +124,10 @@ fn App() -> Element {
                     .filter(|contact| contact.manually_verified)
                     .cloned()
                     .collect::<Vec<_>>(),
+                retry_targets,
             )
         });
-        if let Some((identities, contacts)) = snapshot {
+        if let Some((identities, contacts, retry_targets)) = snapshot {
             let contacts_changed = *applied_network_contacts.read() != contacts;
             let active = listen_stops.read().keys().cloned().collect::<Vec<_>>();
             for identity in &identities {
@@ -124,6 +140,17 @@ fn App() -> Element {
                     listen_stops.write().insert(identity.id.clone(), stop);
                 } else if contacts_changed {
                     runtime::update_contacts(&identity.id, contacts.clone());
+                }
+                for contact in &contacts {
+                    if retry_targets.contains(&(identity.id.clone(), contact.fingerprint.clone())) {
+                        runtime::connect(
+                            identity.detached_copy(),
+                            contact.clone(),
+                            event_sender.read().clone(),
+                        );
+                    } else {
+                        runtime::cancel_retry(&identity.id, &contact.fingerprint);
+                    }
                 }
             }
             if contacts_changed {
@@ -197,12 +224,7 @@ fn App() -> Element {
                                 for message in data.messages.iter().filter(|message| {
                                     message.conversation == *conversation
                                         && message.outgoing
-                                        && matches!(
-                                            message.delivery,
-                                            DeliveryState::Pending
-                                                | DeliveryState::Sent
-                                                | DeliveryState::Unconfirmed
-                                        )
+                                        && message.delivery.needs_delivery()
                                 }) {
                                     if handle
                                         .send_text(message.id.clone(), message.text.clone())
@@ -225,7 +247,7 @@ fn App() -> Element {
                         let vault_path = path.read().clone();
                         if let Ok(mut data) = load_vault(&vault_path, &phrase) {
                             update_delivery(&mut data, &conversation, &id, DeliveryState::Sent);
-                            if save_vault(&vault_path, &data, &phrase).is_ok() {
+                            if save_vault(&vault_path, &mut data, &phrase).is_ok() {
                                 vault.set(Some(data));
                             }
                         }
@@ -253,7 +275,7 @@ fn App() -> Element {
                                     id.clone(),
                                     text,
                                 ));
-                                persisted = save_vault(&vault_path, &data, &phrase).is_ok();
+                                persisted = save_vault(&vault_path, &mut data, &phrase).is_ok();
                                 if persisted {
                                     vault.set(Some(data));
                                 }
@@ -289,7 +311,7 @@ fn App() -> Element {
                                 &id,
                                 DeliveryState::Acknowledged,
                             );
-                            if save_vault(&vault_path, &data, &phrase).is_ok() {
+                            if save_vault(&vault_path, &mut data, &phrase).is_ok() {
                                 vault.set(Some(data));
                             }
                         }
@@ -312,15 +334,12 @@ fn App() -> Element {
                             for message in &mut data.messages {
                                 if message.conversation == conversation
                                     && message.outgoing
-                                    && matches!(
-                                        message.delivery,
-                                        DeliveryState::Pending | DeliveryState::Sent
-                                    )
+                                    && message.delivery.needs_delivery()
                                 {
-                                    message.delivery = DeliveryState::Unconfirmed;
+                                    message.delivery = DeliveryState::Queued;
                                 }
                             }
-                            if save_vault(&vault_path, &data, &phrase).is_ok() {
+                            if save_vault(&vault_path, &mut data, &phrase).is_ok() {
                                 vault.set(Some(data));
                             }
                         }
@@ -467,122 +486,258 @@ fn VaultGate(
     let selected_path = path.read().clone();
     let selected_exists = selected_path.is_file();
     let selected_open_path = selected_path.clone();
-    let selected_create_path = selected_path.clone();
     let default_path = default_vault_path();
+    let default_for_browse = default_path.clone();
+    let default_for_create = default_path.clone();
+    let mut tab = use_signal(|| VaultGateTab::Existing);
+    let mut new_vault_name = use_signal(|| {
+        default_vault_path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("vault")
+            .to_string()
+    });
+    let mut confirm_passphrase = use_signal(String::new);
+    let mut manage_path = use_signal(|| None::<PathBuf>);
+    let mut manage_passphrase = use_signal(String::new);
+    let mut rename_name = use_signal(String::new);
+    let mut manage_verified = use_signal(|| false);
+    let mut confirm_delete = use_signal(|| false);
 
     rsx! {
         section { class: "gate vault-gate",
             div { class: "gate-kicker", "ESPACE PERSONNEL · CHIFFRÉ" }
-            h1 { "Vos échanges restent" br {} em { "chez vous." } }
-            p { "Chaque coffre garde ses propres identités, contacts et conversations. Choisissez où le conserver, puis déverrouillez-le avec sa phrase secrète." }
-
-            section { class: "vault-manager panel",
-                div { class: "panel-title", "Vos coffres" }
-                if vault_paths.read().is_empty() {
-                    p { class: "quiet", "Aucun coffre enregistré. Ajoutez un emplacement ci-dessous." }
-                }
-                for entry in vault_paths.read().iter() {
-                    {
-                        let entry_path = entry.clone();
-                        let path_to_remove = entry.clone();
-                        let default_for_remove = default_path.clone();
-                        let selected = entry == &selected_path;
-                        let exists = entry.is_file();
-                        let label = entry.file_name().and_then(|name| name.to_str()).unwrap_or("Coffre AKRAT").to_string();
-                        let detail = entry.display().to_string();
-                        rsx! {
-                            div { class: if selected { "vault-entry selected" } else { "vault-entry" },
-                                button { class: "vault-entry-select", onclick: move |_| {
-                                    path.set(entry_path.clone());
-                                    vault_path_input.set(entry_path.display().to_string());
-                                    notice.set(String::new());
-                                },
-                                    strong { "{label}" }
-                                    span { "{detail}" }
-                                    small { if exists { "Coffre présent · à déverrouiller" } else { "Emplacement prêt · aucun fichier pour l’instant" } }
-                                }
-                                button { class: "vault-entry-remove", title: "Retirer de la liste sans supprimer le fichier", onclick: move |_| {
-                                    let mut paths = vault_paths.read().clone();
-                                    vault_catalog::remove(&mut paths, &path_to_remove);
-                                    if paths.is_empty() { paths.push(default_for_remove.clone()); }
-                                    match vault_catalog::save(&default_for_remove, &paths) {
-                                        Ok(()) => {
-                                            if path_to_remove == *path.read() {
-                                                let fallback = paths[0].clone();
-                                                path.set(fallback.clone());
-                                                vault_path_input.set(fallback.display().to_string());
-                                            }
-                                            vault_paths.set(paths);
-                                            notice.set("Coffre retiré de la liste. Son fichier n’a pas été supprimé.".into());
-                                        }
-                                        Err(error) => notice.set(error),
+            h1 { "Vos coffres" }
+            p { class: "intro", "Ouvrez un coffre chiffré existant ou créez-en un nouveau. Chaque coffre garde ses propres identités, contacts et conversations." }
+            div { class: "vault-tabs",
+                button { class: if *tab.read() == VaultGateTab::Existing { "vault-tab active" } else { "vault-tab" }, onclick: move |_| { tab.set(VaultGateTab::Existing); notice.set(String::new()); }, "Ouvrir un coffre" }
+                button { class: if *tab.read() == VaultGateTab::Create { "vault-tab active" } else { "vault-tab" }, onclick: move |_| {
+                    tab.set(VaultGateTab::Create);
+                    passphrase.set(String::new());
+                    confirm_passphrase.set(String::new());
+                    let current_path = path.read().clone();
+                    vault_path_input.set(current_path.display().to_string());
+                    if let Some(stem) = current_path.file_stem().and_then(|name| name.to_str()) { new_vault_name.set(stem.to_string()); }
+                    notice.set(String::new());
+                }, "Créer un coffre" }
+            }
+            if *tab.read() == VaultGateTab::Existing {
+                section { class: "vault-manager panel",
+                    div { class: "panel-title", "Coffres enregistrés · {vault_paths.read().len()}" }
+                    if vault_paths.read().is_empty() { p { class: "quiet", "Aucun coffre enregistré. Parcourez vos fichiers ou créez-en un." } }
+                    for entry in vault_paths.read().iter() {
+                        {
+                            let entry_path = entry.clone();
+                            let entry_for_manage = entry.clone();
+                            let entry_for_verify = entry.clone();
+                            let entry_for_rename = entry.clone();
+                            let entry_for_delete = entry.clone();
+                            let default_for_rename = default_path.clone();
+                            let default_for_delete = default_path.clone();
+                            let is_selected = entry == &selected_path;
+                            let exists = entry.is_file();
+                            let label = entry.file_stem().and_then(|name| name.to_str()).unwrap_or("Coffre AKRAT").to_string();
+                            let detail = entry.display().to_string();
+                            let is_managing = manage_path.read().as_ref() == Some(entry);
+                            rsx! {
+                                div { class: if is_selected { "vault-entry selected" } else { "vault-entry" },
+                                    button { class: "vault-entry-select", onclick: move |_| {
+                                        path.set(entry_path.clone());
+                                        vault_path_input.set(entry_path.display().to_string());
+                                        passphrase.set(String::new());
+                                        notice.set(String::new());
+                                    },
+                                        span { class: "vault-entry-title", strong { "{label}" } span { class: "vault-entry-status", if exists { "Présent" } else { "Introuvable" } } }
+                                        span { class: "vault-entry-path", "{detail}" }
                                     }
-                                }, "Retirer" }
+                                    button { class: "secondary compact vault-manage-button", onclick: move |_| {
+                                        let name = entry_for_manage.file_stem().and_then(|value| value.to_str()).unwrap_or("vault").to_string();
+                                        manage_path.set(Some(entry_for_manage.clone()));
+                                        manage_passphrase.set(String::new());
+                                        rename_name.set(name);
+                                        manage_verified.set(false);
+                                        confirm_delete.set(false);
+                                        notice.set(String::new());
+                                    }, "Gérer" }
+                                }
+                                if is_managing {
+                                    section { class: "vault-management panel",
+                                        div { class: "panel-title", "Gérer · {label}" }
+                                        p { class: "quiet", "La phrase secrète confirme que ce coffre vous appartient." }
+                                        label { "Phrase secrète de ce coffre" input { r#type: "password", value: "{manage_passphrase}", placeholder: "Phrase secrète actuelle", oninput: move |event| { manage_passphrase.set(event.value()); manage_verified.set(false); confirm_delete.set(false); } } }
+                                        if !*manage_verified.read() {
+                                            button { class: "secondary", onclick: move |_| {
+                                                let phrase = manage_passphrase.read().clone();
+                                                if phrase.is_empty() { notice.set("Saisissez la phrase secrète de ce coffre.".into()); return; }
+                                                match load_vault(&entry_for_verify, &phrase) {
+                                                    Ok(_) => { manage_verified.set(true); notice.set("Coffre vérifié. Vous pouvez le renommer ou le supprimer.".into()); },
+                                                    Err(error) => notice.set(format!("Phrase secrète incorrecte ou coffre invalide : {error}")),
+                                                }
+                                            }, "Vérifier la phrase secrète" }
+                                        } else {
+                                            label { "Nouveau nom du fichier" input { value: "{rename_name}", placeholder: "Ex. Personnel", oninput: move |event| rename_name.set(event.value()) } }
+                                            button { class: "secondary", onclick: move |_| {
+                                                let phrase = manage_passphrase.read().clone();
+                                                if let Err(error) = load_vault(&entry_for_rename, &phrase) { manage_verified.set(false); notice.set(format!("Vérification refusée : {error}")); return; }
+                                                let renamed = match vault_path_with_name(&entry_for_rename, &rename_name.read()) { Ok(path) => path, Err(error) => { notice.set(error); return; } };
+                                                if renamed == entry_for_rename { notice.set("Ce coffre porte déjà ce nom.".into()); return; }
+                                                if renamed.exists() { notice.set("Un fichier existe déjà avec ce nom.".into()); return; }
+                                                if let Err(error) = std::fs::rename(&entry_for_rename, &renamed) { notice.set(format!("Renommage impossible : {error}")); return; }
+                                                let mut paths = vault_paths.read().clone();
+                                                if !vault_catalog::replace(&mut paths, &entry_for_rename, renamed.clone()) {
+                                                    let _ = std::fs::rename(&renamed, &entry_for_rename);
+                                                    notice.set("Ce coffre n’est plus dans la liste. Réessayez.".into());
+                                                    return;
+                                                }
+                                                if let Err(error) = vault_catalog::save(&default_for_rename, &paths) {
+                                                    let rollback = std::fs::rename(&renamed, &entry_for_rename);
+                                                    notice.set(match rollback { Ok(()) => format!("Liste des coffres non enregistrée : {error}"), Err(rollback_error) => format!("Liste non enregistrée ({error}) et retour arrière impossible ({rollback_error}).") });
+                                                    return;
+                                                }
+                                                if *path.read() == entry_for_rename { path.set(renamed.clone()); vault_path_input.set(renamed.display().to_string()); }
+                                                vault_paths.set(paths);
+                                                manage_path.set(None);
+                                                manage_passphrase.set(String::new());
+                                                notice.set("Coffre renommé. Son contenu chiffré est inchangé.".into());
+                                            }, "Renommer le coffre" }
+                                            div { class: "vault-danger-zone",
+                                                strong { "Supprimer le fichier du coffre" }
+                                                p { "Cette action efface ce coffre et tout son historique de cet appareil." }
+                                                if !*confirm_delete.read() {
+                                                    button { class: "danger-button", onclick: move |_| confirm_delete.set(true), "Supprimer…" }
+                                                } else {
+                                                    p { class: "delete-confirm-text", "Confirmez la suppression définitive de « {label} »." }
+                                                    div { class: "gate-actions",
+                                                        button { class: "secondary", onclick: move |_| confirm_delete.set(false), "Annuler" }
+                                                        button { class: "danger-button", onclick: move |_| {
+                                                            let phrase = manage_passphrase.read().clone();
+                                                            if let Err(error) = load_vault(&entry_for_delete, &phrase) { manage_verified.set(false); confirm_delete.set(false); notice.set(format!("Suppression refusée : {error}")); return; }
+                                                            let mut paths = vault_paths.read().clone();
+                                                            vault_catalog::remove(&mut paths, &entry_for_delete);
+                                                            if paths.is_empty() { paths.push(default_for_delete.clone()); }
+                                                            if let Err(error) = vault_catalog::save(&default_for_delete, &paths) { notice.set(format!("Liste des coffres impossible à mettre à jour : {error}")); return; }
+                                                            if let Err(error) = std::fs::remove_file(&entry_for_delete) {
+                                                                let _ = vault_catalog::add(&mut paths, entry_for_delete.clone());
+                                                                let _ = vault_catalog::save(&default_for_delete, &paths);
+                                                                notice.set(format!("Suppression impossible : {error}"));
+                                                                return;
+                                                            }
+                                                            let fallback = paths.first().cloned().unwrap_or_else(|| default_for_delete.clone());
+                                                            if *path.read() == entry_for_delete { path.set(fallback.clone()); vault_path_input.set(fallback.display().to_string()); }
+                                                            vault_paths.set(paths);
+                                                            manage_path.set(None);
+                                                            manage_passphrase.set(String::new());
+                                                            confirm_delete.set(false);
+                                                            notice.set("Coffre supprimé définitivement de cet appareil.".into());
+                                                        }, "Confirmer la suppression" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        button { class: "vault-cancel-manage", onclick: move |_| { manage_path.set(None); manage_passphrase.set(String::new()); manage_verified.set(false); confirm_delete.set(false); }, "Fermer la gestion" }
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-
-            label { "Phrase secrète du coffre sélectionné" input { r#type: "password", value: "{passphrase}", placeholder: "Au moins 12 caractères", oninput: move |e| passphrase.set(e.value()) } }
-
-            div { class: "vault-location",
-                label { "Emplacement du coffre" input { r#type: "text", value: "{vault_path_input}", placeholder: "Chemin complet vers vault.akrat", oninput: move |e| vault_path_input.set(e.value()) } }
-                if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
-                    div { class: "vault-location-actions",
-                        button { class: "secondary", onclick: move |_| {
-                            if let Some(chosen) = choose_existing_vault() {
-                                vault_path_input.set(chosen.display().to_string());
-                            }
-                        }, "Ajouter un coffre existant…" }
-                        button { class: "secondary", onclick: move |_| {
-                            if let Some(chosen) = choose_new_vault_path() {
-                                vault_path_input.set(chosen.display().to_string());
-                            }
-                        }, "Choisir où créer…" }
-                    }
-                }
-                button { class: "secondary", onclick: move |_| {
-                    let raw = vault_path_input.read().trim().to_string();
-                    if raw.is_empty() { notice.set("Indiquez un emplacement pour le coffre.".into()); return; }
-                    let chosen = PathBuf::from(raw);
-                    if chosen.is_dir() { notice.set("Choisissez un fichier (par exemple vault.akrat), pas un dossier.".into()); return; }
-                    path.set(chosen.clone());
-                    let mut paths = vault_paths.read().clone();
-                    vault_catalog::add(&mut paths, chosen);
-                    match vault_catalog::save(&default_path, &paths) {
-                        Ok(()) => { vault_paths.set(paths); notice.set("Emplacement ajouté à la liste.".into()); }
-                        Err(error) => notice.set(error),
-                    }
-                }, "Ajouter cet emplacement" }
-            }
-
-            div { class: "gate-actions",
+                label { "Phrase secrète" input { r#type: "password", value: "{passphrase}", placeholder: "Phrase secrète du coffre sélectionné", oninput: move |event| passphrase.set(event.value()) } }
                 if selected_exists {
-                    button { class: "primary", onclick: move |_| {
+                    button { class: "primary gate-primary-action", onclick: move |_| {
                         let phrase = passphrase.read().clone();
                         match load_vault(&selected_open_path, &phrase) {
                             Ok(data) => { vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }
                             Err(error) => notice.set(format!("Impossible de déverrouiller ce coffre : {error}")),
                         }
-                    }, "Déverrouiller ce coffre" }
+                    }, "Déverrouiller le coffre sélectionné" }
                 } else {
-                    button { class: "primary", onclick: move |_| {
-                        let phrase = passphrase.read().clone();
-                        if phrase.len() < 12 { notice.set("Choisissez une phrase secrète d’au moins 12 caractères.".into()); return; }
-                        if selected_create_path.exists() { notice.set("Cet emplacement existe déjà et n’est pas un fichier de coffre. Choisissez un autre nom.".into()); return; }
-                        let data = VaultData::default();
-                        match save_vault(&selected_create_path, &data, &phrase) {
-                            Ok(()) => { vault.set(Some(data)); notice.set("Coffre créé et chiffré à cet emplacement.".into()); }
-                            Err(error) => notice.set(format!("Création impossible : {error}")),
+                    p { class: "quiet", "Choisissez un coffre présent ou parcourez vos fichiers pour en ajouter un." }
+                }
+                if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
+                    button { class: "secondary browse-vault-button", onclick: move |_| {
+                        if let Some(chosen) = choose_existing_vault() {
+                            let mut paths = vault_paths.read().clone();
+                            vault_catalog::add(&mut paths, chosen.clone());
+                            match vault_catalog::save(&default_for_browse, &paths) {
+                                Ok(()) => { vault_paths.set(paths); path.set(chosen); passphrase.set(String::new()); notice.set("Coffre ajouté à la liste.".into()); },
+                                Err(error) => notice.set(error),
+                            }
                         }
-                    }, "Créer un coffre ici" }
+                    }, "Parcourir les fichiers pour trouver un coffre…" }
+                }
+            } else {
+                section { class: "panel vault-create-panel",
+                    div { class: "panel-title", "Nouveau coffre chiffré" }
+                    p { class: "quiet", "Choisissez un nom, un emplacement et une phrase secrète. La confirmation évite les erreurs de saisie." }
+                    label { "Nom du coffre" input { value: "{new_vault_name}", placeholder: "Ex. Personnel", oninput: move |event| new_vault_name.set(event.value()) } }
+                    label { "Fichier de destination" input { r#type: "text", value: "{vault_path_input}", placeholder: "Chemin du fichier .akrat", oninput: move |event| vault_path_input.set(event.value()) } }
+                    if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
+                        button { class: "secondary browse-vault-button", onclick: move |_| {
+                            if let Some(chosen) = choose_new_vault_path() {
+                                vault_path_input.set(chosen.display().to_string());
+                                new_vault_name.set(chosen.file_stem().and_then(|name| name.to_str()).unwrap_or("vault").to_string());
+                            }
+                        }, "Choisir un emplacement…" }
+                    }
+                    label { "Phrase secrète · 12 caractères minimum" input { r#type: "password", value: "{passphrase}", placeholder: "Créer une phrase secrète", oninput: move |event| passphrase.set(event.value()) } }
+                    label { "Confirmer la phrase secrète" input { r#type: "password", value: "{confirm_passphrase}", placeholder: "Saisir la même phrase secrète", oninput: move |event| confirm_passphrase.set(event.value()) } }
+                    button { class: "primary gate-primary-action", onclick: move |_| {
+                        let phrase = passphrase.read().clone();
+                        let confirmation = confirm_passphrase.read().clone();
+                        if phrase.len() < 12 { notice.set("La phrase secrète doit contenir au moins 12 caractères.".into()); return; }
+                        if phrase != confirmation { notice.set("Les deux phrases secrètes ne correspondent pas.".into()); return; }
+                        let base = PathBuf::from(vault_path_input.read().trim());
+                        let destination = match vault_path_with_name(&base, &new_vault_name.read()) { Ok(path) => path, Err(error) => { notice.set(error); return; } };
+                        if destination.exists() { notice.set("Un fichier existe déjà à cet emplacement. Choisissez un autre nom ou dossier.".into()); return; }
+                        let mut data = VaultData::default();
+                        if let Err(error) = save_vault(&destination, &mut data, &phrase) { notice.set(format!("Création impossible : {error}")); return; }
+                        let mut paths = vault_paths.read().clone();
+                        vault_catalog::add(&mut paths, destination.clone());
+                        if let Err(error) = vault_catalog::save(&default_for_create, &paths) {
+                            let _ = std::fs::remove_file(&destination);
+                            notice.set(format!("Impossible d’enregistrer le coffre dans la liste : {error}"));
+                            return;
+                        }
+                        path.set(destination.clone());
+                        vault_path_input.set(destination.display().to_string());
+                        vault_paths.set(paths);
+                        vault.set(Some(data));
+                        confirm_passphrase.set(String::new());
+                        notice.set("Coffre créé et chiffré. Le réseau démarre automatiquement.".into());
+                    }, "Créer et chiffrer le coffre" }
                 }
             }
             p { class: "notice", "{notice}" }
-            div { class: "path-note", "COFFRE SÉLECTIONNÉ · {selected_path.display()}" }
+            if *tab.read() == VaultGateTab::Existing { div { class: "path-note", "COFFRE SÉLECTIONNÉ · {selected_path.display()}" } }
         }
     }
+}
+
+fn vault_path_with_name(base_path: &Path, raw_name: &str) -> Result<PathBuf, String> {
+    let name = raw_name.trim();
+    let base_name = if name.to_ascii_lowercase().ends_with(".akrat") {
+        &name[..name.len() - ".akrat".len()]
+    } else {
+        name
+    };
+    if base_name.is_empty()
+        || base_name == "."
+        || base_name == ".."
+        || base_name
+            .chars()
+            .any(|character| character.is_control() || "<>:\"/\\|?*".contains(character))
+    {
+        return Err("Choisissez un nom de coffre valide, sans séparateur de dossier.".into());
+    }
+    let parent = if base_path.is_dir() {
+        base_path
+    } else {
+        base_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    Ok(parent.join(format!("{base_name}.akrat")))
 }
 
 #[cfg(all(
@@ -691,7 +846,7 @@ fn IdentitiesPage(
                         match Identity::generate(name) {
                             Ok(identity) => {
                                 data.identities.push(identity);
-                                match save_vault(&create_path, &data, &phrase) {
+                                match save_vault(&create_path, &mut data, &phrase) {
                                     Ok(()) => { vault.set(Some(data)); identity_name.set(String::new()); notice.set("Nouvelle identité créée. Le réseau l’active automatiquement.".into()); },
                                     Err(error) => notice.set(format!("Enregistrement impossible : {error}")),
                                 }
@@ -781,7 +936,7 @@ fn ContactsPage(
                                 data.contacts.push(Contact { fingerprint: invitation.fingerprint, name, public_key: invitation.public_key, transport_id: invitation.transport_id, legacy_address: String::new(), manually_verified: false });
                                 false
                             };
-                            match save_vault(&import_path, &data, &phrase) {
+                            match save_vault(&import_path, &mut data, &phrase) {
                                 Ok(()) => { vault.set(Some(data)); import_uri.set(String::new()); contact_name.set(String::new()); notice.set(if updated { "Invitation actualisée · comparez de nouveau l’empreinte avant de vérifier le contact.".into() } else { "Invitation importée · comparez l’empreinte avant de vérifier le contact.".into() }); },
                                 Err(error) => notice.set(format!("Enregistrement impossible : {error}")),
                             }
@@ -813,7 +968,7 @@ fn ContactRow(
     rsx! { div { class: "contact-row", div { class: "record-icon", "⌁" } div { class: "record-main", strong { "{contact.name}" } span { class: "fingerprint", "{contact.fingerprint}" } span { class: "quiet", if transport_id.is_empty() { "Ancienne invitation · à réimporter" } else { "Identité réseau stable · itinérance" } } } if verified { span { class: "verified", "VÉRIFIÉ" } } else { button { class: "secondary compact", onclick: move |_| {
         let phrase = passphrase.read().clone(); let mut d = match load_vault(&path, &phrase) { Ok(d) => d, Err(e) => { notice.set(format!("Coffre inaccessible : {e}")); return; } };
         if let Some(item) = d.contacts.iter_mut().find(|c| c.fingerprint == fp) { item.manually_verified = true; }
-        match save_vault(&path, &d, &phrase) { Ok(()) => { vault.set(Some(d)); notice.set("Contact marqué comme vérifié. Confirmez son empreinte avec lui en personne ou par un canal sûr.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
+        match save_vault(&path, &mut d, &phrase) { Ok(()) => { vault.set(Some(d)); notice.set("Contact marqué comme vérifié. Confirmez son empreinte avec lui en personne ou par un canal sûr.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
     }, "Empreinte comparée hors AKRAT" } } } }
 }
 
@@ -1031,10 +1186,10 @@ fn ChatPage(
                             oninput: move |e| draft.set(e.value()),
                             onkeydown: move |event| if event.key() == Key::Enter && !event.modifiers().shift() {
                                 event.prevent_default();
-                                if let Some(key) = input_conversation.clone() { submit_message(key, draft, input_path.clone(), passphrase, vault, sessions, notice, trace); }
+                                    if let Some(key) = input_conversation.clone() { submit_message(key, draft, input_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); }
                             }
                         }
-                        button { class: "primary", disabled: !connected, onclick: move |_| if let Some(key) = button_conversation.clone() { submit_message(key, draft, button_path.clone(), passphrase, vault, sessions, notice, trace); }, "Envoyer" }
+                        button { class: "primary", onclick: move |_| if let Some(key) = button_conversation.clone() { submit_message(key, draft, button_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); }, if connected { "Envoyer" } else { "Mettre en file" } }
                     }
                 } else {
                     div { class: "chat-empty-state",
@@ -1056,6 +1211,7 @@ fn MessageCard(message: StoredMessage) -> Element {
     let outgoing = message.outgoing;
     let status = match message.delivery {
         DeliveryState::Pending => "EN ATTENTE",
+        DeliveryState::Queued => "DANS LA FILE",
         DeliveryState::Sent => "TRANSMIS · ACCUSÉ EN ATTENTE",
         DeliveryState::Received => "REÇU",
         DeliveryState::Acknowledged => "REMIS",
@@ -1065,6 +1221,10 @@ fn MessageCard(message: StoredMessage) -> Element {
         DeliveryState::Pending => vec![
             "Enregistré dans le coffre local",
             "En attente de transmission",
+        ],
+        DeliveryState::Queued => vec![
+            "Enregistré et chiffré dans le coffre local",
+            "Tentatives de connexion P2P automatiques",
         ],
         DeliveryState::Sent => vec![
             "Enregistré dans le coffre local",
@@ -1118,6 +1278,7 @@ fn submit_message(
     sessions: Signal<HashMap<String, SessionHandle>>,
     mut notice: Signal<String>,
     mut trace: Signal<Vec<String>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
 ) {
     let text = draft.read().trim().to_string();
     if text.is_empty() {
@@ -1147,7 +1308,7 @@ fn submit_message(
         id.clone(),
         text.clone(),
     ));
-    if let Err(error) = save_vault(&path, &data, &phrase) {
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
         notice.set(format!("Sauvegarde impossible : {error}"));
         return;
     }
@@ -1164,24 +1325,67 @@ fn submit_message(
         .map(|session| session.send_text(id.clone(), text))
     {
         Some(Ok(())) => {}
-        Some(Err(error)) => update_message_status(
-            &path,
-            &phrase,
-            vault,
-            (&conversation, &id),
-            DeliveryState::Unconfirmed,
-            &mut notice,
-            error,
-        ),
-        None => update_message_status(
-            &path,
-            &phrase,
-            vault,
-            (&conversation, &id),
-            DeliveryState::Unconfirmed,
-            &mut notice,
-            "Session hors ligne".into(),
-        ),
+        Some(Err(error)) => {
+            update_message_status(
+                &path,
+                &phrase,
+                vault,
+                (&conversation, &id),
+                DeliveryState::Queued,
+                &mut notice,
+                format!("Message gardé dans la file locale : {error}"),
+            );
+            push_trace(
+                &mut trace,
+                "Message conservé · reconnexion P2P automatique lancée".into(),
+            );
+            start_retry_for_conversation(&conversation, vault, event_sender);
+        }
+        None => {
+            update_message_status(
+                &path,
+                &phrase,
+                vault,
+                (&conversation, &id),
+                DeliveryState::Queued,
+                &mut notice,
+                "Message gardé dans la file locale · AKRAT réessaie automatiquement.".into(),
+            );
+            push_trace(
+                &mut trace,
+                "Message conservé · reconnexion P2P automatique lancée".into(),
+            );
+            start_retry_for_conversation(&conversation, vault, event_sender);
+        }
+    }
+}
+
+fn start_retry_for_conversation(
+    conversation: &str,
+    vault: Signal<Option<VaultData>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) {
+    let Some((identity_id, fingerprint)) = conversation.split_once(':') else {
+        return;
+    };
+    let (identity, contact) = {
+        let snapshot = vault.read();
+        let Some(data) = snapshot.as_ref() else {
+            return;
+        };
+        (
+            data.identities
+                .iter()
+                .find(|identity| identity.id == identity_id)
+                .map(Identity::detached_copy),
+            data.contacts
+                .iter()
+                .find(|contact| contact.fingerprint == fingerprint && contact.manually_verified)
+                .cloned(),
+        )
+    };
+    if let (Some(identity), Some(contact)) = (identity, contact) {
+        runtime::connect(identity, contact, event_sender.read().clone());
     }
 }
 
@@ -1215,7 +1419,7 @@ fn update_message_status(
 ) {
     if let Ok(mut data) = load_vault(path, passphrase) {
         update_delivery(&mut data, message_key.0, message_key.1, status);
-        if save_vault(path, &data, passphrase).is_ok() {
+        if save_vault(path, &mut data, passphrase).is_ok() {
             vault.set(Some(data));
         }
     }

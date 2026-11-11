@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "akrat"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "akrat-core",
  "clap",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-desktop"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "akrat-core",
  "chrono",

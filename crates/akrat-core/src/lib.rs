@@ -1,6 +1,6 @@
 pub mod network;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use base64::Engine;
@@ -14,7 +14,8 @@ use std::path::Path;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
+const LEGACY_FORMAT_VERSION: u8 = 1;
 const MAX_VAULT_SIZE: usize = 16 * 1024 * 1024;
 const NOISE_PROTOCOL: &str = "Noise_XX_25519_AESGCM_SHA256";
 
@@ -193,18 +194,67 @@ pub struct StoredMessage {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DeliveryState {
     Pending,
+    Queued,
     Sent,
     Received,
     Acknowledged,
     Unconfirmed,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl DeliveryState {
+    pub fn needs_delivery(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Queued | Self::Sent | Self::Unconfirmed
+        )
+    }
+}
+
+#[derive(Default)]
 pub struct VaultData {
     pub identities: Vec<Identity>,
     pub contacts: Vec<Contact>,
     pub messages: Vec<StoredMessage>,
+    pub conversation_keys: Vec<ConversationKey>,
+}
+
+/// Independent local-storage key for one DM. Its fields stay private so callers
+/// can carry the vault without accidentally treating this as an identity key.
+pub struct ConversationKey {
+    conversation: String,
+    key: Zeroizing<[u8; 32]>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyVaultData {
+    identities: Vec<Identity>,
+    contacts: Vec<Contact>,
+    messages: Vec<StoredMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConversationKey {
+    conversation: String,
+    key: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMessageCiphertext {
+    conversation: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultStorageV2 {
+    identities: Vec<Identity>,
+    contacts: Vec<Contact>,
+    conversation_keys: Vec<StoredConversationKey>,
+    messages: Vec<StoredMessageCiphertext>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,7 +275,8 @@ pub fn fingerprint(public_key: &[u8]) -> String {
         .join(" ")
 }
 
-pub fn save_vault(path: &Path, data: &VaultData, passphrase: &str) -> Result<(), AkratError> {
+pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result<(), AkratError> {
+    ensure_conversation_keys(data)?;
     validate_vault(data)?;
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 12];
@@ -236,8 +287,56 @@ pub fn save_vault(path: &Path, data: &VaultData, passphrase: &str) -> Result<(),
         .hash_password_into(passphrase.as_bytes(), &salt, key.as_mut())
         .map_err(|_| AkratError::Authentication)?;
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| AkratError::Authentication)?;
+    let mut encrypted_messages = Vec::with_capacity(data.messages.len());
+    for message in &data.messages {
+        let conversation_key = data
+            .conversation_keys
+            .iter()
+            .find(|key| key.conversation == message.conversation)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(conversation_key.key.as_ref())
+            .map_err(|_| AkratError::Authentication)?;
+        let mut message_nonce = [0u8; 12];
+        getrandom::fill(&mut message_nonce).map_err(|_| AkratError::Random)?;
+        let mut message_plaintext =
+            Zeroizing::new(serde_json::to_vec(message).map_err(|_| AkratError::Serialization)?);
+        let nonce =
+            Nonce::try_from(message_nonce.as_slice()).map_err(|_| AkratError::Authentication)?;
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: message_plaintext.as_slice(),
+                    aad: message.conversation.as_bytes(),
+                },
+            )
+            .map_err(|_| AkratError::Authentication)?;
+        message_plaintext.zeroize();
+        encrypted_messages.push(StoredMessageCiphertext {
+            conversation: message.conversation.clone(),
+            nonce: message_nonce.to_vec(),
+            ciphertext,
+        });
+    }
+    let storage = VaultStorageV2 {
+        identities: data
+            .identities
+            .iter()
+            .map(Identity::detached_copy)
+            .collect(),
+        contacts: data.contacts.clone(),
+        conversation_keys: data
+            .conversation_keys
+            .iter()
+            .map(|key| StoredConversationKey {
+                conversation: key.conversation.clone(),
+                key: key.key.to_vec(),
+            })
+            .collect(),
+        messages: encrypted_messages,
+    };
     let mut plaintext =
-        Zeroizing::new(serde_json::to_vec(data).map_err(|_| AkratError::Serialization)?);
+        Zeroizing::new(serde_json::to_vec(&storage).map_err(|_| AkratError::Serialization)?);
     if plaintext.len() > MAX_VAULT_SIZE {
         return Err(AkratError::InvalidVault);
     }
@@ -269,7 +368,7 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
     }
     let envelope: VaultEnvelope =
         serde_json::from_slice(&encoded).map_err(|_| AkratError::InvalidVault)?;
-    if envelope.version != FORMAT_VERSION
+    if (envelope.version != FORMAT_VERSION && envelope.version != LEGACY_FORMAT_VERSION)
         || envelope.salt.len() != 16
         || envelope.nonce.len() != 12
         || envelope.ciphertext.len() < 16
@@ -286,10 +385,97 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
         .decrypt(&nonce, envelope.ciphertext.as_slice())
         .map_err(|_| AkratError::Authentication)?;
     let mut plaintext = Zeroizing::new(plaintext);
-    let result = serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
+    if envelope.version == LEGACY_FORMAT_VERSION {
+        let legacy: LegacyVaultData =
+            serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
+        plaintext.zeroize();
+        let mut result = VaultData {
+            identities: legacy.identities,
+            contacts: legacy.contacts,
+            messages: legacy.messages,
+            conversation_keys: Vec::new(),
+        };
+        ensure_conversation_keys(&mut result)?;
+        validate_vault(&result)?;
+        // Upgrade in place atomically so the first unlock migrates old histories.
+        save_vault(path, &mut result, passphrase)?;
+        return Ok(result);
+    }
+    let stored: VaultStorageV2 =
+        serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
     plaintext.zeroize();
+    let mut conversation_keys = Vec::with_capacity(stored.conversation_keys.len());
+    for stored_key in stored.conversation_keys {
+        let key: [u8; 32] = stored_key
+            .key
+            .try_into()
+            .map_err(|_| AkratError::InvalidVault)?;
+        conversation_keys.push(ConversationKey {
+            conversation: stored_key.conversation,
+            key: Zeroizing::new(key),
+        });
+    }
+    let mut messages = Vec::with_capacity(stored.messages.len());
+    for stored_message in stored.messages {
+        if stored_message.nonce.len() != 12 {
+            return Err(AkratError::InvalidVault);
+        }
+        let conversation_key = conversation_keys
+            .iter()
+            .find(|key| key.conversation == stored_message.conversation)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(conversation_key.key.as_ref())
+            .map_err(|_| AkratError::InvalidVault)?;
+        let nonce = Nonce::try_from(stored_message.nonce.as_slice())
+            .map_err(|_| AkratError::InvalidVault)?;
+        let mut message_plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: stored_message.ciphertext.as_slice(),
+                        aad: stored_message.conversation.as_bytes(),
+                    },
+                )
+                .map_err(|_| AkratError::Authentication)?,
+        );
+        let message: StoredMessage =
+            serde_json::from_slice(&message_plaintext).map_err(|_| AkratError::InvalidVault)?;
+        message_plaintext.zeroize();
+        if message.conversation != stored_message.conversation {
+            return Err(AkratError::InvalidVault);
+        }
+        messages.push(message);
+    }
+    let result = VaultData {
+        identities: stored.identities,
+        contacts: stored.contacts,
+        messages,
+        conversation_keys,
+    };
     validate_vault(&result)?;
     Ok(result)
+}
+
+fn ensure_conversation_keys(data: &mut VaultData) -> Result<(), AkratError> {
+    let mut seen = std::collections::HashSet::new();
+    for key in &data.conversation_keys {
+        if key.conversation.is_empty() || !seen.insert(key.conversation.clone()) {
+            return Err(AkratError::InvalidVault);
+        }
+    }
+    for message in &data.messages {
+        if !seen.contains(&message.conversation) {
+            let mut key = Zeroizing::new([0u8; 32]);
+            getrandom::fill(key.as_mut()).map_err(|_| AkratError::Random)?;
+            data.conversation_keys.push(ConversationKey {
+                conversation: message.conversation.clone(),
+                key,
+            });
+            seen.insert(message.conversation.clone());
+        }
+    }
+    Ok(())
 }
 
 fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
@@ -323,6 +509,19 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
         {
             return Err(AkratError::InvalidVault);
         }
+    }
+    let mut conversation_keys = std::collections::HashSet::new();
+    for key in &data.conversation_keys {
+        if key.conversation.is_empty() || !conversation_keys.insert(key.conversation.as_str()) {
+            return Err(AkratError::InvalidVault);
+        }
+    }
+    if data
+        .messages
+        .iter()
+        .any(|message| !conversation_keys.contains(message.conversation.as_str()))
+    {
+        return Err(AkratError::InvalidVault);
     }
     Ok(())
 }
@@ -372,10 +571,7 @@ pub(crate) fn noise_params() -> Result<NoiseParams, AkratError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AkratError, Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData,
-        load_vault, save_vault, write_atomically_with_interrupt,
-    };
+    use super::*;
     use std::fs;
 
     #[test]
@@ -384,7 +580,7 @@ mod tests {
         let path = directory.path().join("vault.akrat");
         let identity = Identity::generate("Alice".to_string()).expect("identity");
         let bob = Identity::generate("Bob".to_string()).expect("Bob");
-        let data = VaultData {
+        let mut data = VaultData {
             identities: vec![identity],
             contacts: vec![Contact {
                 fingerprint: bob.fingerprint(),
@@ -394,16 +590,27 @@ mod tests {
                 legacy_address: "127.0.0.1:4000".to_string(),
                 manually_verified: true,
             }],
-            messages: vec![StoredMessage {
-                conversation: "peer".to_string(),
-                id: "message-1".to_string(),
-                outgoing: false,
-                text: "hello".to_string(),
-                delivery: DeliveryState::Received,
-                timestamp: 42,
-            }],
+            messages: vec![
+                StoredMessage {
+                    conversation: "peer".to_string(),
+                    id: "message-1".to_string(),
+                    outgoing: false,
+                    text: "hello".to_string(),
+                    delivery: DeliveryState::Received,
+                    timestamp: 42,
+                },
+                StoredMessage {
+                    conversation: "peer".to_string(),
+                    id: "queued-message".to_string(),
+                    outgoing: true,
+                    text: "stored while offline".to_string(),
+                    delivery: DeliveryState::Queued,
+                    timestamp: 43,
+                },
+            ],
+            conversation_keys: Vec::new(),
         };
-        save_vault(&path, &data, "correct horse battery staple").expect("save");
+        save_vault(&path, &mut data, "correct horse battery staple").expect("save");
         let bytes = fs::read(&path).expect("read vault");
         assert!(!String::from_utf8_lossy(&bytes).contains("correct horse battery staple"));
         assert!(!String::from_utf8_lossy(&bytes).contains("hello"));
@@ -412,13 +619,135 @@ mod tests {
         assert_eq!(loaded.identities[0].id, data.identities[0].id);
         assert_eq!(loaded.contacts[0].name, "Bob");
         assert_eq!(loaded.messages[0].text, "hello");
+        assert_eq!(loaded.messages[1].delivery, DeliveryState::Queued);
+        assert!(loaded.messages[1].delivery.needs_delivery());
+    }
+
+    #[test]
+    fn each_dm_has_a_stable_independent_storage_key_and_encrypted_records() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let mut data = VaultData {
+            messages: vec![
+                StoredMessage {
+                    conversation: "alice:bob".into(),
+                    id: "message-bob".into(),
+                    outgoing: true,
+                    text: "secret for Bob".into(),
+                    delivery: DeliveryState::Sent,
+                    timestamp: 10,
+                },
+                StoredMessage {
+                    conversation: "alice:carol".into(),
+                    id: "message-carol".into(),
+                    outgoing: false,
+                    text: "secret for Carol".into(),
+                    delivery: DeliveryState::Received,
+                    timestamp: 11,
+                },
+            ],
+            ..VaultData::default()
+        };
+
+        save_vault(&path, &mut data, "vault passphrase").expect("save");
+        assert_eq!(data.conversation_keys.len(), 2);
+        assert_ne!(
+            data.conversation_keys[0].key.as_ref(),
+            data.conversation_keys[1].key.as_ref()
+        );
+        let original_keys = data
+            .conversation_keys
+            .iter()
+            .map(|key| (key.conversation.clone(), *key.key))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let envelope: VaultEnvelope =
+            serde_json::from_slice(&fs::read(&path).expect("read vault")).expect("envelope");
+        assert_eq!(envelope.version, FORMAT_VERSION);
+        let mut master_key = Zeroizing::new([0u8; 32]);
+        Argon2::default()
+            .hash_password_into(b"vault passphrase", &envelope.salt, master_key.as_mut())
+            .expect("derive vault key");
+        let vault_cipher = Aes256Gcm::new_from_slice(master_key.as_ref()).expect("cipher");
+        let vault_nonce = Nonce::try_from(envelope.nonce.as_slice()).expect("vault nonce");
+        let inner = vault_cipher
+            .decrypt(&vault_nonce, envelope.ciphertext.as_slice())
+            .expect("decrypt outer vault");
+        let stored: VaultStorageV2 = serde_json::from_slice(&inner).expect("stored vault");
+        assert_eq!(stored.messages.len(), 2);
+        for message in &stored.messages {
+            let encoded = serde_json::to_vec(message).expect("encode record");
+            assert!(!String::from_utf8_lossy(&encoded).contains("secret for"));
+        }
+
+        let mut loaded = load_vault(&path, "vault passphrase").expect("load");
+        assert_eq!(loaded.messages[0].text, "secret for Bob");
+        assert_eq!(loaded.messages[1].text, "secret for Carol");
+        assert_eq!(loaded.conversation_keys.len(), 2);
+        for key in &loaded.conversation_keys {
+            assert_eq!(original_keys[&key.conversation], *key.key);
+        }
+        save_vault(&path, &mut loaded, "vault passphrase").expect("save again");
+        let reopened = load_vault(&path, "vault passphrase").expect("reopen");
+        for key in &reopened.conversation_keys {
+            assert_eq!(original_keys[&key.conversation], *key.key);
+        }
+    }
+
+    #[test]
+    fn legacy_vault_migrates_to_per_conversation_encryption_on_unlock() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("legacy.akrat");
+        let legacy = LegacyVaultData {
+            identities: Vec::new(),
+            contacts: Vec::new(),
+            messages: vec![StoredMessage {
+                conversation: "alice:bob".into(),
+                id: "old-message".into(),
+                outgoing: false,
+                text: "legacy history".into(),
+                delivery: DeliveryState::Received,
+                timestamp: 12,
+            }],
+        };
+        let salt = [7u8; 16];
+        let nonce_bytes = [9u8; 12];
+        let mut master_key = Zeroizing::new([0u8; 32]);
+        Argon2::default()
+            .hash_password_into(b"legacy passphrase", &salt, master_key.as_mut())
+            .expect("derive vault key");
+        let cipher = Aes256Gcm::new_from_slice(master_key.as_ref()).expect("cipher");
+        let nonce = Nonce::try_from(nonce_bytes.as_slice()).expect("nonce");
+        let plaintext = serde_json::to_vec(&legacy).expect("serialize legacy data");
+        let envelope = VaultEnvelope {
+            version: LEGACY_FORMAT_VERSION,
+            salt: salt.to_vec(),
+            nonce: nonce_bytes.to_vec(),
+            ciphertext: cipher
+                .encrypt(&nonce, plaintext.as_slice())
+                .expect("encrypt"),
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&envelope).expect("serialize envelope"),
+        )
+        .expect("write legacy vault");
+
+        let migrated = load_vault(&path, "legacy passphrase").expect("migrate on unlock");
+        assert_eq!(migrated.messages[0].text, "legacy history");
+        assert_eq!(migrated.conversation_keys.len(), 1);
+        let migrated_envelope: VaultEnvelope =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated vault"))
+                .expect("migrated envelope");
+        assert_eq!(migrated_envelope.version, FORMAT_VERSION);
     }
 
     #[test]
     fn wrong_passphrase_and_tampering_fail_closed() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
-        save_vault(&path, &VaultData::default(), "secret").expect("save");
+        let mut data = VaultData::default();
+        save_vault(&path, &mut data, "secret").expect("save");
         assert!(matches!(
             load_vault(&path, "wrong"),
             Err(AkratError::Authentication)
@@ -435,10 +764,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
         let mut data = VaultData::default();
-        save_vault(&path, &data, "secret").expect("first save");
+        save_vault(&path, &mut data, "secret").expect("first save");
         data.identities
             .push(Identity::generate("Alice".to_string()).expect("identity"));
-        save_vault(&path, &data, "secret").expect("replacement save");
+        save_vault(&path, &mut data, "secret").expect("replacement save");
         let reopened = load_vault(&path, "secret").expect("reopen");
         assert_eq!(reopened.identities.len(), 1);
     }
@@ -447,8 +776,8 @@ mod tests {
     fn interruption_after_temporary_file_sync_keeps_previous_vault() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
-        let original = VaultData::default();
-        save_vault(&path, &original, "secret").expect("initial save");
+        let mut original = VaultData::default();
+        save_vault(&path, &mut original, "secret").expect("initial save");
         let previous = fs::read(&path).expect("original bytes");
         assert!(write_atomically_with_interrupt(&path, b"incomplete replacement", true).is_err());
         assert_eq!(fs::read(&path).expect("preserved bytes"), previous);

@@ -37,6 +37,15 @@ pub fn remove(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.retain(|existing| !same_path(existing, path));
 }
 
+pub fn replace(paths: &mut Vec<PathBuf>, old: &Path, new: PathBuf) -> bool {
+    let Some(index) = paths.iter().position(|existing| same_path(existing, old)) else {
+        return false;
+    };
+    paths[index] = new;
+    deduplicate(paths);
+    true
+}
+
 fn catalog_path(default_path: &Path) -> PathBuf {
     default_path
         .parent()

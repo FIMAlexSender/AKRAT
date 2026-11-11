@@ -96,7 +96,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 return Err("un coffre existe déjà à cet emplacement".into());
             }
             let passphrase = new_passphrase()?;
-            save_vault(&path, &VaultData::default(), &passphrase)?;
+            let mut data = VaultData::default();
+            save_vault(&path, &mut data, &passphrase)?;
             println!("Coffre créé et verrouillé : {}", path.display());
         }
         Command::Vault {
@@ -118,7 +119,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("Identité créée : {}", identity.name);
             println!("Empreinte publique : {}", identity.fingerprint());
             data.identities.push(identity);
-            save_vault(&path, &data, &passphrase)?;
+            save_vault(&path, &mut data, &passphrase)?;
         }
         Command::Identity {
             action: IdentityCommand::List,
@@ -159,7 +160,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 });
                 false
             };
-            save_vault(&path, &data, &passphrase)?;
+            save_vault(&path, &mut data, &passphrase)?;
             println!(
                 "{} comme non vérifié : {}",
                 if updated {
@@ -218,7 +219,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 return Err("l'empreinte saisie ne correspond pas".into());
             }
             contact.manually_verified = true;
-            save_vault(&path, &data, &passphrase)?;
+            save_vault(&path, &mut data, &passphrase)?;
             println!("Identité vérifiée manuellement et enregistrée dans le coffre.");
         }
         Command::Invite { identity } => {
@@ -445,10 +446,7 @@ where
         .filter(|message| {
             message.conversation == conversation
                 && message.outgoing
-                && matches!(
-                    message.delivery,
-                    DeliveryState::Pending | DeliveryState::Unconfirmed | DeliveryState::Sent
-                )
+                && message.delivery.needs_delivery()
         })
         .map(|message| (message.id.clone(), message.text.clone()))
         .collect::<Vec<_>>();
@@ -488,12 +486,9 @@ where
     for message in data.messages.iter_mut().filter(|message| {
         message.conversation == conversation
             && message.outgoing
-            && matches!(
-                message.delivery,
-                DeliveryState::Pending | DeliveryState::Sent
-            )
+            && message.delivery.needs_delivery()
     }) {
-        message.delivery = DeliveryState::Unconfirmed;
+        message.delivery = DeliveryState::Queued;
     }
     save_vault(path, data, passphrase)?;
     println!("Session fermée; une reconnexion établira de nouvelles clés.");
@@ -698,6 +693,7 @@ mod tests {
                 delivery: DeliveryState::Unconfirmed,
                 timestamp: 1,
             }],
+            conversation_keys: Vec::new(),
         };
         assert!(!update_delivery(
             &mut data,

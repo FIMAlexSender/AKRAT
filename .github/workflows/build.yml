@@ -173,6 +173,7 @@ jobs:
                 "$folder/akrat-desktop" "$folder/akrat"
             fi
           done
+          cp dist/akrat-android-apk/app-debug.apk "dist/AKRAT-${version}-android.apk"
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
@@ -196,6 +197,7 @@ jobs:
             dist/AKRAT-"${GITHUB_REF_NAME}"-linux-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-macos-aarch64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-macos-x64.zip \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-android.apk \
             --title "AKRAT ${GITHUB_REF_NAME}" \
             --notes-file dist/release-notes.md
 
@@ -209,6 +211,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       - uses: android-actions/setup-android@v4
 
@@ -250,6 +256,18 @@ jobs:
           dx bundle --platform android --target aarch64-linux-android --package akrat-desktop
           --release --no-default-features --features mobile --package-types apk
           --out-dir dist/android
+
+      - name: Apply the AKRAT Android launcher icon
+        run: |
+          python -m pip install Pillow
+          python packaging/android/apply_launcher_icon.py \
+            --project target/dx/akrat-desktop/release/android/app \
+            --icon crates/akrat-desktop/assets/akrat-logo.png
+          bash target/dx/akrat-desktop/release/android/app/gradlew \
+            --project-dir target/dx/akrat-desktop/release/android/app \
+            --no-daemon --console=plain :app:assembleDebug
+          cp target/dx/akrat-desktop/release/android/app/app/build/outputs/apk/debug/app-debug.apk \
+            dist/android/app-debug.apk
 
       - uses: actions/upload-artifact@v4
         with:

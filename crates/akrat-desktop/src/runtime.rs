@@ -1,10 +1,11 @@
 use akrat_core::network::{self, SecureChannel};
 use akrat_core::{Contact, DeliveryState, Identity, StoredMessage};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, watch};
 use zeroize::Zeroize;
 
@@ -12,9 +13,12 @@ const IROH_ALPN: &[u8] = b"akrat-chat/0.1";
 static SERVICES: OnceLock<StdMutex<HashMap<String, (u64, mpsc::UnboundedSender<ServiceCommand>)>>> =
     OnceLock::new();
 static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIAL_ID: AtomicU64 = AtomicU64::new(1);
 
 enum ServiceCommand {
     Dial(Contact, mpsc::UnboundedSender<UiEvent>),
+    CancelDial(String),
+    DialFinished(String, u64),
     UpdateContacts(Vec<Contact>),
     Stop,
 }
@@ -117,6 +121,17 @@ pub fn update_contacts(identity_id: &str, contacts: Vec<Contact>) {
     }
 }
 
+pub fn cancel_retry(identity_id: &str, fingerprint: &str) {
+    let registry = SERVICES.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Some(sender) = registry
+        .lock()
+        .ok()
+        .and_then(|services| services.get(identity_id).map(|(_, sender)| sender.clone()))
+    {
+        let _ = sender.send(ServiceCommand::CancelDial(fingerprint.to_string()));
+    }
+}
+
 pub fn listen(
     identity: Identity,
     contacts: Vec<Contact>,
@@ -148,6 +163,8 @@ pub fn listen(
         };
         runtime.block_on(async move {
             let mut contacts = contacts;
+            let mut dial_workers = HashMap::<String, (u64, watch::Sender<bool>)>::new();
+            let active_conversations = Arc::new(Mutex::new(HashSet::<String>::new()));
             let transport_key_bytes = identity.transport_private_key();
             let transport_key = iroh::SecretKey::from_bytes(&transport_key_bytes);
             let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -179,11 +196,32 @@ pub fn listen(
                     changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { break; },
                     command = command_rx.recv() => match command {
                         Some(ServiceCommand::Dial(contact, command_events)) => {
-                            let endpoint = endpoint.clone();
-                            let identity = identity.detached_copy();
-                            tokio::spawn(async move { dial_contact(endpoint, identity, contact, command_events).await; });
+                            let peer_key = contact.fingerprint.clone();
+                            if !dial_workers.contains_key(&peer_key) {
+                                let worker_id = NEXT_DIAL_ID.fetch_add(1, Ordering::Relaxed);
+                                let (cancel, stopped) = watch::channel(false);
+                                dial_workers.insert(peer_key.clone(), (worker_id, cancel));
+                                let endpoint = endpoint.clone();
+                                let identity = identity.detached_copy();
+                                let active = active_conversations.clone();
+                                let finished = commands.clone();
+                                tokio::spawn(async move {
+                                    dial_contact(endpoint, identity, contact, command_events, active, stopped).await;
+                                    let _ = finished.send(ServiceCommand::DialFinished(peer_key, worker_id));
+                                });
+                            }
                         }
-                        Some(ServiceCommand::UpdateContacts(updated)) => contacts = updated,
+                        Some(ServiceCommand::CancelDial(fingerprint)) => {
+                            if let Some((_, cancel)) = dial_workers.remove(&fingerprint) { let _ = cancel.send(true); }
+                        }
+                        Some(ServiceCommand::DialFinished(fingerprint, worker_id)) => {
+                            if dial_workers.get(&fingerprint).is_some_and(|(id, _)| *id == worker_id) { dial_workers.remove(&fingerprint); }
+                        }
+                        Some(ServiceCommand::UpdateContacts(updated)) => {
+                            contacts = updated;
+                            let no_longer_verified = dial_workers.keys().filter(|fingerprint| !contacts.iter().any(|contact| contact.fingerprint.as_str() == fingerprint.as_str() && contact.manually_verified)).cloned().collect::<Vec<_>>();
+                            for fingerprint in no_longer_verified { if let Some((_, cancel)) = dial_workers.remove(&fingerprint) { let _ = cancel.send(true); } }
+                        }
                         Some(ServiceCommand::Stop) | None => break,
                     },
                     accepted = endpoint.accept() => match accepted {
@@ -199,18 +237,26 @@ pub fn listen(
                                 continue;
                             };
                             let _ = events.send(UiEvent::Trace(format!("Pair reconnu · {} · canal Noise XX", contact.name)));
+                            let conversation = format!("{}:{}", identity.id, contact.fingerprint);
+                            if !active_conversations.lock().await.insert(conversation.clone()) {
+                                connection.close(1u8.into(), b"session already active");
+                                continue;
+                            }
                             let permit = match handshake_slots.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
                                     let _ = events.send(UiEvent::Trace("Connexion refusée · trop de négociations simultanées".into()));
+                                    active_conversations.lock().await.remove(&conversation);
                                     connection.close(1u8.into(), b"busy");
                                     continue;
                                 }
                             };
                             let identity = identity.detached_copy();
                             let events = events.clone();
+                            let active = active_conversations.clone();
                             tokio::spawn(async move {
-                                accept_contact(connection, identity, contact, events).await;
+                                accept_contact(connection, identity, contact, conversation.clone(), events).await;
+                                active.lock().await.remove(&conversation);
                                 drop(permit);
                             });
                         }
@@ -218,6 +264,7 @@ pub fn listen(
                     }
                 }
             }
+            for (_, cancel) in dial_workers.values() { let _ = cancel.send(true); }
             endpoint.close().await;
             remove_service(&identity.id, service_id);
             let _ = events.send(UiEvent::Trace("Disponibilité P2P arrêtée".into()));
@@ -248,14 +295,67 @@ async fn dial_contact(
     identity: Identity,
     contact: Contact,
     events: mpsc::UnboundedSender<UiEvent>,
+    active_conversations: Arc<Mutex<HashSet<String>>>,
+    mut stopped: watch::Receiver<bool>,
 ) {
+    let conversation = format!("{}:{}", identity.id, contact.fingerprint);
+    let mut delay = Duration::from_secs(2);
+    loop {
+        if *stopped.borrow() {
+            return;
+        }
+        if active_conversations.lock().await.contains(&conversation) {
+            tokio::select! {
+                changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { return; },
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+            }
+        }
+        let attempt = tokio::select! {
+            changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { return; } else { continue; },
+            attempt = dial_contact_once(endpoint.clone(), identity.detached_copy(), contact.clone(), events.clone(), active_conversations.clone()) => attempt,
+        };
+        match attempt {
+            DialAttempt::Stop => return,
+            DialAttempt::SessionEnded => delay = Duration::from_secs(2),
+            DialAttempt::Retry => {}
+        }
+        let _ = events.send(UiEvent::Trace(format!(
+            "Nouvelle tentative P2P vers {} dans {} s",
+            contact.name,
+            delay.as_secs()
+        )));
+        tokio::select! {
+            changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { return; },
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = next_retry_delay(delay);
+    }
+}
+
+enum DialAttempt {
+    Retry,
+    SessionEnded,
+    Stop,
+}
+
+fn next_retry_delay(delay: Duration) -> Duration {
+    std::cmp::min(delay * 2, Duration::from_secs(60))
+}
+
+async fn dial_contact_once(
+    endpoint: iroh::Endpoint,
+    identity: Identity,
+    contact: Contact,
+    events: mpsc::UnboundedSender<UiEvent>,
+    active_conversations: Arc<Mutex<HashSet<String>>>,
+) -> DialAttempt {
     let remote_id = match contact.transport_id.parse::<iroh::EndpointId>() {
         Ok(id) => id,
         Err(error) => {
             let _ = events.send(UiEvent::Trace(format!(
                 "Identité réseau invalide : {error}"
             )));
-            return;
+            return DialAttempt::Stop;
         }
     };
     let _ = events.send(UiEvent::Trace(format!(
@@ -273,14 +373,14 @@ async fn dial_contact(
             let _ = events.send(UiEvent::Trace(format!(
                 "Pair injoignable · recherche P2P/direct et relais : {error}"
             )));
-            return;
+            return DialAttempt::Retry;
         }
         Err(_) => {
             let _ = events.send(UiEvent::Trace(
                 "Recherche P2P expirée après 90 secondes · vérifiez que le contact est en ligne"
                     .into(),
             ));
-            return;
+            return DialAttempt::Retry;
         }
     };
     let _ = events.send(UiEvent::Trace(
@@ -290,7 +390,7 @@ async fn dial_contact(
         Ok(stream) => stream,
         Err(error) => {
             let _ = events.send(UiEvent::Trace(format!("Flux P2P indisponible : {error}")));
-            return;
+            return DialAttempt::Retry;
         }
     };
     let pending = match tokio::time::timeout(
@@ -304,13 +404,13 @@ async fn dial_contact(
             let _ = events.send(UiEvent::Trace(format!(
                 "Négociation Noise refusée : {error}"
             )));
-            return;
+            return DialAttempt::Retry;
         }
         Err(_) => {
             let _ = events.send(UiEvent::Trace(
                 "Négociation Noise expirée après 30 secondes".into(),
             ));
-            return;
+            return DialAttempt::Retry;
         }
     };
     let _ = events.send(UiEvent::Trace(format!(
@@ -321,17 +421,30 @@ async fn dial_contact(
         Ok(channel) => channel,
         Err(error) => {
             let _ = events.send(UiEvent::Trace(format!("Empreinte refusée : {error}")));
-            return;
+            return DialAttempt::Stop;
         }
     };
     let conversation = format!("{}:{}", identity.id, contact.fingerprint);
+    if !active_conversations
+        .lock()
+        .await
+        .insert(conversation.clone())
+    {
+        return DialAttempt::Retry;
+    }
     start_session(channel, conversation, contact.name, events).await;
+    active_conversations
+        .lock()
+        .await
+        .remove(&format!("{}:{}", identity.id, contact.fingerprint));
+    DialAttempt::SessionEnded
 }
 
 async fn accept_contact(
     connection: iroh::endpoint::Connection,
     identity: Identity,
     contact: Contact,
+    conversation: String,
     events: mpsc::UnboundedSender<UiEvent>,
 ) {
     let stream = match iroh_stream(connection, true).await {
@@ -376,7 +489,6 @@ async fn accept_contact(
         "Identité de {} reconnue et vérifiée",
         contact.name
     )));
-    let conversation = format!("{}:{}", identity.id, contact.fingerprint);
     start_session(channel, conversation, contact.name, events).await;
 }
 
@@ -547,11 +659,22 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionHandle, UiEvent, start_session};
+    use super::{SessionHandle, UiEvent, next_retry_delay, start_session};
     use akrat_core::Identity;
     use akrat_core::network;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn automatic_retry_backoff_is_capped() {
+        let mut delay = std::time::Duration::from_secs(2);
+        let mut attempts = Vec::new();
+        for _ in 0..8 {
+            attempts.push(delay.as_secs());
+            delay = next_retry_delay(delay);
+        }
+        assert_eq!(attempts, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
 
     #[tokio::test]
     async fn session_actor_delivers_messages_and_authenticated_acknowledgements() {
