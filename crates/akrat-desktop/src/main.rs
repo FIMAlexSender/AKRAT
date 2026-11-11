@@ -1,5 +1,6 @@
 mod runtime;
 mod updater;
+mod vault_catalog;
 
 use akrat_core::{
     Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData, load_vault, save_vault,
@@ -61,6 +62,8 @@ enum Page {
 #[component]
 fn App() -> Element {
     let path = use_signal(default_vault_path);
+    let vault_paths = use_signal(|| vault_catalog::load(&default_vault_path()));
+    let vault_path_input = use_signal(|| default_vault_path().display().to_string());
     let mut vault = use_signal(|| None::<VaultData>);
     let mut passphrase = use_signal(String::new);
     let identity_name = use_signal(String::new);
@@ -306,8 +309,6 @@ fn App() -> Element {
     });
 
     let path_value = path.read().clone();
-    let create_path = path_value.clone();
-    let open_path = path_value.clone();
     let opened = vault.read().is_some();
     let identities = vault
         .read()
@@ -330,27 +331,7 @@ fn App() -> Element {
                 div { class: "top-status", span { class: if opened { "status-dot live" } else { "status-dot" } } span { class: "lock-mark" } if opened { "Coffre déverrouillé" } else { "Coffre verrouillé" } }
             }
             if !opened {
-                section { class: "gate",
-                    div { class: "gate-kicker", "ESPACE PERSONNEL · CHIFFRÉ" }
-                    h1 { "Vos échanges restent" br {} em { "chez vous." } }
-                    p { "Le coffre AKRAT garde vos identités, contacts et conversations sur cet ordinateur, protégés par votre phrase secrète." }
-                    label { "Phrase secrète" input { r#type: "password", value: "{passphrase}", placeholder: "Au moins une phrase que vous seul connaissez", oninput: move |e| passphrase.set(e.value()) } }
-                    div { class: "gate-actions",
-                        button { class: "primary", onclick: move |_| {
-                            let phrase = passphrase.read().clone();
-                            if phrase.len() < 12 { notice.set("Choisissez une phrase secrète d’au moins 12 caractères.".into()); return; }
-                            if create_path.exists() { notice.set("Un coffre existe déjà à cet emplacement. Déverrouillez-le.".into()); return; }
-                            let data = VaultData::default();
-                            match save_vault(&create_path, &data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Coffre créé et chiffré sur cet appareil.".into()); }, Err(e) => notice.set(format!("Création impossible : {e}")) }
-                        }, "Créer mon coffre" }
-                        button { class: "secondary", onclick: move |_| {
-                            let phrase = passphrase.read().clone();
-                            match load_vault(&open_path, &phrase) { Ok(data) => { vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }, Err(e) => notice.set(format!("Impossible d’ouvrir le coffre : {e}")) }
-                        }, "Déverrouiller" }
-                    }
-                    p { class: "notice", "{notice}" }
-                    div { class: "path-note", "COFFRE LOCAL · {path_value.display()}" }
-                }
+                VaultGate { path, vault_paths, vault_path_input, passphrase, vault, notice }
             } else {
                 div { class: "workspace",
                     aside { class: "sidebar",
@@ -396,7 +377,7 @@ fn App() -> Element {
                                 vault.set(None);
                                 runtime::wipe_string(&mut passphrase.write());
                                 notice.set("Coffre verrouillé · sessions réseau fermées.".into());
-                            } } },
+                                } } },
                         }
                     }
                     aside { class: "trace",
@@ -409,6 +390,169 @@ fn App() -> Element {
             }
         }
     }
+}
+
+#[component]
+fn VaultGate(
+    mut path: Signal<PathBuf>,
+    mut vault_paths: Signal<Vec<PathBuf>>,
+    mut vault_path_input: Signal<String>,
+    mut passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    mut notice: Signal<String>,
+) -> Element {
+    let selected_path = path.read().clone();
+    let selected_exists = selected_path.is_file();
+    let selected_open_path = selected_path.clone();
+    let selected_create_path = selected_path.clone();
+    let default_path = default_vault_path();
+
+    rsx! {
+        section { class: "gate vault-gate",
+            div { class: "gate-kicker", "ESPACE PERSONNEL · CHIFFRÉ" }
+            h1 { "Vos échanges restent" br {} em { "chez vous." } }
+            p { "Chaque coffre garde ses propres identités, contacts et conversations. Choisissez où le conserver, puis déverrouillez-le avec sa phrase secrète." }
+
+            section { class: "vault-manager panel",
+                div { class: "panel-title", "Vos coffres" }
+                if vault_paths.read().is_empty() {
+                    p { class: "quiet", "Aucun coffre enregistré. Ajoutez un emplacement ci-dessous." }
+                }
+                for entry in vault_paths.read().iter() {
+                    {
+                        let entry_path = entry.clone();
+                        let path_to_remove = entry.clone();
+                        let default_for_remove = default_path.clone();
+                        let selected = entry == &selected_path;
+                        let exists = entry.is_file();
+                        let label = entry.file_name().and_then(|name| name.to_str()).unwrap_or("Coffre AKRAT").to_string();
+                        let detail = entry.display().to_string();
+                        rsx! {
+                            div { class: if selected { "vault-entry selected" } else { "vault-entry" },
+                                button { class: "vault-entry-select", onclick: move |_| {
+                                    path.set(entry_path.clone());
+                                    vault_path_input.set(entry_path.display().to_string());
+                                    notice.set(String::new());
+                                },
+                                    strong { "{label}" }
+                                    span { "{detail}" }
+                                    small { if exists { "Coffre présent · à déverrouiller" } else { "Emplacement prêt · aucun fichier pour l’instant" } }
+                                }
+                                button { class: "vault-entry-remove", title: "Retirer de la liste sans supprimer le fichier", onclick: move |_| {
+                                    let mut paths = vault_paths.read().clone();
+                                    vault_catalog::remove(&mut paths, &path_to_remove);
+                                    if paths.is_empty() { paths.push(default_for_remove.clone()); }
+                                    match vault_catalog::save(&default_for_remove, &paths) {
+                                        Ok(()) => {
+                                            if path_to_remove == *path.read() {
+                                                let fallback = paths[0].clone();
+                                                path.set(fallback.clone());
+                                                vault_path_input.set(fallback.display().to_string());
+                                            }
+                                            vault_paths.set(paths);
+                                            notice.set("Coffre retiré de la liste. Son fichier n’a pas été supprimé.".into());
+                                        }
+                                        Err(error) => notice.set(error),
+                                    }
+                                }, "Retirer" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            label { "Phrase secrète du coffre sélectionné" input { r#type: "password", value: "{passphrase}", placeholder: "Au moins 12 caractères", oninput: move |e| passphrase.set(e.value()) } }
+
+            div { class: "vault-location",
+                label { "Emplacement du coffre" input { r#type: "text", value: "{vault_path_input}", placeholder: "Chemin complet vers vault.akrat", oninput: move |e| vault_path_input.set(e.value()) } }
+                if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
+                    div { class: "vault-location-actions",
+                        button { class: "secondary", onclick: move |_| {
+                            if let Some(chosen) = choose_existing_vault() {
+                                vault_path_input.set(chosen.display().to_string());
+                            }
+                        }, "Ajouter un coffre existant…" }
+                        button { class: "secondary", onclick: move |_| {
+                            if let Some(chosen) = choose_new_vault_path() {
+                                vault_path_input.set(chosen.display().to_string());
+                            }
+                        }, "Choisir où créer…" }
+                    }
+                }
+                button { class: "secondary", onclick: move |_| {
+                    let raw = vault_path_input.read().trim().to_string();
+                    if raw.is_empty() { notice.set("Indiquez un emplacement pour le coffre.".into()); return; }
+                    let chosen = PathBuf::from(raw);
+                    if chosen.is_dir() { notice.set("Choisissez un fichier (par exemple vault.akrat), pas un dossier.".into()); return; }
+                    path.set(chosen.clone());
+                    let mut paths = vault_paths.read().clone();
+                    vault_catalog::add(&mut paths, chosen);
+                    match vault_catalog::save(&default_path, &paths) {
+                        Ok(()) => { vault_paths.set(paths); notice.set("Emplacement ajouté à la liste.".into()); }
+                        Err(error) => notice.set(error),
+                    }
+                }, "Ajouter cet emplacement" }
+            }
+
+            div { class: "gate-actions",
+                if selected_exists {
+                    button { class: "primary", onclick: move |_| {
+                        let phrase = passphrase.read().clone();
+                        match load_vault(&selected_open_path, &phrase) {
+                            Ok(data) => { vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }
+                            Err(error) => notice.set(format!("Impossible de déverrouiller ce coffre : {error}")),
+                        }
+                    }, "Déverrouiller ce coffre" }
+                } else {
+                    button { class: "primary", onclick: move |_| {
+                        let phrase = passphrase.read().clone();
+                        if phrase.len() < 12 { notice.set("Choisissez une phrase secrète d’au moins 12 caractères.".into()); return; }
+                        if selected_create_path.exists() { notice.set("Cet emplacement existe déjà et n’est pas un fichier de coffre. Choisissez un autre nom.".into()); return; }
+                        let data = VaultData::default();
+                        match save_vault(&selected_create_path, &data, &phrase) {
+                            Ok(()) => { vault.set(Some(data)); notice.set("Coffre créé et chiffré à cet emplacement.".into()); }
+                            Err(error) => notice.set(format!("Création impossible : {error}")),
+                        }
+                    }, "Créer un coffre ici" }
+                }
+            }
+            p { class: "notice", "{notice}" }
+            div { class: "path-note", "COFFRE SÉLECTIONNÉ · {selected_path.display()}" }
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "desktop",
+    not(target_os = "android"),
+    not(target_os = "ios")
+))]
+fn choose_existing_vault() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Coffre AKRAT", &["akrat"])
+        .pick_file()
+}
+
+#[cfg(all(
+    feature = "desktop",
+    not(target_os = "android"),
+    not(target_os = "ios")
+))]
+fn choose_new_vault_path() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Coffre AKRAT", &["akrat"])
+        .set_file_name("vault.akrat")
+        .save_file()
+}
+
+#[cfg(any(not(feature = "desktop"), target_os = "android", target_os = "ios"))]
+fn choose_existing_vault() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(not(feature = "desktop"), target_os = "android", target_os = "ios"))]
+fn choose_new_vault_path() -> Option<PathBuf> {
+    None
 }
 
 #[component]
@@ -830,7 +974,7 @@ fn SettingsPage(
     rsx! { section { class: "page-scroll",
         div { class: "eyebrow", "STOCKAGE LOCAL" } h1 { "Votre coffre" }
         p { class: "intro", "Les clés privées, contacts et messages sont conservés dans un fichier chiffré par votre phrase secrète." }
-        section { class: "panel settings-panel", div { class: "panel-title", "Emplacement" } p { class: "fingerprint", "{path.display()}" } div { class: "crypto-note", "Chiffrement du coffre : Argon2id + AES-256-GCM. Une phrase secrète perdue ne peut pas être récupérée." } div { class: "crypto-note", "Verrouillage automatique après 5 minutes sans toucher l’application. Les sessions réseau sont fermées en même temps." } button { class: "secondary", onclick: on_lock, "Verrouiller le coffre" } }
+        section { class: "panel settings-panel", div { class: "panel-title", "Emplacement" } p { class: "fingerprint", "{path.display()}" } div { class: "crypto-note", "Chiffrement du coffre : Argon2id + AES-256-GCM. Une phrase secrète perdue ne peut pas être récupérée." } div { class: "crypto-note", "Verrouillage automatique après 5 minutes sans toucher l’application. Les sessions réseau sont fermées en même temps." } button { class: "secondary", onclick: on_lock, "Verrouiller et choisir un autre coffre" } }
         section { class: "panel settings-panel", div { class: "panel-title", "Mises à jour" } {update_view} button { class: "secondary update-check", onclick: on_check_updates, "Rechercher à nouveau" } }
         p { class: "quiet", "{notice}" }
     } }

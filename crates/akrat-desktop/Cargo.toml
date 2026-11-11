@@ -13,6 +13,7 @@ directories.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+rfd = { version = "0.17.2", optional = true }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,5 +25,5 @@ self-replace = { version = "1.5.1", optional = true }
 
 [features]
 default = ["desktop"]
-desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:self-replace", "dep:zip"]
+desktop = ["dioxus/desktop", "dep:dioxus-desktop", "dep:rfd", "dep:self-replace", "dep:zip"]
 mobile = ["dioxus/mobile"]
