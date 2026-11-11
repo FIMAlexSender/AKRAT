@@ -70,9 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
+
+      - name: Verify Rust toolchain on the AKRAT PC
+        shell: pwsh
+        run: |
+          cargo --version
+          rustc --version
 
       - name: Build desktop app and CLI with MSVC
         shell: pwsh
