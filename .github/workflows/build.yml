@@ -90,12 +90,32 @@ jobs:
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Package the Windows installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^" ]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $version) { throw 'Could not read the workspace version from Cargo.toml.' }
+          $nsisZip = Join-Path $env:RUNNER_TEMP 'nsis-3.13.zip'
+          $nsisRoot = Join-Path $env:RUNNER_TEMP 'nsis'
+          Invoke-WebRequest -Uri 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' -OutFile $nsisZip
+          $actualHash = (Get-FileHash -Path $nsisZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne 'ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8') {
+            throw "NSIS archive SHA-256 mismatch: $actualHash"
+          }
+          Expand-Archive -Path $nsisZip -DestinationPath $nsisRoot -Force
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $makensis = Join-Path $nsisRoot 'nsis-3.13\makensis.exe'
+          & $makensis /V2 "/DAKRAT_VERSION=$version" 'packaging\windows\akrat-installer.nsi'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "dist\AKRAT-Setup-v$version.exe")) { throw 'Windows installer was not created.' }
+
       - uses: actions/upload-artifact@v4
         with:
           name: akrat-windows-x64
           path: |
             target/release/akrat-desktop.exe
             target/release/akrat.exe
+            dist/AKRAT-Setup-*.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -160,7 +180,7 @@ jobs:
 
           Build automatique depuis GitHub Actions.
 
-          - Windows x64 : application et CLI
+          - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
           - macOS Apple Silicon et Intel : application et CLI
           - Android : APK de test
@@ -173,6 +193,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            dist/akrat-windows-x64/AKRAT-Setup-*.exe \
             dist/AKRAT-"${GITHUB_REF_NAME}"-windows-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-linux-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-macos-aarch64.zip \
