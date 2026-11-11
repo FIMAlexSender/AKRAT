@@ -71,7 +71,7 @@ fn App() -> Element {
     let identity_name = use_signal(String::new);
     let import_uri = use_signal(String::new);
     let contact_name = use_signal(String::new);
-    let invitation_address = use_signal(String::new);
+    let invitation_address = use_signal(default_invitation_address);
     let invitation_result = use_signal(String::new);
     let mut notice = use_signal(String::new);
     let mut last_activity = use_signal(Instant::now);
@@ -721,9 +721,21 @@ fn NetworkPage(
                         option { value: "", "Choisir une identité" }
                         for (id, name, _) in identities.iter() { option { value: "{id}", "{name}" } }
                     }
-                    label { "Adresse joignable de cet ordinateur" }
-                    input { value: "{invitation_address}", placeholder: "192.168.1.20:47474", oninput: move |e| invitation_address.set(e.value()) }
-                    p { class: "copy-hint", "Utilisez l’IPv4 locale de cet appareil (ipconfig sur Windows), pas 127.0.0.1. Les deux appareils doivent être sur le même réseau Wi-Fi." }
+                    label { "Adresse IP de cet appareil · à copier et partager" }
+                    div { class: "form-row invite-address-row",
+                        input { value: "{invitation_address}", placeholder: "192.168.1.20:47474", oninput: move |e| invitation_address.set(e.value()) }
+                        button { class: "secondary compact", disabled: invitation_address.read().is_empty(), onclick: move |_| {
+                            let address = invitation_address.read().clone();
+                            async move {
+                                if copy_to_clipboard(address).await {
+                                    notice.set("Adresse IP et port copiés.".into());
+                                } else {
+                                    notice.set("Copie impossible. Maintenez le doigt sur le champ pour sélectionner l’adresse.".into());
+                                }
+                            }
+                        }, "Copier IP + port" }
+                    }
+                    p { class: "copy-hint", "Cette adresse est détectée automatiquement. Remplacez-la par l’IPv4 du Wi-Fi si besoin. 127.0.0.1 ne fonctionne que sur cet appareil. Les deux appareils doivent être sur le même réseau Wi-Fi." }
                     button { class: "primary", onclick: move |_| {
                         let id = selected.read().clone();
                         let address = invitation_address.read().clone();
@@ -1006,6 +1018,29 @@ fn SettingsPage(
         section { class: "panel settings-panel", div { class: "panel-title", "Mises à jour" } {update_view} button { class: "secondary update-check", onclick: on_check_updates, "Rechercher à nouveau" } }
         p { class: "quiet", "{notice}" }
     } }
+}
+
+fn default_invitation_address() -> String {
+    use std::net::{IpAddr, UdpSocket};
+
+    // A UDP connect selects the active route; no datagram is sent.
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        return String::new();
+    };
+    if socket.connect("8.8.8.8:53").is_err() {
+        return String::new();
+    }
+    let Ok(local_address) = socket.local_addr() else {
+        return String::new();
+    };
+    let IpAddr::V4(address) = local_address.ip() else {
+        return String::new();
+    };
+    let octets = address.octets();
+    if address.is_loopback() || address.is_unspecified() || (octets[0] == 169 && octets[1] == 254) {
+        return String::new();
+    }
+    format!("{address}:47474")
 }
 
 fn default_vault_path() -> PathBuf {
