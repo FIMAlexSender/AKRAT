@@ -71,7 +71,7 @@ fn App() -> Element {
     let identity_name = use_signal(String::new);
     let import_uri = use_signal(String::new);
     let contact_name = use_signal(String::new);
-    let invitation_address = use_signal(|| "127.0.0.1:47474".to_string());
+    let invitation_address = use_signal(String::new);
     let invitation_result = use_signal(String::new);
     let mut notice = use_signal(String::new);
     let mut last_activity = use_signal(Instant::now);
@@ -723,13 +723,27 @@ fn NetworkPage(
                     }
                     label { "Adresse joignable de cet ordinateur" }
                     input { value: "{invitation_address}", placeholder: "192.168.1.20:47474", oninput: move |e| invitation_address.set(e.value()) }
+                    p { class: "copy-hint", "Utilisez l’IPv4 locale de cet appareil (ipconfig sur Windows), pas 127.0.0.1. Les deux appareils doivent être sur le même réseau Wi-Fi." }
                     button { class: "primary", onclick: move |_| {
                         let id = selected.read().clone();
                         let address = invitation_address.read().clone();
                         if id.is_empty() { notice.set("Choisissez une identité.".into()); return; }
                         let item = vault.read().as_ref().and_then(|v| v.identities.iter().find(|i| i.id == id).map(Identity::detached_copy));
                         match item.and_then(|identity| Invitation::create(&identity, address).ok()) {
-                            Some(invite) => match invite.to_uri() { Ok(uri) => { invitation_result.set(uri); notice.set("Invitation créée. Partagez-la avec votre contact.".into()); }, Err(e) => notice.set(format!("Création impossible : {e}")) },
+                            Some(invite) => {
+                                let is_loopback = invite.address.parse::<std::net::SocketAddr>().is_ok_and(|address| address.ip().is_loopback());
+                                match invite.to_uri() {
+                                    Ok(uri) => {
+                                        invitation_result.set(uri);
+                                        if is_loopback {
+                                            notice.set("Attention : 127.0.0.1 ne fonctionne que sur cet appareil. Pour joindre un téléphone ou un autre PC, utilisez son IPv4 locale.".into());
+                                        } else {
+                                            notice.set("Invitation créée. Partagez-la avec votre contact.".into());
+                                        }
+                                    },
+                                    Err(e) => notice.set(format!("Création impossible : {e}"))
+                                }
+                            },
                             None => notice.set("Adresse invalide. Utilisez une IP et un port joignables.".into())
                         }
                     }, "Générer une invitation" }
