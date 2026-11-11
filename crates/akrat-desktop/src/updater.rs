@@ -90,25 +90,28 @@ pub async fn check_latest() -> Result<Option<UpdateRelease>, String> {
                 .assets
                 .into_iter()
                 .find(|asset| asset.name == expected_name)?;
+            let release_url = release.html_url;
+            let download_url = asset.browser_download_url;
+            let size = asset.size;
             let digest = asset
                 .digest
                 .filter(|digest| digest.starts_with("sha256:") && digest.len() == 71)?;
-            if asset.size == 0 || asset.size > MAX_ARCHIVE_SIZE {
+            if size == 0 || size > MAX_ARCHIVE_SIZE {
                 return None;
             }
-            Some((version, release, asset, digest))
+            Some((version, release_url, download_url, size, digest))
         })
         .max_by(|left, right| left.0.cmp(&right.0));
-    let Some((latest_version, release, asset, digest)) = available else {
+    let Some((latest_version, release_url, download_url, size, digest)) = available else {
         return Ok(None);
     };
 
     Ok(Some(UpdateRelease {
         version: latest_version.to_string(),
-        release_url: release.html_url,
-        download_url: asset.browser_download_url,
+        release_url,
+        download_url,
         digest,
-        size: asset.size,
+        size,
         executable_name,
     }))
 }
