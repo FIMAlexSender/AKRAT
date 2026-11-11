@@ -269,6 +269,28 @@ jobs:
           cp target/dx/akrat-desktop/release/android/app/app/build/outputs/apk/debug/app-debug.apk \
             dist/android/app-debug.apk
 
+      - name: Sign APK with the persistent AKRAT test key
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.AKRAT_ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ANDROID_SIGNING_KEYSTORE_BASE64" ]]; then
+            echo "Missing repository secret AKRAT_ANDROID_DEBUG_KEYSTORE_BASE64" >&2
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/akrat-debug.keystore"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          apk="dist/android/app-debug.apk"
+          apksigner sign \
+            --ks "$keystore" \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out "$RUNNER_TEMP/akrat-signed.apk" \
+            "$apk"
+          mv "$RUNNER_TEMP/akrat-signed.apk" "$apk"
+          apksigner verify --verbose "$apk"
+
       - uses: actions/upload-artifact@v4
         with:
           name: akrat-android-apk
