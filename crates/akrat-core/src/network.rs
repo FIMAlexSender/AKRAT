@@ -1,6 +1,5 @@
 use crate::{AkratError, Identity, fingerprint, noise_params};
 use snow::{Builder, HandshakeState, TransportState};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -260,16 +259,12 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, Net
     Ok(bytes)
 }
 
-pub async fn connect(address: SocketAddr) -> Result<tokio::net::TcpStream, NetworkError> {
-    Ok(tokio::net::TcpStream::connect(address).await?)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{NetworkError, connect, initiate, respond};
+    use super::{NetworkError, initiate, respond};
     use crate::Identity;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     async fn noise_xx_authenticates_pins_and_encrypts_bidirectionally() {
@@ -287,7 +282,7 @@ mod tests {
             assert_eq!(received.as_slice(), b"hello Bob");
             channel.send(b"hello Alice").await.expect("reply");
         });
-        let stream = connect(address).await.expect("connect");
+        let stream = TcpStream::connect(address).await.expect("connect");
         let pending = initiate(stream, &alice).await.expect("handshake");
         assert_eq!(pending.remote_public_key(), bob_key);
         let mut channel = pending.verify_peer(&bob_key).expect("pin");
@@ -308,7 +303,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept");
             respond(stream, &bob).await.expect("handshake");
         });
-        let stream = connect(address).await.expect("connect");
+        let stream = TcpStream::connect(address).await.expect("connect");
         let pending = initiate(stream, &alice).await.expect("handshake");
         assert!(matches!(
             pending.verify_peer(expected.public_key()),
@@ -343,7 +338,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept");
             respond(stream, &server_bob).await.expect("handshake")
         });
-        let stream = connect(address).await.expect("connect");
+        let stream = TcpStream::connect(address).await.expect("connect");
         let pending = initiate(stream, &alice).await.expect("handshake");
         let alice_channel = pending.verify_peer(bob.public_key()).expect("verify Bob");
         let pending = server.await.expect("server task");

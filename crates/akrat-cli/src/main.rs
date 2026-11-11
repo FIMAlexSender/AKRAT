@@ -6,14 +6,13 @@ use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
-#[command(name = "akrat", version, about = "Messagerie directe pair à pair")]
+#[command(name = "akrat", version, about = "Messagerie chiffrée pair à pair")]
 struct Args {
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
@@ -38,18 +37,10 @@ enum Command {
         #[command(subcommand)]
         action: ContactCommand,
     },
-    #[command(about = "Créer une invitation publique pour une adresse réseau")]
-    Invite {
-        identity: String,
-        #[arg(long)]
-        address: SocketAddr,
-    },
+    #[command(about = "Créer une invitation réseau stable liée à une identité")]
+    Invite { identity: String },
     #[command(about = "Écouter et accepter les contacts déjà vérifiés")]
-    Listen {
-        identity: String,
-        #[arg(long, default_value = "0.0.0.0:47474")]
-        bind: SocketAddr,
-    },
+    Listen { identity: String },
     #[command(about = "Se connecter à un contact déjà vérifié")]
     Connect {
         identity: String,
@@ -147,26 +138,35 @@ async fn run() -> Result<(), Box<dyn Error>> {
         } => {
             let invitation = Invitation::from_uri(&invitation)?;
             let (mut data, passphrase) = unlock(&path)?;
-            if let Some(contact) = data
+            let updated = if let Some(contact) = data
                 .contacts
                 .iter_mut()
                 .find(|item| item.fingerprint == invitation.fingerprint)
             {
-                contact.address = invitation.address;
+                contact.transport_id = invitation.transport_id;
+                contact.legacy_address.clear();
                 contact.name = name;
                 contact.manually_verified = false;
+                true
             } else {
                 data.contacts.push(Contact {
                     fingerprint: invitation.fingerprint.clone(),
                     name,
                     public_key: invitation.public_key,
-                    address: invitation.address,
+                    transport_id: invitation.transport_id,
+                    legacy_address: String::new(),
                     manually_verified: false,
                 });
-            }
+                false
+            };
             save_vault(&path, &data, &passphrase)?;
             println!(
-                "Contact importé comme non vérifié : {}",
+                "{} comme non vérifié : {}",
+                if updated {
+                    "Invitation actualisée"
+                } else {
+                    "Contact importé"
+                },
                 invitation.fingerprint
             );
         }
@@ -182,7 +182,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 println!(
                     "{}  {}  {}  {}",
-                    contact.fingerprint, contact.name, contact.address, trust
+                    contact.fingerprint,
+                    contact.name,
+                    if contact.transport_id.is_empty() {
+                        "ancienne invitation · à réimporter"
+                    } else {
+                        "identité réseau stable"
+                    },
+                    trust
                 );
             }
         }
@@ -214,20 +221,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
             save_vault(&path, &data, &passphrase)?;
             println!("Identité vérifiée manuellement et enregistrée dans le coffre.");
         }
-        Command::Invite { identity, address } => {
+        Command::Invite { identity } => {
             let (data, _) = unlock(&path)?;
             let local = find_identity(&data, &identity)?;
             println!("Partage cette invitation avec ton correspondant :");
+            println!("{}", Invitation::create(local)?.to_uri()?);
             println!(
-                "{}",
-                Invitation::create(local, address.to_string())?.to_uri()?
-            );
-            println!(
-                "L'invitation contient une clé publique et une adresse, jamais la clé privée."
+                "L'invitation contient l'identité publique et un identifiant réseau stable, jamais la clé privée ni une adresse IP."
             );
         }
-        Command::Listen { identity, bind } => {
-            listen(&path, &identity, bind).await?;
+        Command::Listen { identity } => {
+            listen(&path, &identity).await?;
         }
         Command::Connect {
             identity,
@@ -264,15 +268,45 @@ fn default_vault_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(directory.data_local_dir().join("vault.akrat"))
 }
 
-async fn listen(path: &Path, identity_id: &str, bind: SocketAddr) -> Result<(), Box<dyn Error>> {
+async fn listen(path: &Path, identity_id: &str) -> Result<(), Box<dyn Error>> {
     let (mut data, passphrase) = unlock(path)?;
     let local_identity = find_identity(&data, identity_id)?;
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    println!("Écoute TCP démarrée sur {}.", listener.local_addr()?);
+    let endpoint = new_endpoint(local_identity).await?;
+    println!(
+        "Disponibilité P2P activée · identité réseau {}.",
+        endpoint.id()
+    );
+    println!("Connexion directe tentée automatiquement, relais chiffré si nécessaire.");
+    if tokio::time::timeout(std::time::Duration::from_secs(20), endpoint.online())
+        .await
+        .is_ok()
+    {
+        println!("Relais P2P prêt; en attente de contacts.");
+    } else {
+        println!("Relais non disponible pour le moment; en attente des connexions possibles.");
+    }
     println!("Les connexions seront acceptées uniquement pour les contacts vérifiés.");
     loop {
-        let (stream, address) = listener.accept().await?;
-        println!("Connexion TCP depuis {address}; négociation cryptographique en cours.");
+        let incoming = endpoint.accept().await.ok_or("point réseau fermé")?;
+        let connection = match incoming.await {
+            Ok(connection) => connection,
+            Err(problem) => {
+                println!("Connexion P2P refusée : {problem}");
+                continue;
+            }
+        };
+        let transport_id = connection.remote_id().to_string();
+        let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|item| item.transport_id == transport_id && item.manually_verified)
+        else {
+            println!("Identité réseau inconnue ou non vérifiée; connexion refusée.");
+            connection.close(1u8.into(), b"unverified peer");
+            continue;
+        };
+        println!("Pair reconnu · {} · négociation Noise XX.", contact.name);
+        let stream = iroh_stream(connection, true).await?;
         let pending = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             network::respond(stream, local_identity),
@@ -291,20 +325,19 @@ async fn listen(path: &Path, identity_id: &str, bind: SocketAddr) -> Result<(), 
         };
         let peer_fingerprint = pending.fingerprint();
         println!("Empreinte distante reçue : {peer_fingerprint}");
-        let Some(contact) = data
-            .contacts
-            .iter()
-            .find(|item| item.fingerprint == peer_fingerprint && item.manually_verified)
-        else {
-            println!("Contact inconnu ou non vérifié; aucun message accepté.");
+        if contact.fingerprint != peer_fingerprint {
+            println!(
+                "L'empreinte Noise ne correspond pas au contact enregistré; aucun message accepté."
+            );
             continue;
-        };
+        }
         let contact_name = contact.name.clone();
         let expected = contact.public_key.clone();
         let channel = pending.verify_peer(&expected)?;
         println!("Identité confirmée; canal chiffré établi avec {contact_name}.");
         let conversation = format!("{identity_id}:{peer_fingerprint}");
         chat(channel, &mut data, path, &passphrase, &conversation).await?;
+        endpoint.close().await;
         return Ok(());
     }
 }
@@ -317,7 +350,7 @@ async fn connect_and_chat(
     let (mut data, passphrase) = unlock(path)?;
     let canonical =
         canonical_fingerprint(fingerprint_input).ok_or("format d'empreinte invalide")?;
-    let (contact_name, address, peer_key, conversation) = {
+    let (contact_name, transport_id, peer_key, conversation) = {
         let contact = data
             .contacts
             .iter()
@@ -328,19 +361,28 @@ async fn connect_and_chat(
             .ok_or("contact absent du coffre ou non vérifié")?;
         (
             contact.name.clone(),
-            contact.address.parse::<SocketAddr>()?,
+            contact.transport_id.clone(),
             contact.public_key.clone(),
             format!("{identity_id}:{}", contact.fingerprint),
         )
     };
+    if transport_id.is_empty() {
+        return Err(
+            "l'invitation de ce contact doit être actualisée pour le réseau P2P v0.1.6".into(),
+        );
+    }
     let local_identity = find_identity(&data, identity_id)?;
-    println!("Connexion TCP vers {address}.");
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        network::connect(address),
+    let endpoint = new_endpoint(local_identity).await?;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), endpoint.online()).await;
+    println!("Recherche du pair par son identité réseau, sans adresse IP fixe.");
+    let remote_id = transport_id.parse::<iroh::EndpointId>()?;
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        endpoint.connect(remote_id, b"akrat-chat/0.1"),
     )
     .await??;
-    println!("Connexion établie; négociation cryptographique en cours.");
+    println!("Transport P2P établi · négociation Noise XX.");
+    let stream = iroh_stream(connection, false).await?;
     let pending = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         network::initiate(stream, local_identity),
@@ -348,7 +390,44 @@ async fn connect_and_chat(
     .await??;
     let channel = pending.verify_peer(&peer_key)?;
     println!("Empreinte vérifiée; canal chiffré établi avec {contact_name}.");
-    chat(channel, &mut data, path, &passphrase, &conversation).await
+    let result = chat(channel, &mut data, path, &passphrase, &conversation).await;
+    endpoint.close().await;
+    result
+}
+
+async fn new_endpoint(identity: &Identity) -> Result<iroh::Endpoint, Box<dyn Error>> {
+    let transport_key_bytes = identity.transport_private_key();
+    let secret = iroh::SecretKey::from_bytes(&transport_key_bytes);
+    Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .alpns(vec![b"akrat-chat/0.1".to_vec()])
+        .bind()
+        .await?)
+}
+
+async fn iroh_stream(
+    connection: iroh::endpoint::Connection,
+    incoming: bool,
+) -> Result<tokio::io::DuplexStream, Box<dyn Error>> {
+    let (mut send, mut receive) = if incoming {
+        connection.accept_bi().await?
+    } else {
+        connection.open_bi().await?
+    };
+    let (stream, bridge) = tokio::io::duplex(128 * 1024);
+    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
+    let receive_connection = connection.clone();
+    tokio::spawn(async move {
+        let _connection = receive_connection;
+        let _ = tokio::io::copy(&mut receive, &mut bridge_write).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut bridge_write).await;
+    });
+    tokio::spawn(async move {
+        let _connection = connection;
+        let _ = tokio::io::copy(&mut bridge_read, &mut send).await;
+        let _ = send.finish();
+    });
+    Ok(stream)
 }
 
 async fn chat<S>(

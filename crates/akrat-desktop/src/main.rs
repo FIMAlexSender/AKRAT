@@ -34,7 +34,7 @@ fn main() {
     let icon = dioxus_desktop::icon_from_memory::<Icon>(include_bytes!("../assets/akrat-logo.png"))
         .expect("Le logo AKRAT doit être une image PNG valide");
     let window = WindowBuilder::new()
-        .with_title("AKRAT · Réseau direct")
+        .with_title("AKRAT · Messagerie P2P")
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(1000.0, 680.0))
         .with_window_icon(Some(icon.clone()));
@@ -71,7 +71,6 @@ fn App() -> Element {
     let identity_name = use_signal(String::new);
     let import_uri = use_signal(String::new);
     let contact_name = use_signal(String::new);
-    let invitation_address = use_signal(default_invitation_address);
     let invitation_result = use_signal(String::new);
     let mut notice = use_signal(String::new);
     let mut last_activity = use_signal(Instant::now);
@@ -359,7 +358,7 @@ fn App() -> Element {
                     main { class: "content",
                         match page() {
                             Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace, setup_label: (if identities == 0 { "Créer une identité" } else { "Ajouter un contact" }).to_string(), on_setup: move |_| page.set(if identities == 0 { Page::People } else { Page::Network }) } },
-                            Page::Network => rsx! { NetworkPage { notice, invitation_address, invitation_result, vault, event_sender, listen_stop } },
+                            Page::Network => rsx! { NetworkPage { notice, invitation_result, vault, event_sender, listen_stop } },
                             Page::People => rsx! { PeoplePage { vault, passphrase, path: path_value, identity_name, import_uri, contact_name, notice } },
                             Page::Settings => rsx! { SettingsPage { path: path_value, notice, update_status,
                                 on_check_updates: move |_| {
@@ -642,9 +641,18 @@ fn PeoplePage(
                     if name.is_empty() { notice.set("Donnez un nom au contact.".into()); return; }
                     match Invitation::from_uri(&uri) { Ok(invitation) => {
                         let mut d = match load_vault(&import_path, &phrase) { Ok(d) => d, Err(e) => { notice.set(format!("Coffre inaccessible : {e}")); return; } };
-                        if d.contacts.iter().any(|c| c.fingerprint == invitation.fingerprint) { notice.set("Ce contact est déjà importé.".into()); return; }
-                        d.contacts.push(Contact { fingerprint: invitation.fingerprint, name, public_key: invitation.public_key, address: invitation.address, manually_verified: false });
-                        match save_vault(&import_path, &d, &phrase) { Ok(()) => { vault.set(Some(d)); import_uri.set(String::new()); contact_name.set(String::new()); notice.set("Invitation importée. Vérifiez l’empreinte avant toute connexion.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
+                        let updated = if let Some(contact) = d.contacts.iter_mut().find(|c| c.fingerprint == invitation.fingerprint) {
+                            contact.name = name;
+                            contact.public_key = invitation.public_key;
+                            contact.transport_id = invitation.transport_id;
+                            contact.legacy_address.clear();
+                            contact.manually_verified = false;
+                            true
+                        } else {
+                        d.contacts.push(Contact { fingerprint: invitation.fingerprint, name, public_key: invitation.public_key, transport_id: invitation.transport_id, legacy_address: String::new(), manually_verified: false });
+                            false
+                        };
+                        match save_vault(&import_path, &d, &phrase) { Ok(()) => { vault.set(Some(d)); import_uri.set(String::new()); contact_name.set(String::new()); notice.set(if updated { "Invitation réseau mise à jour. Comparez de nouveau l’empreinte avant de vérifier le contact.".into() } else { "Invitation importée. Vérifiez l’empreinte avant toute connexion.".into() }); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
                     }, Err(e) => notice.set(format!("Invitation invalide : {e}")) }
                 }, "Importer le contact" }
             }
@@ -666,7 +674,8 @@ fn ContactRow(
 ) -> Element {
     let verified = contact.manually_verified;
     let fp = contact.fingerprint.clone();
-    rsx! { div { class: "contact-row", div { class: "record-icon", "⌁" } div { class: "record-main", strong { "{contact.name}" } span { class: "fingerprint", "{contact.fingerprint}" } span { class: "quiet", "{contact.address}" } } if verified { span { class: "verified", "VÉRIFIÉ" } } else { button { class: "secondary compact", onclick: move |_| {
+    let transport_id = contact.transport_id.clone();
+    rsx! { div { class: "contact-row", div { class: "record-icon", "⌁" } div { class: "record-main", strong { "{contact.name}" } span { class: "fingerprint", "{contact.fingerprint}" } span { class: "quiet", if transport_id.is_empty() { "Ancienne invitation · à réimporter" } else { "Identité réseau stable · itinérance" } } } if verified { span { class: "verified", "VÉRIFIÉ" } } else { button { class: "secondary compact", onclick: move |_| {
         let phrase = passphrase.read().clone(); let mut d = match load_vault(&path, &phrase) { Ok(d) => d, Err(e) => { notice.set(format!("Coffre inaccessible : {e}")); return; } };
         if let Some(item) = d.contacts.iter_mut().find(|c| c.fingerprint == fp) { item.manually_verified = true; }
         match save_vault(&path, &d, &phrase) { Ok(()) => { vault.set(Some(d)); notice.set("Contact marqué comme vérifié. Confirmez son empreinte avec lui en personne ou par un canal sûr.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
@@ -676,7 +685,6 @@ fn ContactRow(
 #[component]
 fn NetworkPage(
     notice: Signal<String>,
-    invitation_address: Signal<String>,
     invitation_result: Signal<String>,
     vault: Signal<Option<VaultData>>,
     event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
@@ -705,12 +713,11 @@ fn NetworkPage(
         .unwrap_or_default();
     let mut selected = use_signal(String::new);
     let mut selected_contact = use_signal(String::new);
-    let mut listen_address = use_signal(|| "0.0.0.0:47474".to_string());
     rsx! {
         section { class: "page-scroll",
-            div { class: "eyebrow", "CONNEXION DIRECTE" }
+            div { class: "eyebrow", "RÉSEAU PAIR À PAIR" }
             h1 { "Réseau" }
-            p { class: "intro", "Les connexions sont directes et authentifiées. Seuls les contacts dont l’empreinte a été vérifiée peuvent établir une session." }
+            p { class: "intro", "Votre identité reste la même quand vous changez de réseau. AKRAT cherche une route directe et utilise un relais chiffré si nécessaire. Les deux appareils doivent être en ligne et disponibles." }
             section { class: "panel network-panel",
                 div { class: "panel-title", "Préparer une invitation" }
                 if identities.is_empty() {
@@ -721,42 +728,22 @@ fn NetworkPage(
                         option { value: "", "Choisir une identité" }
                         for (id, name, _) in identities.iter() { option { value: "{id}", "{name}" } }
                     }
-                    label { "Adresse IP de cet appareil · à copier et partager" }
-                    div { class: "form-row invite-address-row",
-                        input { value: "{invitation_address}", placeholder: "192.168.1.20:47474", oninput: move |e| invitation_address.set(e.value()) }
-                        button { class: "secondary compact", disabled: invitation_address.read().is_empty(), onclick: move |_| {
-                            let address = invitation_address.read().clone();
-                            async move {
-                                if copy_to_clipboard(address).await {
-                                    notice.set("Adresse IP et port copiés.".into());
-                                } else {
-                                    notice.set("Copie impossible. Maintenez le doigt sur le champ pour sélectionner l’adresse.".into());
-                                }
-                            }
-                        }, "Copier IP + port" }
-                    }
-                    p { class: "copy-hint", "Cette adresse est détectée automatiquement. Remplacez-la par l’IPv4 du Wi-Fi si besoin. 127.0.0.1 ne fonctionne que sur cet appareil. Les deux appareils doivent être sur le même réseau Wi-Fi." }
+                    p { class: "copy-hint", "L’invitation partage votre identité cryptographique et son identifiant réseau stable." }
                     button { class: "primary", onclick: move |_| {
                         let id = selected.read().clone();
-                        let address = invitation_address.read().clone();
                         if id.is_empty() { notice.set("Choisissez une identité.".into()); return; }
                         let item = vault.read().as_ref().and_then(|v| v.identities.iter().find(|i| i.id == id).map(Identity::detached_copy));
-                        match item.and_then(|identity| Invitation::create(&identity, address).ok()) {
+                        match item.and_then(|identity| Invitation::create(&identity).ok()) {
                             Some(invite) => {
-                                let is_loopback = invite.address.parse::<std::net::SocketAddr>().is_ok_and(|address| address.ip().is_loopback());
                                 match invite.to_uri() {
                                     Ok(uri) => {
                                         invitation_result.set(uri);
-                                        if is_loopback {
-                                            notice.set("Attention : 127.0.0.1 ne fonctionne que sur cet appareil. Pour joindre un téléphone ou un autre PC, utilisez son IPv4 locale.".into());
-                                        } else {
-                                            notice.set("Invitation créée. Partagez-la avec votre contact.".into());
-                                        }
+                                        notice.set("Invitation créée. Elle reste valable si vous changez de réseau.".into());
                                     },
                                     Err(e) => notice.set(format!("Création impossible : {e}"))
                                 }
                             },
-                            None => notice.set("Adresse invalide. Utilisez une IP et un port joignables.".into())
+                            None => notice.set("Invitation impossible pour cette identité.".into())
                         }
                     }, "Générer une invitation" }
                     if !invitation_result().is_empty() {
@@ -766,7 +753,7 @@ fn NetworkPage(
                             let invitation = invitation_result.read().clone();
                             async move {
                                 if copy_to_clipboard(invitation).await {
-                                    notice.set("Invitation copiée. Collez-la dans votre messagerie sur le téléphone.".into());
+                                    notice.set("Invitation copiée. Envoyez-la au contact par un canal sûr.".into());
                                 } else {
                                     notice.set("Copie impossible. Maintenez le doigt sur le lien pour le sélectionner et le copier.".into());
                                 }
@@ -777,9 +764,8 @@ fn NetworkPage(
                 }
             }
             section { class: "panel network-panel",
-                div { class: "panel-title", "Écoute et connexions" }
-                label { "Adresse d’écoute" }
-                input { value: "{listen_address}", placeholder: "0.0.0.0:47474", oninput: move |e| listen_address.set(e.value()) }
+                div { class: "panel-title", "Disponibilité et connexions" }
+                p { class: "quiet", "Activez le réseau pour recevoir des connexions sur cette identité. La découverte et le relais prennent en charge les changements de Wi-Fi, de lieu et de réseau mobile." }
                 if listen_stop.read().is_some() {
                     button { class: "secondary", onclick: move |_| {
                         if let Some(stop) = listen_stop.read().as_ref() { let _ = stop.send(true); }
@@ -790,8 +776,8 @@ fn NetworkPage(
                         let identity_id = selected.read().clone();
                         let local_identity = vault.read().as_ref().and_then(|v| v.identities.iter().find(|i| i.id == identity_id).map(Identity::detached_copy));
                         let verified = vault.read().as_ref().map(|v| v.contacts.iter().filter(|c| c.manually_verified).cloned().collect::<Vec<_>>()).unwrap_or_default();
-                        match local_identity { Some(identity) => { let stop = runtime::listen(identity, verified, listen_address.read().clone(), event_sender.read().clone()); listen_stop.set(Some(stop)); }, None => notice.set("Choisissez une identité avant de démarrer l’écoute.".into()) }
-                    }, "Démarrer l’écoute" }
+                        match local_identity { Some(identity) => { let stop = runtime::listen(identity, verified, event_sender.read().clone()); listen_stop.set(Some(stop)); }, None => notice.set("Choisissez une identité avant d’activer le réseau.".into()) }
+                    }, "Activer la disponibilité P2P" }
                 }
                 if contacts.is_empty() {
                     p { class: "quiet", "Aucun contact vérifié ne peut encore se connecter." }
@@ -916,7 +902,7 @@ fn ChatPage(
                 div { class: "message-illustration", span { class: "bubble bubble-back" } span { class: "bubble bubble-front", span { "•••" } } }
                 div { class: "eyebrow", "MESSAGERIE PAIR À PAIR" }
                 h1 { "La parole circule." }
-                p { "Choisissez un contact vérifié dans Réseau pour établir une session directe. Les étapes apparaîtront dans le journal." }
+                p { "Choisissez un contact vérifié dans Réseau pour établir une session pair à pair. Les étapes apparaîtront dans le journal." }
                 button { class: "primary empty-action", onclick: on_setup, span { class: "lock-mark" } "{setup_label}" }
             }
         }
@@ -1018,29 +1004,6 @@ fn SettingsPage(
         section { class: "panel settings-panel", div { class: "panel-title", "Mises à jour" } {update_view} button { class: "secondary update-check", onclick: on_check_updates, "Rechercher à nouveau" } }
         p { class: "quiet", "{notice}" }
     } }
-}
-
-fn default_invitation_address() -> String {
-    use std::net::{IpAddr, UdpSocket};
-
-    // A UDP connect selects the active route; no datagram is sent.
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-        return String::new();
-    };
-    if socket.connect("8.8.8.8:53").is_err() {
-        return String::new();
-    }
-    let Ok(local_address) = socket.local_addr() else {
-        return String::new();
-    };
-    let IpAddr::V4(address) = local_address.ip() else {
-        return String::new();
-    };
-    let octets = address.octets();
-    if address.is_loopback() || address.is_unspecified() || (octets[0] == 169 && octets[1] == 254) {
-        return String::new();
-    }
-    format!("{address}:47474")
 }
 
 fn default_vault_path() -> PathBuf {

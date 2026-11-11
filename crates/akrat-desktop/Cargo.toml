@@ -12,6 +12,7 @@ dioxus-desktop = { workspace = true, optional = true }
 directories.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+iroh.workspace = true
 reqwest.workspace = true
 rfd = { version = "0.17.2", optional = true }
 semver.workspace = true

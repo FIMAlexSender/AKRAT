@@ -86,6 +86,21 @@ impl Identity {
         fingerprint(&self.public_key)
     }
 
+    /// Stable transport identity derived with domain separation from this identity's secret.
+    /// It is independent of the device's current IP address or network.
+    pub fn transport_private_key(&self) -> Zeroizing<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"AKRAT/transport-key/v1\0");
+        hasher.update(&self.private_key);
+        Zeroizing::new(hasher.finalize().into())
+    }
+
+    pub fn transport_id(&self) -> String {
+        let private_key = self.transport_private_key();
+        let secret = iroh::SecretKey::from_bytes(&private_key);
+        secret.public().to_string()
+    }
+
     pub(crate) fn private_key(&self) -> &[u8] {
         &self.private_key
     }
@@ -97,7 +112,11 @@ pub struct Contact {
     pub fingerprint: String,
     pub name: String,
     pub public_key: Vec<u8>,
-    pub address: String,
+    #[serde(default)]
+    pub transport_id: String,
+    // Legacy vaults used a fixed IP address. Keep decoding it for migration only.
+    #[serde(default, rename = "address", skip_serializing_if = "String::is_empty")]
+    pub legacy_address: String,
     pub manually_verified: bool,
 }
 
@@ -107,22 +126,20 @@ pub struct Invitation {
     pub version: u8,
     pub fingerprint: String,
     pub public_key: Vec<u8>,
-    pub address: String,
+    pub transport_id: String,
 }
 
 impl Invitation {
-    pub fn create(identity: &Identity, address: String) -> Result<Self, AkratError> {
-        let address = address
-            .parse::<std::net::SocketAddr>()
-            .map_err(|_| AkratError::InvalidIdentity)?;
-        if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+    pub fn create(identity: &Identity) -> Result<Self, AkratError> {
+        let transport_id = identity.transport_id();
+        if transport_id.is_empty() {
             return Err(AkratError::InvalidIdentity);
         }
         Ok(Self {
-            version: FORMAT_VERSION,
+            version: 2,
             fingerprint: identity.fingerprint(),
             public_key: identity.public_key().to_vec(),
-            address: address.to_string(),
+            transport_id,
         })
     }
 
@@ -146,19 +163,18 @@ impl Invitation {
             .map_err(|_| AkratError::InvalidIdentity)?;
         let invitation: Self =
             serde_json::from_slice(&bytes).map_err(|_| AkratError::InvalidIdentity)?;
-        let address = invitation
-            .address
-            .parse::<std::net::SocketAddr>()
-            .map_err(|_| AkratError::InvalidIdentity)?;
-        if invitation.version != FORMAT_VERSION
+        if invitation.version != 2
             || invitation.public_key.len() != 32
             || invitation.fingerprint != fingerprint(&invitation.public_key)
-            || address.port() == 0
-            || address.ip().is_unspecified()
-            || address.ip().is_multicast()
+            || invitation.transport_id.len() > 128
+            || invitation.transport_id.is_empty()
         {
             return Err(AkratError::InvalidIdentity);
         }
+        invitation
+            .transport_id
+            .parse::<iroh::EndpointId>()
+            .map_err(|_| AkratError::InvalidIdentity)?;
         Ok(invitation)
     }
 }
@@ -292,7 +308,8 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
     for contact in &data.contacts {
         if contact.public_key.len() != 32
             || contact.fingerprint != fingerprint(&contact.public_key)
-            || contact.address.parse::<std::net::SocketAddr>().is_err()
+            || (!contact.transport_id.is_empty()
+                && contact.transport_id.parse::<iroh::EndpointId>().is_err())
             || !contacts.insert(contact.fingerprint.as_str())
         {
             return Err(AkratError::InvalidVault);
@@ -373,7 +390,8 @@ mod tests {
                 fingerprint: bob.fingerprint(),
                 name: "Bob".to_string(),
                 public_key: bob.public_key().to_vec(),
-                address: "127.0.0.1:4000".to_string(),
+                transport_id: bob.transport_id(),
+                legacy_address: "127.0.0.1:4000".to_string(),
                 manually_verified: true,
             }],
             messages: vec![StoredMessage {
@@ -440,10 +458,35 @@ mod tests {
     #[test]
     fn invitation_round_trips_and_rejects_changed_keys() {
         let identity = Identity::generate("Alice".to_string()).expect("identity");
-        let invitation =
-            Invitation::create(&identity, "127.0.0.1:4000".to_string()).expect("invitation");
+        let invitation = Invitation::create(&identity).expect("invitation");
         let uri = invitation.to_uri().expect("uri");
         assert_eq!(Invitation::from_uri(&uri).expect("parse"), invitation);
+        assert_eq!(
+            identity.transport_id(),
+            identity.detached_copy().transport_id()
+        );
+        assert_ne!(
+            identity.transport_id(),
+            Identity::generate("Bob".into())
+                .expect("Bob")
+                .transport_id()
+        );
+        assert!(!uri.contains("address"));
         assert!(Invitation::from_uri("akrat://invite/not-base64!").is_err());
+    }
+
+    #[test]
+    fn legacy_ip_contact_can_be_loaded_without_becoming_a_network_route() {
+        let identity = Identity::generate("Legacy contact".into()).expect("identity");
+        let legacy = serde_json::json!({
+            "fingerprint": identity.fingerprint(),
+            "name": "Old peer",
+            "public_key": identity.public_key(),
+            "address": "10.0.0.4:47474",
+            "manually_verified": true
+        });
+        let contact: Contact = serde_json::from_value(legacy).expect("migrate old contact");
+        assert!(contact.transport_id.is_empty());
+        assert_eq!(contact.legacy_address, "10.0.0.4:47474");
     }
 }

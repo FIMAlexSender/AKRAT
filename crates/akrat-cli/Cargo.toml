@@ -12,6 +12,7 @@ directories.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 hex.workspace = true
+iroh.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -173,7 +173,6 @@ jobs:
                 "$folder/akrat-desktop" "$folder/akrat"
             fi
           done
-          cp dist/akrat-android-apk/app-debug.apk "dist/AKRAT-${version}-android.apk"
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
@@ -182,7 +181,7 @@ jobs:
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
           - macOS Apple Silicon et Intel : application et CLI
-          - Android : APK de test
+          - Android : la compilation de l’APK est vérifiée par la CI ; l’APK signé pour les installations de test est publié séparément.
 
           Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256.
           EOF
@@ -197,7 +196,6 @@ jobs:
             dist/AKRAT-"${GITHUB_REF_NAME}"-linux-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-macos-aarch64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-macos-x64.zip \
-            dist/AKRAT-"${GITHUB_REF_NAME}"-android.apk \
             --title "AKRAT ${GITHUB_REF_NAME}" \
             --notes-file dist/release-notes.md
 
