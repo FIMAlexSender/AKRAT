@@ -281,7 +281,9 @@ jobs:
           keystore="$RUNNER_TEMP/akrat-debug.keystore"
           printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$keystore"
           apk="dist/android/app-debug.apk"
-          apksigner sign \
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$apksigner"
+          "$apksigner" sign \
             --ks "$keystore" \
             --ks-key-alias androiddebugkey \
             --ks-pass pass:android \
@@ -289,7 +291,7 @@ jobs:
             --out "$RUNNER_TEMP/akrat-signed.apk" \
             "$apk"
           mv "$RUNNER_TEMP/akrat-signed.apk" "$apk"
-          apksigner verify --verbose "$apk"
+          "$apksigner" verify --verbose "$apk"
 
       - uses: actions/upload-artifact@v4
         with:
