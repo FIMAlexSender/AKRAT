@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(feature = "mobile")), windows_subsystem = "windows")]
+
 mod runtime;
 mod updater;
 mod vault_catalog;
@@ -96,12 +98,24 @@ fn App() -> Element {
 
     use_future(move || async move {
         match updater::check_latest().await {
-            Ok(Some(release)) => {
+            Ok(Some(release)) if cfg!(target_os = "android") => {
                 notice.set(format!(
                     "AKRAT v{} est disponible · Coffre > Mises à jour",
                     release.version
                 ));
                 update_status.set(updater::UpdateStatus::Available(release));
+            }
+            Ok(Some(release)) => {
+                let version = release.version.clone();
+                notice.set(format!("Installation de la mise à jour AKRAT v{version}…"));
+                update_status.set(updater::UpdateStatus::Installing);
+                match updater::install(release).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        update_status.set(updater::UpdateStatus::Failed(error.clone()));
+                        notice.set(format!("Mise à jour automatique impossible : {error}"));
+                    }
+                }
             }
             Ok(None) => update_status.set(updater::UpdateStatus::Current),
             Err(error) => update_status.set(updater::UpdateStatus::Failed(error)),
@@ -953,12 +967,12 @@ fn SettingsPage(
         updater::UpdateStatus::Available(release) => rsx! {
             div { class: "update-ready",
                 strong { "AKRAT v{release.version} est disponible" }
-                p { class: "quiet", "La mise à jour est téléchargée depuis GitHub et vérifiée avant installation." }
                 if cfg!(target_os = "android") {
+                    p { class: "quiet", "Téléchargez la mise à jour depuis GitHub. Android vous demandera de confirmer son installation." }
                     a { class: "secondary update-link", href: "{release.download_url}", target: "_blank", "Télécharger l’APK" }
                     p { class: "copy-hint", "Android demande une confirmation. Les APK de test n’ont pas encore de signature stable ; une mise à jour peut être refusée par-dessus une ancienne installation. Ne désinstallez pas AKRAT si le coffre contient des données importantes." }
                 } else {
-                    p { class: "quiet", "AKRAT remplacera son exécutable puis redémarrera. Le coffre restera chiffré." }
+                    p { class: "quiet", "AKRAT installe automatiquement les mises à jour au lancement, vérifie leur empreinte SHA-256, puis redémarre. Le coffre reste chiffré." }
                     button { class: "primary", onclick: on_install_update, "Installer et redémarrer" }
                 }
                 a { class: "release-link", href: "{release.release_url}", target: "_blank", "Voir la release sur GitHub" }

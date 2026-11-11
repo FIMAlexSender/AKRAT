@@ -7,7 +7,7 @@ use serde::Deserialize;
 ))]
 use sha2::{Digest, Sha256};
 
-const RELEASES_API: &str = "https://api.github.com/repos/FIMAlexSender/AKRAT/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/FIMAlexSender/AKRAT/releases?per_page=100";
 const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024;
 #[cfg(all(
     feature = "desktop",
@@ -61,48 +61,47 @@ pub async fn check_latest() -> Result<Option<UpdateRelease>, String> {
         .user_agent(concat!("AKRAT/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| error.to_string())?;
-    let release = client
+    let releases = client
         .get(RELEASES_API)
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
         .map_err(|error| format!("GitHub inaccessible : {error}"))?
         .error_for_status()
         .map_err(|error| format!("GitHub a refusé la vérification : {error}"))?
-        .json::<GithubRelease>()
+        .json::<Vec<GithubRelease>>()
         .await
         .map_err(|error| format!("Réponse GitHub invalide : {error}"))?;
 
-    if release.prerelease {
-        return Ok(None);
-    }
-
-    let latest = release.tag_name.trim_start_matches('v');
     let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("Version locale invalide : {error}"))?;
-    let latest_version = semver::Version::parse(latest)
-        .map_err(|error| format!("Version GitHub invalide : {error}"))?;
-    if latest_version <= current_version {
-        return Ok(None);
-    }
-
-    let expected_name = format!("AKRAT-{}-{asset_suffix}.{extension}", release.tag_name);
-    let asset = release
-        .assets
+    let available = releases
         .into_iter()
-        .find(|asset| asset.name == expected_name)
-        .ok_or_else(|| {
-            format!(
-                "La release {} ne contient pas {expected_name}.",
-                release.tag_name
-            )
-        })?;
-    let digest = asset
-        .digest
-        .filter(|digest| digest.starts_with("sha256:") && digest.len() == 71)
-        .ok_or_else(|| format!("Empreinte SHA-256 absente pour {expected_name}."))?;
-    if asset.size == 0 || asset.size > MAX_ARCHIVE_SIZE {
-        return Err("La taille de l’archive de mise à jour est invalide.".into());
-    }
+        .filter_map(|release| {
+            if release.prerelease {
+                return None;
+            }
+            let version = semver::Version::parse(release.tag_name.trim_start_matches('v')).ok()?;
+            if version <= current_version {
+                return None;
+            }
+            let expected_name = format!("AKRAT-{}-{asset_suffix}.{extension}", release.tag_name);
+            let asset = release
+                .assets
+                .into_iter()
+                .find(|asset| asset.name == expected_name)?;
+            let digest = asset
+                .digest
+                .filter(|digest| digest.starts_with("sha256:") && digest.len() == 71)?;
+            if asset.size == 0 || asset.size > MAX_ARCHIVE_SIZE {
+                return None;
+            }
+            Some((version, release, asset, digest))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0));
+    let Some((latest_version, release, asset, digest)) = available else {
+        return Ok(None);
+    };
 
     Ok(Some(UpdateRelease {
         version: latest_version.to_string(),
@@ -126,6 +125,7 @@ pub async fn install(release: UpdateRelease) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let response = client
         .get(&release.download_url)
+        .timeout(std::time::Duration::from_secs(300))
         .send()
         .await
         .map_err(|error| format!("Téléchargement impossible : {error}"))?
