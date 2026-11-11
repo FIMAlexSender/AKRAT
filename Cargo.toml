@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/akrat-core", "crates/akrat-cli", "crates/akrat-desktop"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.91"
@@ -13,6 +13,7 @@ aes-gcm = "0.11.1"
 argon2 = "0.6"
 base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dioxus = { version = "0.7.10" }
 dioxus-desktop = "0.7.10"
 directories = "6"

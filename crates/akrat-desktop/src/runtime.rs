@@ -15,6 +15,7 @@ static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
 
 enum ServiceCommand {
     Dial(Contact, mpsc::UnboundedSender<UiEvent>),
+    UpdateContacts(Vec<Contact>),
     Stop,
 }
 
@@ -105,6 +106,17 @@ pub fn connect(identity: Identity, contact: Contact, events: mpsc::UnboundedSend
     }
 }
 
+pub fn update_contacts(identity_id: &str, contacts: Vec<Contact>) {
+    let registry = SERVICES.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Some(sender) = registry
+        .lock()
+        .ok()
+        .and_then(|services| services.get(identity_id).map(|(_, sender)| sender.clone()))
+    {
+        let _ = sender.send(ServiceCommand::UpdateContacts(contacts));
+    }
+}
+
 pub fn listen(
     identity: Identity,
     contacts: Vec<Contact>,
@@ -135,6 +147,7 @@ pub fn listen(
             }
         };
         runtime.block_on(async move {
+            let mut contacts = contacts;
             let transport_key_bytes = identity.transport_private_key();
             let transport_key = iroh::SecretKey::from_bytes(&transport_key_bytes);
             let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -170,6 +183,7 @@ pub fn listen(
                             let identity = identity.detached_copy();
                             tokio::spawn(async move { dial_contact(endpoint, identity, contact, command_events).await; });
                         }
+                        Some(ServiceCommand::UpdateContacts(updated)) => contacts = updated,
                         Some(ServiceCommand::Stop) | None => break,
                     },
                     accepted = endpoint.accept() => match accepted {

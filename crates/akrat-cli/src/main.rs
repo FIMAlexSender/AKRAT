@@ -367,9 +367,7 @@ async fn connect_and_chat(
         )
     };
     if transport_id.is_empty() {
-        return Err(
-            "l'invitation de ce contact doit être actualisée pour le réseau P2P v0.1.6".into(),
-        );
+        return Err("l'invitation de ce contact doit être actualisée pour le réseau P2P".into());
     }
     let local_identity = find_identity(&data, identity_id)?;
     let endpoint = new_endpoint(local_identity).await?;
