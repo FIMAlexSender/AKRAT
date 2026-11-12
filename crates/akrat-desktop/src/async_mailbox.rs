@@ -1464,33 +1464,34 @@ mod tests {
         .await
         .expect("deposit encrypted group message");
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload Alice vault");
-        assert_eq!(
-            alice_data.messages[0].delivery,
-            DeliveryState::MailboxStored
-        );
-        assert!(
-            alice_data.messages[0]
-                .delivery_events
+        for message_id in [MESSAGE_ID, SECOND_MESSAGE_ID] {
+            let sent = alice_data
+                .messages
                 .iter()
-                .any(|event| event.kind == DeliveryEventKind::Encrypted && event.verified)
-        );
-        assert!(alice_data.messages[0].delivery_events.iter().any(|event| {
-            event.kind == DeliveryEventKind::Deposited
-                && event.verified
-                && event.receipt_bytes.is_some()
-        }));
+                .find(|message| message.id == message_id)
+                .expect("concurrent direct message remains in the vault");
+            assert_eq!(sent.delivery, DeliveryState::MailboxStored);
+            assert!(
+                sent.delivery_events
+                    .iter()
+                    .any(|event| event.kind == DeliveryEventKind::Encrypted && event.verified)
+            );
+            assert_eq!(
+                sent.delivery_events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == DeliveryEventKind::Deposited
+                            && event.verified
+                            && event.receipt_bytes.is_some()
+                    })
+                    .count(),
+                2
+            );
+        }
         assert_eq!(alice_data.async_outbox.len(), 3);
         assert_eq!(
             alice_data.group_deliveries[0].recipients[0].status,
             GroupRecipientStatus::Deposited
-        );
-        assert_eq!(
-            alice_data.messages[0]
-                .delivery_events
-                .iter()
-                .filter(|event| event.kind == DeliveryEventKind::Deposited)
-                .count(),
-            2
         );
 
         let (primary_poll, replica_poll) = tokio::join!(
@@ -1589,7 +1590,12 @@ mod tests {
         let bob_data = load_vault(&bob_vault, PHRASE).expect("reload Bob vault");
         assert_eq!(bob_data.mailbox_inboxes[0].server_key_generation, 2);
         assert_eq!(bob_data.messages.len(), 3);
-        assert_eq!(bob_data.messages[0].text, message);
+        let received_direct = bob_data
+            .messages
+            .iter()
+            .find(|message| message.id == MESSAGE_ID)
+            .expect("original direct message is retained");
+        assert_eq!(received_direct.text, message);
         assert!(
             bob_data
                 .messages
@@ -1598,13 +1604,13 @@ mod tests {
                     && message.text.contains("Group delivery"))
         );
         assert!(
-            bob_data.messages[0]
+            received_direct
                 .delivery_events
                 .iter()
                 .any(|event| event.kind == DeliveryEventKind::Retrieved)
         );
         assert!(
-            bob_data.messages[0]
+            received_direct
                 .delivery_events
                 .iter()
                 .any(
@@ -1612,14 +1618,14 @@ mod tests {
                         && event.verified
                 )
         );
-        assert!(bob_data.messages[0].delivery_events.iter().any(|event| {
+        assert!(received_direct.delivery_events.iter().any(|event| {
             event.kind == DeliveryEventKind::RecipientConfirmed
                 && event.verified
                 && event.receipt_bytes.is_some()
         }));
         assert!(bob_data.pending_recipient_receipts.is_empty());
         assert_eq!(
-            bob_data.messages[0]
+            received_direct
                 .delivery_events
                 .iter()
                 .filter(|event| event.kind == DeliveryEventKind::RecipientConfirmed)
@@ -1629,7 +1635,12 @@ mod tests {
         assert_eq!(mailbox_message_count(address, &alice, &config).await, 0);
         assert_eq!(mailbox_message_count(address2, &alice, &config2).await, 0);
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload delivered Alice vault");
-        assert_eq!(alice_data.messages[0].delivery, DeliveryState::Acknowledged);
+        let acknowledged_direct = alice_data
+            .messages
+            .iter()
+            .find(|message| message.id == MESSAGE_ID)
+            .expect("original direct message remains in Alice's history");
+        assert_eq!(acknowledged_direct.delivery, DeliveryState::Acknowledged);
         assert_eq!(
             alice_data.group_deliveries[0].recipients[0].status,
             GroupRecipientStatus::Received
@@ -1643,7 +1654,7 @@ mod tests {
                 .delivery,
             DeliveryState::Acknowledged
         );
-        assert!(alice_data.messages[0].delivery_events.iter().any(|event| {
+        assert!(acknowledged_direct.delivery_events.iter().any(|event| {
             event.kind == DeliveryEventKind::RecipientConfirmed
                 && event.verified
                 && event.receipt_bytes.is_some()
