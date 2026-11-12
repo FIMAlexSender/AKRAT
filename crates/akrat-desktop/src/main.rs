@@ -10,7 +10,7 @@ use akrat_core::{
     Contact, DeliveryActor, DeliveryEvent, DeliveryEventKind, DeliveryState, GroupChange,
     GroupEvent, GroupMember, GroupMessage, GroupMessageDelivery, GroupRecipientDelivery,
     GroupRecipientStatus, GroupRole, GroupState, Identity, Invitation, MailboxInbox, MailboxRoute,
-    StoredAttachment, StoredMessage, VaultData, VaultFileLock, load_vault,
+    RelaySettings, StoredAttachment, StoredMessage, VaultData, VaultFileLock, load_vault,
     markdown::TableAlignment,
     markdown::{MarkdownNode, MarkdownNodeKind, parse_markdown},
     save_vault,
@@ -100,6 +100,25 @@ struct GroupUiContext {
     event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
 }
 
+struct ImageActionContext {
+    path: PathBuf,
+    passphrase: Signal<String>,
+    vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    notice: Signal<String>,
+    trace: Signal<Vec<String>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+}
+
+struct GroupManagementContext {
+    path: PathBuf,
+    passphrase: Signal<String>,
+    vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+    notice: Signal<String>,
+}
+
 #[component]
 fn App() -> Element {
     let catalog_state = use_hook(|| {
@@ -143,6 +162,7 @@ fn App() -> Element {
     let mut sessions = use_signal(HashMap::<String, SessionHandle>::new);
     let mut listen_stops = use_signal(HashMap::<String, tokio::sync::watch::Sender<bool>>::new);
     let mut applied_network_contacts = use_signal(Vec::<Contact>::new);
+    let mut applied_relay_settings = use_signal(RelaySettings::default);
     let mut active_conversation = use_signal(|| None::<String>);
     let draft = use_signal(String::new);
     let mut trace = use_signal(|| {
@@ -182,16 +202,25 @@ fn App() -> Element {
                     .cloned()
                     .collect::<Vec<_>>(),
                 retry_targets,
+                data.relay_settings.clone(),
             )
         });
-        if let Some((identities, contacts, retry_targets)) = snapshot {
+        if let Some((identities, contacts, retry_targets, relay_settings)) = snapshot {
             let contacts_changed = *applied_network_contacts.read() != contacts;
+            let relays_changed = *applied_relay_settings.read() != relay_settings;
+            if relays_changed {
+                for stop in listen_stops.read().values() {
+                    let _ = stop.send(true);
+                }
+                listen_stops.write().clear();
+            }
             let active = listen_stops.read().keys().cloned().collect::<Vec<_>>();
             for identity in &identities {
                 if !active.contains(&identity.id) {
                     let stop = runtime::listen(
                         identity.detached_copy(),
                         contacts.clone(),
+                        relay_settings.clone(),
                         event_sender.read().clone(),
                     );
                     listen_stops.write().insert(identity.id.clone(), stop);
@@ -212,6 +241,9 @@ fn App() -> Element {
             }
             if contacts_changed {
                 applied_network_contacts.set(contacts);
+            }
+            if relays_changed {
+                applied_relay_settings.set(relay_settings);
             }
         } else {
             let stops = listen_stops.read().values().cloned().collect::<Vec<_>>();
@@ -2029,7 +2061,15 @@ fn NetworkPage(
     let mut write_capability = use_signal(String::new);
     let mut read_capability = use_signal(String::new);
     let mut bundle_capability = use_signal(String::new);
+    let mut relay_url_input = use_signal(String::new);
+    let mut relay_fingerprint_input = use_signal(String::new);
+    let relay_settings = vault
+        .read()
+        .as_ref()
+        .map(|data| data.relay_settings.clone())
+        .unwrap_or_default();
     let inbox_path = path.clone();
+    let relay_path = path.clone();
     rsx! {
         section { class: "page-scroll",
             div { class: "eyebrow", "RÉSEAU PAIR À PAIR" }
@@ -2046,6 +2086,90 @@ fn NetworkPage(
                             div { class: "record-main", strong { "{name}" } span { class: "quiet", if online_ids.contains(id) { "Service démarré · relais dans le journal" } else { "Démarrage du service réseau…" } } }
                         }
                     }
+                }
+            }
+            section { class: "panel mailbox-inbox-form",
+                div { class: "panel-title", "Relais P2P" }
+                p { class: "quiet", "Iroh tente d’abord la connexion directe et utilise ensuite les relais configurés. Le relais transporte des paquets chiffrés de bout en bout. Les relais personnalisés remplacent les relais publics par défaut." }
+                label { "Niveau de confiance minimum" select {
+                    value: "{relay_settings.minimum_trust as u8}",
+                    onchange: {
+                        let path = relay_path.clone();
+                        move |event: Event<FormData>| {
+                            let Ok(level) = event.value().parse::<u8>() else { return; };
+                            let trust = match level { 0 => akrat_core::RelayTrustLevel::Unknown, 1 => akrat_core::RelayTrustLevel::IdentityVerified, _ => { notice.set("La provenance de distribution et l’attestation matérielle ne sont pas disponibles dans cette version.".into()); return; } };
+                            let phrase = passphrase.read().clone();
+                            let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                            data.relay_settings.minimum_trust = trust;
+                            if let Err(error) = data.relay_settings.relay_mode() { notice.set(error); return; }
+                            match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Politique de confiance mise à jour.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                        }
+                    },
+                    option { value: "0", "0 · Autoriser les relais non vérifiés" }
+                    option { value: "1", "1 · Exiger une identité épinglée" }
+                    option { value: "2", disabled: true, "2 · Provenance de distribution · indisponible" }
+                    option { value: "3", disabled: true, "3 · Exécution attestée · indisponible" }
+                } }
+                p { class: "quiet", "Niveau 1 vérifie une signature de défi Ed25519 pour l’URL épinglée. Les niveaux 2 (artefact de distribution signé) et 3 (attestation matérielle) ne sont pas annoncés comme vérifiés ici." }
+                if relay_settings.custom_relays.is_empty() {
+                    p { class: "network-identity", if relay_settings.minimum_trust >= akrat_core::RelayTrustLevel::IdentityVerified { "Mode strict · relais non épinglés désactivés · connexions directes seulement" } else if relay_settings.use_default_relays { "Relais publics Iroh activés" } else { "Relais désactivés · connexions directes seulement" } }
+                } else {
+                    for (index, url) in relay_settings.custom_relays.iter().enumerate() {
+                        div { class: "network-identity",
+                            span { class: "record-main", "{url}" }
+                            button { class: "secondary compact", onclick: {
+                                let path = relay_path.clone();
+                                move |_| {
+                                    let phrase = passphrase.read().clone();
+                                    let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                                    let removed = if index < data.relay_settings.custom_relays.len() { Some(data.relay_settings.custom_relays.remove(index)) } else { None };
+                                    if let Some(url) = removed { data.relay_settings.identity_pins.retain(|pin| pin.relay_url != url); }
+                                    if data.relay_settings.custom_relays.is_empty() { data.relay_settings.use_default_relays = true; }
+                                    match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Relais retiré. Les services réseau redémarrent.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                                }
+                            }, "Retirer" }
+                        }
+                    }
+                }
+                label { "URL du relais Iroh · HTTPS" input { value: "{relay_url_input}", placeholder: "https://relay.example.org", oninput: move |e| relay_url_input.set(e.value()) } }
+                label { "Empreinte Ed25519 attendue · 64 caractères hexadécimaux, à comparer avec l’opérateur" input { value: "{relay_fingerprint_input}", placeholder: "Empreinte fournie hors bande", oninput: move |e| relay_fingerprint_input.set(e.value()) } }
+                button { class: "secondary", onclick: {
+                    let path = relay_path.clone();
+                    move |_| {
+                        let value = relay_url_input.read().trim().to_string();
+                        if value.is_empty() { notice.set("Saisissez une URL de relais.".into()); return; }
+                        let expected_fingerprint = relay_fingerprint_input.read().trim().to_string();
+                        let phrase = passphrase.read().clone();
+                        let task_path = path.clone();
+                        spawn(async move {
+                            let canonical = match value.parse::<iroh::RelayUrl>() { Ok(url) => url.to_string(), Err(_) => { notice.set("URL de relais Iroh invalide.".into()); return; } };
+                            let pin = if expected_fingerprint.is_empty() { None } else {
+                                match akrat_trust::verify_remote_relay_identity(&canonical, &expected_fingerprint).await {
+                                    Ok(pin) => Some(pin),
+                                    Err(error) => { notice.set(format!("Identité du relais refusée : {error}")); return; }
+                                }
+                            };
+                            let mut data = match load_vault(&task_path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                            if data.relay_settings.custom_relays.contains(&canonical) { notice.set("Ce relais figure déjà dans la liste.".into()); return; }
+                            data.relay_settings.custom_relays.push(canonical.clone());
+                            if let Some(pin) = pin { data.relay_settings.identity_pins.push(pin); }
+                            data.relay_settings.use_default_relays = false;
+                            if let Err(error) = data.relay_settings.relay_mode() { data.relay_settings.custom_relays.pop(); notice.set(error); return; }
+                            match save_vault(&task_path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); relay_url_input.set(String::new()); relay_fingerprint_input.set(String::new()); notice.set("Relais ajouté. Les identités réseau redémarrent avec cette configuration.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                        });
+                    }
+                }, "Ajouter ce relais" }
+                if !relay_settings.custom_relays.is_empty() {
+                    button { class: "secondary", onclick: {
+                        let path = relay_path.clone();
+                        move |_| {
+                            let phrase = passphrase.read().clone();
+                            let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                            data.relay_settings.custom_relays.clear();
+                            data.relay_settings.use_default_relays = true;
+                            match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Relais publics Iroh réactivés.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                        }
+                    }, "Revenir aux relais publics Iroh" }
                 }
             }
             section { class: "panel mailbox-inbox-form",
@@ -2432,7 +2556,7 @@ fn ChatPage(
                                 let conversation = image_conversation.clone();
                                 spawn(async move {
                                     match file.read_bytes().await {
-                                        Ok(bytes) => send_image_action(conversation, name, bytes.to_vec(), path, passphrase, vault, sessions, notice, trace, event_sender),
+                                        Ok(bytes) => send_image_action(conversation, name, bytes.to_vec(), ImageActionContext { path, passphrase, vault, sessions, notice, trace, event_sender }),
                                         Err(error) => notice.set(format!("Lecture de l’image impossible : {error}")),
                                     }
                                 });
@@ -2504,7 +2628,7 @@ fn GroupAdminPanel(
                 div { class: "group-admin-rename",
                     input { value: "{rename_draft}", maxlength: "64", placeholder: "Nom du groupe", oninput: move |event| rename_draft.set(event.value()) }
                     button { class: "secondary compact", onclick: move |_| {
-                        apply_group_change_action(group_id_for_rename.clone(), GroupChange::Rename { name: rename_draft.read().trim().to_string() }, path_for_rename.clone(), passphrase, vault, sessions, event_sender, notice);
+                        apply_group_change_action(group_id_for_rename.clone(), GroupChange::Rename { name: rename_draft.read().trim().to_string() }, GroupManagementContext { path: path_for_rename.clone(), passphrase, vault, sessions, event_sender, notice });
                     }, "Renommer" }
                 }
             }
@@ -2515,11 +2639,11 @@ fn GroupAdminPanel(
                         if can_manage && member.accepted && member.role != GroupRole::Owner {
                             if is_owner {
                                 button { class: "secondary compact", onclick: { let fingerprint = member.fingerprint.clone(); let role = if member.role == GroupRole::Admin { GroupRole::Member } else { GroupRole::Admin }; let group_id = group_id.clone(); let path = path_for_role.clone(); move |_| {
-                                    apply_group_change_action(group_id.clone(), GroupChange::SetRole { fingerprint: fingerprint.clone(), role }, path.clone(), passphrase, vault, sessions, event_sender, notice);
+                                    apply_group_change_action(group_id.clone(), GroupChange::SetRole { fingerprint: fingerprint.clone(), role }, GroupManagementContext { path: path.clone(), passphrase, vault, sessions, event_sender, notice });
                                 } }, if member.role == GroupRole::Admin { "Rétrograder" } else { "Promouvoir admin" } }
                             }
                             button { class: "secondary compact danger", onclick: { let fingerprint = member.fingerprint.clone(); let group_id = group_id.clone(); let path = path_for_remove.clone(); move |_| {
-                                apply_group_change_action(group_id.clone(), GroupChange::Remove { fingerprint: fingerprint.clone() }, path.clone(), passphrase, vault, sessions, event_sender, notice);
+                                apply_group_change_action(group_id.clone(), GroupChange::Remove { fingerprint: fingerprint.clone() }, GroupManagementContext { path: path.clone(), passphrase, vault, sessions, event_sender, notice });
                             } }, "Retirer" }
                         }
                     }
@@ -2527,7 +2651,7 @@ fn GroupAdminPanel(
             }
             if can_leave {
                 button { class: "secondary compact danger", onclick: move |_| {
-                    apply_group_change_action(group_id.clone(), GroupChange::Leave, path_for_leave.clone(), passphrase, vault, sessions, event_sender, notice);
+                    apply_group_change_action(group_id.clone(), GroupChange::Leave, GroupManagementContext { path: path_for_leave.clone(), passphrase, vault, sessions, event_sender, notice });
                 }, "Quitter le groupe" }
             }
         }
@@ -3123,25 +3247,34 @@ fn send_image_action(
     conversation: String,
     display_name: String,
     bytes: Vec<u8>,
-    path: PathBuf,
-    passphrase: Signal<String>,
-    mut vault: Signal<Option<VaultData>>,
-    sessions: Signal<HashMap<String, SessionHandle>>,
-    mut notice: Signal<String>,
-    mut trace: Signal<Vec<String>>,
-    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+    context: ImageActionContext,
 ) {
+    let ImageActionContext {
+        path,
+        passphrase,
+        vault,
+        sessions,
+        notice,
+        trace,
+        event_sender,
+    } = context;
+    let mut vault = vault;
+    let mut notice = notice;
+    let mut trace = trace;
     if conversation.starts_with("group:") {
         send_group_image_action(
             conversation,
             display_name,
             bytes,
-            path,
-            passphrase,
-            vault,
-            sessions,
-            notice,
-            trace,
+            ImageActionContext {
+                path,
+                passphrase,
+                vault,
+                sessions,
+                notice,
+                trace,
+                event_sender,
+            },
         );
         return;
     }
@@ -3236,13 +3369,20 @@ fn send_group_image_action(
     conversation: String,
     display_name: String,
     bytes: Vec<u8>,
-    path: PathBuf,
-    passphrase: Signal<String>,
-    mut vault: Signal<Option<VaultData>>,
-    sessions: Signal<HashMap<String, SessionHandle>>,
-    mut notice: Signal<String>,
-    mut trace: Signal<Vec<String>>,
+    context: ImageActionContext,
 ) {
+    let ImageActionContext {
+        path,
+        passphrase,
+        vault,
+        sessions,
+        notice,
+        trace,
+        ..
+    } = context;
+    let mut vault = vault;
+    let mut notice = notice;
+    let mut trace = trace;
     let group_id = conversation.trim_start_matches("group:");
     let phrase = passphrase.read().clone();
     let mut data = match load_vault(&path, &phrase) {
@@ -3802,13 +3942,18 @@ fn connect_group_members(
 fn apply_group_change_action(
     group_id: String,
     change: GroupChange,
-    path: PathBuf,
-    passphrase: Signal<String>,
-    mut vault: Signal<Option<VaultData>>,
-    sessions: Signal<HashMap<String, SessionHandle>>,
-    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
-    mut notice: Signal<String>,
+    context: GroupManagementContext,
 ) {
+    let GroupManagementContext {
+        path,
+        passphrase,
+        vault,
+        sessions,
+        event_sender,
+        notice,
+    } = context;
+    let mut vault = vault;
+    let mut notice = notice;
     let phrase = passphrase.read().clone();
     let mut data = match load_vault(&path, &phrase) {
         Ok(data) => data,

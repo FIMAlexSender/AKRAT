@@ -2,7 +2,7 @@ name: Build AKRAT
 
 on:
   push:
-    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager, v0.1.11-groups-media-markdown, akr-at-v0.1-foundation, akrat-cli-core, akrat-desktop-ui]
+    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager, v0.1.11-groups-media-markdown, v0.1.12-architecture-relay, akr-at-v0.1-foundation, akrat-cli-core, akrat-desktop-ui]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -27,6 +27,7 @@ jobs:
             app: target/release/akrat-desktop
             cli: target/release/akrat
             mailbox: target/release/akrat-mailbox
+            relay: target/release/akrat-relay
     runs-on: [self-hosted, Linux, X64, "${{ matrix.os }}"]
     steps:
       - uses: actions/checkout@v6
@@ -48,13 +49,26 @@ jobs:
       - name: Test workspace and formatting
         run: |
           cargo fmt --all -- --check
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked --root target/security-tools
+          cargo install cargo-deny --version 0.20.2 --locked --root target/security-tools
+          target/security-tools/bin/cargo-audit audit
+          target/security-tools/bin/cargo-deny check -W unmaintained -W unsound --hide-inclusion-graph
 
       - name: Build desktop app and CLI
         run: |
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
           cargo build --locked --release -p akrat-mailbox
+          cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools
+          cp target/relay-tools/bin/iroh-relay target/release/iroh-relay
+          cargo build --locked --release -p akrat-relay
+          cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/README.md target/release/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -63,6 +77,13 @@ jobs:
             ${{ matrix.app }}
             ${{ matrix.cli }}
             ${{ matrix.mailbox }}
+            ${{ matrix.relay }}
+            target/release/iroh-relay
+            target/release/akrat-node.sh
+            target/release/akrat-node.ps1
+            target/release/iroh-relay.toml.example
+            target/release/akrat-node.service
+            target/release/README.md
           if-no-files-found: error
           retention-days: 14
 
@@ -99,6 +120,8 @@ jobs:
         shell: powershell
         run: |
           cargo fmt --all -- --check
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
 
       - name: Build desktop app and CLI with MSVC
@@ -112,9 +135,10 @@ jobs:
           $stableRustc = (& rustup which --toolchain stable rustc).Trim()
           $stableCargo = (& rustup which --toolchain stable cargo).Trim()
           if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The stable Rust toolchain is incomplete on the AKRAT runner.' }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox'
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox && "' + $stableCargo + '" install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools && copy /Y target\relay-tools\bin\iroh-relay.exe target\release\iroh-relay.exe && "' + $stableCargo + '" build --locked --release -p akrat-relay'
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item 'packaging\relay\akrat-node.sh','packaging\relay\akrat-node.ps1','packaging\relay\iroh-relay.toml.example','packaging\relay\akrat-node.service','packaging\relay\README.md' 'target\release\' -Force
 
       - name: Package the Windows installer
         shell: powershell
@@ -141,6 +165,13 @@ jobs:
             target/release/akrat-desktop.exe
             target/release/akrat.exe
             target/release/akrat-mailbox.exe
+            target/release/akrat-relay.exe
+            target/release/iroh-relay.exe
+            target/release/akrat-node.sh
+            target/release/akrat-node.ps1
+            target/release/iroh-relay.toml.example
+            target/release/akrat-node.service
+            target/release/README.md
             target/release/AKRAT-Setup-*.exe
           if-no-files-found: error
           retention-days: 14
@@ -180,6 +211,10 @@ jobs:
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
           cargo build --locked --release -p akrat-mailbox
+          cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools
+          Copy-Item 'target\relay-tools\bin\iroh-relay.exe' 'target\release\iroh-relay.exe' -Force
+          cargo build --locked --release -p akrat-relay
+          Copy-Item 'packaging\relay\akrat-node.sh','packaging\relay\akrat-node.ps1','packaging\relay\iroh-relay.toml.example','packaging\relay\akrat-node.service','packaging\relay\README.md' 'target\release\' -Force
 
       - uses: actions/upload-artifact@v4
         with:
@@ -188,6 +223,13 @@ jobs:
             target/release/akrat-desktop.exe
             target/release/akrat.exe
             target/release/akrat-mailbox.exe
+            target/release/akrat-relay.exe
+            target/release/iroh-relay.exe
+            target/release/akrat-node.sh
+            target/release/akrat-node.ps1
+            target/release/iroh-relay.toml.example
+            target/release/akrat-node.service
+            target/release/README.md
           if-no-files-found: error
           retention-days: 14
 
@@ -205,6 +247,19 @@ jobs:
         with:
           path: dist
 
+      - name: Generate CycloneDX SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="AKRAT-${GITHUB_REF_NAME}-sbom"
+          cargo install cargo-cyclonedx --version 0.5.10 --locked --root target/sbom-tools
+          target/sbom-tools/bin/cargo-cyclonedx cyclonedx \
+            --manifest-path crates/akrat-mailbox/Cargo.toml \
+            --format json --target all --override-filename "$stem"
+          for crate in akrat-cli akrat-core akrat-desktop akrat-mailbox akrat-relay akrat-trust; do
+            cp "crates/$crate/$stem.json" "dist/$stem-$crate.json"
+          done
+
       - name: Préparer les archives par plateforme
         shell: bash
         run: |
@@ -214,28 +269,35 @@ jobs:
             folder="dist/akrat-${target}"
             if [[ "$target" == windows-* ]]; then
               zip -j "dist/AKRAT-${version}-${target}.zip" \
-                "$folder/akrat-desktop.exe" "$folder/akrat.exe" "$folder/akrat-mailbox.exe"
+                "$folder/akrat-desktop.exe" "$folder/akrat.exe" "$folder/akrat-mailbox.exe" "$folder/akrat-relay.exe" "$folder/iroh-relay.exe" \
+                "$folder/akrat-node.sh" "$folder/akrat-node.ps1" "$folder/iroh-relay.toml.example" "$folder/akrat-node.service" "$folder/README.md"
             else
-              chmod +x "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox"
+              chmod +x "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox" "$folder/akrat-relay" "$folder/iroh-relay" "$folder/akrat-node.sh"
               zip -j "dist/AKRAT-${version}-${target}.zip" \
-                "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox"
+                "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox" "$folder/akrat-relay" "$folder/iroh-relay" \
+                "$folder/akrat-node.sh" "$folder/akrat-node.ps1" "$folder/iroh-relay.toml.example" "$folder/akrat-node.service" "$folder/README.md"
             fi
           done
           cp dist/akrat-android-apk/app-debug.apk "dist/AKRAT-${version}-android.apk"
           cp dist/akrat-windows-x64/akrat-mailbox.exe "dist/AKRAT-${version}-mailbox-windows-x64.exe"
           cp dist/akrat-linux-x64/akrat-mailbox "dist/AKRAT-${version}-mailbox-linux-x64"
+          cp dist/akrat-windows-x64/akrat-relay.exe "dist/AKRAT-${version}-relay-windows-x64.exe"
+          cp dist/akrat-linux-x64/akrat-relay "dist/AKRAT-${version}-relay-linux-x64"
+          cp dist/akrat-windows-x64/iroh-relay.exe "dist/AKRAT-${version}-iroh-relay-windows-x64.exe"
+          cp dist/akrat-linux-x64/iroh-relay "dist/AKRAT-${version}-iroh-relay-linux-x64"
           cp dist/akrat-windows-x64/AKRAT-Setup-v"${version#v}".exe "dist/AKRAT-${version}-windows-installer.exe"
+          cp docs/v0.1.12-validation.md "dist/AKRAT-${version}-validation.md"
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
-          AKRAT v0.1.10 ajoute un gestionnaire de coffres avec sélection restaurée, importation portable, renommage sans rechiffrement et catalogue récupérable. Les capacités de livraison différée et de fédération v0.1.9 sont conservées.
+          Cette version ajoute le composant relais Iroh configurable, la vérification épinglée d'identité Ed25519 et une réduction ciblée des dépendances médias du service Mailbox.
 
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
           - Android : la compilation de l’APK est vérifiée par la CI ; l’APK signé pour les installations de test est publié séparément.
           - macOS : non compilé pour cette version ; aucun Mac n’est utilisé.
 
-          La continuité des clés de reçus est authentifiée par une racine persistante ; les anciennes signatures ne sont acceptées que pendant la période d’activité de leur clé. La compromission de cette racine nécessite un réépinglage hors bande. Le prekey Kyber signé n’est pas un pool de prekeys PQ à usage unique. Aucun audit cryptographique indépendant n’a été réalisé.
+          Le niveau de confiance 0 et l'épinglage du niveau 1 sont disponibles. Les preuves de distribution signées (niveau 2), l'attestation matérielle (niveau 3), la réputation et les preuves décentralisées de faute ne sont pas implémentées et ne sont pas annoncées comme vérifiées. Le relais transporte le trafic Iroh chiffré sans accéder aux secrets applicatifs. Il peut toujours observer des métadonnées et interrompre le service.
 
           Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256. L’APK Android est signé avec la clé de test persistante du projet.
           EOF
@@ -252,6 +314,17 @@ jobs:
             dist/AKRAT-"${GITHUB_REF_NAME}"-android.apk \
             dist/AKRAT-"${GITHUB_REF_NAME}"-mailbox-windows-x64.exe \
             dist/AKRAT-"${GITHUB_REF_NAME}"-mailbox-linux-x64 \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-relay-windows-x64.exe \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-relay-linux-x64 \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-iroh-relay-windows-x64.exe \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-iroh-relay-linux-x64 \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-cli.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-core.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-desktop.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-mailbox.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-relay.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-trust.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-validation.md \
             dist/SHA256SUMS \
             --title "AKRAT ${GITHUB_REF_NAME}" \
             --notes-file dist/release-notes.md

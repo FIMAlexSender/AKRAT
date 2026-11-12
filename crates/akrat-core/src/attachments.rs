@@ -1,10 +1,13 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+#[cfg(feature = "media-image")]
 use image::{ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+#[cfg(feature = "media-image")]
+use std::io::Cursor;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -12,7 +15,9 @@ pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 pub const ATTACHMENT_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_ATTACHMENT_CHUNKS: usize = MAX_ATTACHMENT_BYTES.div_ceil(ATTACHMENT_CHUNK_BYTES);
 pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
+#[cfg(feature = "media-image")]
 const MAX_IMAGE_PIXELS: u64 = 32_000_000;
+#[cfg(feature = "media-image")]
 const MAX_DECODE_ALLOCATION: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -65,6 +70,7 @@ pub enum AttachmentError {
     Encoding,
 }
 
+#[cfg(feature = "media-image")]
 pub fn sanitize_image(input: &[u8]) -> Result<(Vec<u8>, String), AttachmentError> {
     if input.is_empty() || input.len() > MAX_ATTACHMENT_BYTES {
         return Err(AttachmentError::TooLarge);
@@ -100,6 +106,7 @@ pub fn sanitize_image(input: &[u8]) -> Result<(Vec<u8>, String), AttachmentError
     Ok((bytes, "image/png".into()))
 }
 
+#[cfg(feature = "media-image")]
 pub fn encrypt_image(
     input: &[u8],
     attachment_id: String,
@@ -348,6 +355,7 @@ fn validate_id(id: &str) -> Result<(), AttachmentError> {
     Ok(())
 }
 
+#[cfg(feature = "media-image")]
 fn sanitize_display_name(name: &str) -> Result<String, AttachmentError> {
     let leaf = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned = leaf
@@ -361,7 +369,7 @@ fn sanitize_display_name(name: &str) -> Result<String, AttachmentError> {
     Ok(cleaned)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "media-image"))]
 mod tests {
     use super::*;
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
@@ -465,7 +473,7 @@ mod tests {
             ciphertext: vec![9; ATTACHMENT_CHUNK_BYTES + 16],
         };
         let sidecar = directory.path().join("vault.akrat.attachments");
-        store_encrypted_chunks(&sidecar, &[chunk.clone()]).expect("save full chunk");
+        store_encrypted_chunks(&sidecar, std::slice::from_ref(&chunk)).expect("save full chunk");
         let restored = load_encrypted_chunks(&sidecar, &manifest).expect("load full chunk");
         assert_eq!(restored, [chunk]);
     }

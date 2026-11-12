@@ -1,7 +1,9 @@
 pub mod async_crypto;
 pub mod attachments;
+#[cfg(feature = "markdown")]
 pub mod markdown;
 pub mod network;
+pub use akrat_trust::{RelayIdentityPin, RelayTrustLevel};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -368,6 +370,89 @@ pub struct VaultData {
     pub mailbox_inboxes: Vec<MailboxInbox>,
     pub async_outbox: Vec<AsyncOutboxItem>,
     pub pending_recipient_receipts: Vec<PendingRecipientReceipt>,
+    pub relay_settings: RelaySettings,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelaySettings {
+    pub use_default_relays: bool,
+    pub custom_relays: Vec<String>,
+    pub identity_pins: Vec<RelayIdentityPin>,
+    pub minimum_trust: RelayTrustLevel,
+}
+
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            use_default_relays: true,
+            custom_relays: Vec::new(),
+            identity_pins: Vec::new(),
+            minimum_trust: RelayTrustLevel::Unknown,
+        }
+    }
+}
+
+impl RelaySettings {
+    pub fn relay_mode(&self) -> Result<iroh::RelayMode, String> {
+        if self.custom_relays.len() > 16 {
+            return Err("un maximum de 16 relais personnalisés est autorisé".into());
+        }
+        if self.identity_pins.len() > 16 {
+            return Err("un maximum de 16 identités de relais peut être épinglé".into());
+        }
+        if self.minimum_trust >= RelayTrustLevel::DistributionVerified {
+            return Err("la provenance de distribution et l’attestation d’exécution ne sont pas disponibles dans cette version".into());
+        }
+        let relays = self
+            .custom_relays
+            .iter()
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<iroh::RelayUrl>()
+                    .map_err(|_| format!("URL de relais Iroh invalide : {value}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for pin in &self.identity_pins {
+            let pinned_url = pin
+                .relay_url
+                .parse::<iroh::RelayUrl>()
+                .map_err(|_| format!("URL d’identité de relais invalide : {}", pin.relay_url))?;
+            let public_key = hex::decode(&pin.public_key_hex)
+                .map_err(|_| "clé publique épinglée invalide".to_string())?;
+            if public_key.len() != 32
+                || !akrat_trust::relay_identity_fingerprint(&public_key)
+                    .eq_ignore_ascii_case(&pin.fingerprint)
+                || !relays.iter().any(|relay| relay == &pinned_url)
+            {
+                return Err("épinglage de relais incohérent ou invalide".into());
+            }
+        }
+        if !relays.is_empty() {
+            if self.minimum_trust >= RelayTrustLevel::IdentityVerified
+                && relays.iter().any(|relay| {
+                    !self.identity_pins.iter().any(|pin| {
+                        pin.relay_url.parse::<iroh::RelayUrl>().ok().as_ref() == Some(relay)
+                    })
+                })
+            {
+                return Err(
+                    "la politique exige une identité épinglée pour chaque relais personnalisé"
+                        .into(),
+                );
+            }
+            return Ok(iroh::RelayMode::custom(relays));
+        }
+        if self.use_default_relays {
+            if self.minimum_trust >= RelayTrustLevel::IdentityVerified {
+                return Ok(iroh::RelayMode::Disabled);
+            }
+            Ok(iroh::RelayMode::Default)
+        } else {
+            Ok(iroh::RelayMode::Disabled)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -875,6 +960,8 @@ struct VaultStorageV3 {
     async_outbox: Vec<AsyncOutboxItem>,
     #[serde(default)]
     pending_recipient_receipts: Vec<PendingRecipientReceipt>,
+    #[serde(default)]
+    relay_settings: RelaySettings,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -899,6 +986,8 @@ struct VaultStorageV4 {
     async_outbox: Vec<AsyncOutboxItem>,
     #[serde(default)]
     pending_recipient_receipts: Vec<PendingRecipientReceipt>,
+    #[serde(default)]
+    relay_settings: RelaySettings,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1127,6 +1216,7 @@ fn persist_vault_locked(
         mailbox_inboxes: data.mailbox_inboxes.clone(),
         async_outbox: data.async_outbox.clone(),
         pending_recipient_receipts: data.pending_recipient_receipts.clone(),
+        relay_settings: data.relay_settings.clone(),
     };
     let mut plaintext =
         Zeroizing::new(serde_json::to_vec(&storage).map_err(|_| AkratError::Serialization)?);
@@ -1201,6 +1291,7 @@ fn load_vault_inner(path: &Path, passphrase: &str, migrate: bool) -> Result<Vaul
             mailbox_inboxes: Vec::new(),
             async_outbox: Vec::new(),
             pending_recipient_receipts: Vec::new(),
+            relay_settings: RelaySettings::default(),
         };
         ensure_conversation_keys(&mut result)?;
         validate_vault(&result)?;
@@ -1232,6 +1323,7 @@ fn load_vault_inner(path: &Path, passphrase: &str, migrate: bool) -> Result<Vaul
                 mailbox_inboxes: Vec::new(),
                 async_outbox: Vec::new(),
                 pending_recipient_receipts: Vec::new(),
+                relay_settings: RelaySettings::default(),
             },
             0,
         )
@@ -1256,6 +1348,7 @@ fn load_vault_inner(path: &Path, passphrase: &str, migrate: bool) -> Result<Vaul
                 mailbox_inboxes: current.mailbox_inboxes,
                 async_outbox: current.async_outbox,
                 pending_recipient_receipts: current.pending_recipient_receipts,
+                relay_settings: current.relay_settings,
             },
             current.revision,
         )
@@ -1382,6 +1475,7 @@ fn load_vault_inner(path: &Path, passphrase: &str, migrate: bool) -> Result<Vaul
         mailbox_inboxes: stored.mailbox_inboxes,
         async_outbox: stored.async_outbox,
         pending_recipient_receipts: stored.pending_recipient_receipts,
+        relay_settings: stored.relay_settings,
     };
     validate_vault(&result)?;
     if envelope.version != FORMAT_VERSION && migrate {
@@ -1836,6 +1930,62 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn relay_settings_are_validated_and_survive_vault_reopen() {
+        let mut settings = RelaySettings::default();
+        assert_eq!(
+            settings.relay_mode().expect("default relay mode"),
+            iroh::RelayMode::Default
+        );
+        settings.use_default_relays = false;
+        assert_eq!(
+            settings.relay_mode().expect("disabled relay mode"),
+            iroh::RelayMode::Disabled
+        );
+        settings.custom_relays = vec!["https://relay.example.org".into()];
+        assert!(matches!(
+            settings.relay_mode().expect("custom relay mode"),
+            iroh::RelayMode::Custom(_)
+        ));
+        settings.minimum_trust = RelayTrustLevel::IdentityVerified;
+        assert!(settings.relay_mode().is_err());
+        let public_key = [7; 32];
+        settings.identity_pins = vec![RelayIdentityPin {
+            relay_url: "https://relay.example.org".into(),
+            public_key_hex: hex::encode(public_key),
+            fingerprint: akrat_trust::relay_identity_fingerprint(&public_key),
+        }];
+        assert!(settings.relay_mode().is_ok());
+        settings.identity_pins[0].fingerprint = "00".repeat(32);
+        assert!(settings.relay_mode().is_err());
+        settings.identity_pins.clear();
+        settings.minimum_trust = RelayTrustLevel::Unknown;
+        settings.custom_relays.clear();
+        settings.use_default_relays = true;
+        settings.minimum_trust = RelayTrustLevel::IdentityVerified;
+        assert_eq!(
+            settings.relay_mode().expect("strict direct-only mode"),
+            iroh::RelayMode::Disabled
+        );
+        settings.minimum_trust = RelayTrustLevel::Unknown;
+        settings.custom_relays = vec!["not a relay URL".into()];
+        assert!(settings.relay_mode().is_err());
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let mut data = VaultData {
+            relay_settings: RelaySettings {
+                use_default_relays: false,
+                custom_relays: vec!["https://relay.example.org".into()],
+                ..RelaySettings::default()
+            },
+            ..VaultData::default()
+        };
+        save_vault(&path, &mut data, "relay settings test phrase").expect("save vault");
+        let restored = load_vault(&path, "relay settings test phrase").expect("restore vault");
+        assert_eq!(restored.relay_settings, data.relay_settings);
+    }
+
+    #[test]
     fn signed_group_membership_uses_chain_epoch_and_member_authorization() {
         let alice = Identity::generate("Alice".into()).expect("Alice identity");
         let bob = Identity::generate("Bob".into()).expect("Bob identity");
@@ -2015,6 +2165,7 @@ mod tests {
         assert!(migrated.attachments.is_empty());
     }
 
+    #[cfg(feature = "media-image")]
     #[test]
     fn attachment_manifest_and_content_key_are_encrypted_by_its_conversation_key() {
         let directory = tempfile::tempdir().expect("temp directory");
@@ -2129,6 +2280,7 @@ mod tests {
             mailbox_inboxes: Vec::new(),
             async_outbox: Vec::new(),
             pending_recipient_receipts: Vec::new(),
+            relay_settings: RelaySettings::default(),
         };
         save_vault(&path, &mut data, "correct horse battery staple").expect("save");
         let bytes = fs::read(&path).expect("read vault");

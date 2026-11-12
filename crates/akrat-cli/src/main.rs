@@ -275,7 +275,7 @@ fn default_vault_path() -> Result<PathBuf, Box<dyn Error>> {
 async fn listen(path: &Path, identity_id: &str) -> Result<(), Box<dyn Error>> {
     let (mut data, passphrase) = unlock(path)?;
     let local_identity = find_identity(&data, identity_id)?;
-    let endpoint = new_endpoint(local_identity).await?;
+    let endpoint = new_endpoint(local_identity, &data.relay_settings).await?;
     println!(
         "Disponibilité P2P activée · identité réseau {}.",
         endpoint.id()
@@ -374,7 +374,7 @@ async fn connect_and_chat(
         return Err("l'invitation de ce contact doit être actualisée pour le réseau P2P".into());
     }
     let local_identity = find_identity(&data, identity_id)?;
-    let endpoint = new_endpoint(local_identity).await?;
+    let endpoint = new_endpoint(local_identity, &data.relay_settings).await?;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(20), endpoint.online()).await;
     println!("Recherche du pair par son identité réseau, sans adresse IP fixe.");
     let remote_id = transport_id.parse::<iroh::EndpointId>()?;
@@ -397,11 +397,49 @@ async fn connect_and_chat(
     result
 }
 
-async fn new_endpoint(identity: &Identity) -> Result<iroh::Endpoint, Box<dyn Error>> {
+async fn new_endpoint(
+    identity: &Identity,
+    relay_settings: &akrat_core::RelaySettings,
+) -> Result<iroh::Endpoint, Box<dyn Error>> {
+    let configured = relay_settings.relay_mode()?;
+    let relay_mode = if let iroh::RelayMode::Custom(relays) = configured {
+        let mut allowed = Vec::new();
+        for relay in relays.urls::<Vec<_>>() {
+            let pin = relay_settings
+                .identity_pins
+                .iter()
+                .find(|pin| pin.relay_url.parse::<iroh::RelayUrl>().ok().as_ref() == Some(&relay));
+            match pin {
+                Some(pin) => match akrat_trust::verify_remote_relay_identity(
+                    &pin.relay_url,
+                    &pin.fingerprint,
+                )
+                .await
+                {
+                    Ok(verified) if verified == *pin => allowed.push(relay.clone()),
+                    _ => eprintln!(
+                        "Relais écarté · identité épinglée indisponible ou invalide : {relay}"
+                    ),
+                },
+                None if relay_settings.minimum_trust == akrat_core::RelayTrustLevel::Unknown => {
+                    allowed.push(relay.clone())
+                }
+                None => eprintln!("Relais écarté · aucune identité épinglée : {relay}"),
+            }
+        }
+        if allowed.is_empty() {
+            iroh::RelayMode::Disabled
+        } else {
+            iroh::RelayMode::custom(allowed)
+        }
+    } else {
+        configured
+    };
     let transport_key_bytes = identity.transport_private_key();
     let secret = iroh::SecretKey::from_bytes(&transport_key_bytes);
     Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret)
+        .relay_mode(relay_mode)
         .alpns(vec![b"akrat-chat/0.1".to_vec()])
         .bind()
         .await?)
@@ -746,6 +784,7 @@ mod tests {
             mailbox_inboxes: Vec::new(),
             async_outbox: Vec::new(),
             pending_recipient_receipts: Vec::new(),
+            relay_settings: akrat_core::RelaySettings::default(),
         };
         assert!(!update_delivery(
             &mut data,

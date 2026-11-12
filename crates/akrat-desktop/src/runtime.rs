@@ -1,6 +1,8 @@
 use akrat_core::attachments::{AttachmentChunk, AttachmentManifest};
 use akrat_core::network::{self, SecureChannel};
-use akrat_core::{Contact, DeliveryState, GroupEvent, GroupMessage, Identity, StoredMessage};
+use akrat_core::{
+    Contact, DeliveryState, GroupEvent, GroupMessage, Identity, RelaySettings, StoredMessage,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
@@ -279,6 +281,7 @@ pub fn cancel_retry(identity_id: &str, fingerprint: &str) {
 pub fn listen(
     identity: Identity,
     contacts: Vec<Contact>,
+    relay_settings: RelaySettings,
     events: mpsc::UnboundedSender<UiEvent>,
 ) -> watch::Sender<bool> {
     let (stop, mut stopped) = watch::channel(false);
@@ -310,8 +313,26 @@ pub fn listen(
             let active_conversations = Arc::new(Mutex::new(HashSet::<String>::new()));
             let transport_key_bytes = identity.transport_private_key();
             let transport_key = iroh::SecretKey::from_bytes(&transport_key_bytes);
+            let (relay_mode, trust_messages) = match trusted_relay_mode(&relay_settings).await {
+                Ok(selection) => selection,
+                Err(error) => {
+                    let _ = events.send(UiEvent::Trace(format!("Configuration des relais invalide : {error}")));
+                    remove_service(&identity.id, service_id);
+                    return;
+                }
+            };
+            for message in trust_messages {
+                let _ = events.send(UiEvent::Trace(message));
+            }
+            if relay_settings.minimum_trust >= akrat_core::RelayTrustLevel::IdentityVerified
+                && relay_settings.use_default_relays
+                && relay_settings.custom_relays.is_empty()
+            {
+                let _ = events.send(UiEvent::Trace("Politique stricte : aucun relais par défaut n’est épinglé · connexions directes uniquement".into()));
+            }
             let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(transport_key)
+                .relay_mode(relay_mode)
                 .alpns(vec![IROH_ALPN.to_vec()])
                 .bind()
                 .await
@@ -414,6 +435,51 @@ pub fn listen(
         });
     });
     stop
+}
+
+async fn trusted_relay_mode(
+    settings: &RelaySettings,
+) -> Result<(iroh::RelayMode, Vec<String>), String> {
+    let configured = settings.relay_mode()?;
+    let iroh::RelayMode::Custom(relays) = configured else {
+        return Ok((configured, Vec::new()));
+    };
+    let mut allowed = Vec::new();
+    let mut messages = Vec::new();
+    for relay in relays.urls::<Vec<_>>() {
+        let pin = settings
+            .identity_pins
+            .iter()
+            .find(|pin| pin.relay_url.parse::<iroh::RelayUrl>().ok().as_ref() == Some(&relay));
+        match pin {
+            Some(pin) => match akrat_trust::verify_remote_relay_identity(
+                &pin.relay_url,
+                &pin.fingerprint,
+            )
+            .await
+            {
+                Ok(verified) if verified == *pin => allowed.push(relay.clone()),
+                Ok(_) => messages.push(format!(
+                    "Relais écarté · l’identité retournée a changé : {relay}"
+                )),
+                Err(error) => messages.push(format!(
+                    "Relais écarté · identité épinglée indisponible ou invalide : {relay} · {error}"
+                )),
+            },
+            None if settings.minimum_trust == akrat_core::RelayTrustLevel::Unknown => {
+                allowed.push(relay.clone())
+            }
+            None => messages.push(format!(
+                "Relais écarté · aucune identité épinglée : {relay}"
+            )),
+        }
+    }
+    let mode = if allowed.is_empty() {
+        iroh::RelayMode::Disabled
+    } else {
+        iroh::RelayMode::custom(allowed)
+    };
+    Ok((mode, messages))
 }
 
 fn remove_service(identity_id: &str, service_id: u64) {

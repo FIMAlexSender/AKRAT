@@ -1,0 +1,14 @@
+enable_relay = true
+enable_quic_addr_discovery = true
+enable_metrics = false
+http_bind_addr = "[::]:80"
+access = "everyone"
+
+[tls]
+https_bind_addr = "[::]:443"
+quic_bind_addr = "[::]:7842"
+hostname = ["relay.example.org"]
+cert_mode = "LetsEncrypt"
+cert_dir = "./certs"
+contact = "admin@example.org"
+prod_tls = true

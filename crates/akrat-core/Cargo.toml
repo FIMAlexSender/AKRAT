@@ -5,17 +5,23 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["media-image", "markdown"]
+media-image = ["dep:image"]
+markdown = ["dep:pulldown-cmark"]
+
 [dependencies]
+akrat-trust = { version = "=0.1.12", path = "../akrat-trust" }
 aes-gcm.workspace = true
 argon2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 fs2.workspace = true
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 iroh.workspace = true
-libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
-pulldown-cmark = "0.13.4"
+libsignal-protocol = { version = "=0.1.0", git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
+pulldown-cmark = { version = "0.13.4", optional = true }
 rand = "0.9"
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +32,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+iroh = { version = "1.4.1", features = ["test-utils"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

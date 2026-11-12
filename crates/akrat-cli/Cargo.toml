@@ -6,7 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-core = { path = "../akrat-core" }
+akrat-trust = { version = "=0.1.12", path = "../akrat-trust", features = ["client"] }
+akrat-core = { version = "=0.1.12", path = "../akrat-core" }
 clap.workspace = true
 directories.workspace = true
 getrandom.workspace = true

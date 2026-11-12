@@ -1,0 +1,27 @@
+[Unit]
+Description=AKRAT Mailbox and Iroh relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=akrat
+Group=akrat
+StateDirectory=akrat
+WorkingDirectory=/opt/akrat
+Environment=AKRAT_RELAY_URL=https://relay.example.org
+Environment=AKRAT_MAILBOX_CONFIG=/etc/akrat/akrat-mailbox.toml
+Environment=AKRAT_RELAY_CONFIG=/etc/akrat/iroh-relay.toml
+Environment=AKRAT_RELAY_IDENTITY_KEY=/var/lib/akrat/relay-identity.key
+ExecStart=/opt/akrat/akrat-node.sh both
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/akrat
+
+[Install]
+WantedBy=multi-user.target
