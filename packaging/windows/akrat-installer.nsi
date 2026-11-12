@@ -51,6 +51,7 @@ Section "AKRAT" SEC_AKRAT
   SetOutPath "$INSTDIR"
   File "..\..\target\release\akrat-desktop.exe"
   File "..\..\target\release\akrat.exe"
+  File "..\..\target\release\akrat-mailbox.exe"
   File "akrat.ico"
 
   CreateDirectory "$SMPROGRAMS\AKRAT"

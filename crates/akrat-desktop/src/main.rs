@@ -1,11 +1,13 @@
 #![cfg_attr(all(windows, not(feature = "mobile")), windows_subsystem = "windows")]
 
+mod async_mailbox;
 mod runtime;
 mod updater;
 mod vault_catalog;
 
 use akrat_core::{
-    Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData, load_vault, save_vault,
+    Contact, DeliveryActor, DeliveryEventKind, DeliveryState, Identity, Invitation, MailboxInbox,
+    MailboxRoute, StoredMessage, VaultData, load_vault, save_vault,
 };
 use dioxus::prelude::*;
 #[cfg(not(target_os = "android"))]
@@ -196,6 +198,83 @@ fn App() -> Element {
         }
     });
 
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let (path_value, phrase, inboxes, queued_mailbox_messages, pending_receipts) = {
+                let snapshot = vault.read();
+                let Some(data) = snapshot.as_ref() else {
+                    continue;
+                };
+                (
+                    path.read().clone(),
+                    passphrase.read().clone(),
+                    data.mailbox_inboxes.clone(),
+                    data.messages
+                        .iter()
+                        .filter(|message| {
+                            message.outgoing
+                                && matches!(
+                                    message.delivery,
+                                    DeliveryState::Queued | DeliveryState::MailboxStored
+                                )
+                                && message.conversation.split_once(':').is_some_and(
+                                    |(_, fingerprint)| {
+                                        data.contacts.iter().any(|contact| {
+                                            contact.manually_verified
+                                                && contact.fingerprint == fingerprint
+                                                && contact.mailbox_route.is_some()
+                                        })
+                                    },
+                                )
+                        })
+                        .map(|message| (message.conversation.clone(), message.id.clone()))
+                        .collect::<Vec<_>>(),
+                    data.messages
+                        .iter()
+                        .filter(|message| {
+                            message.outgoing && message.delivery == DeliveryState::MailboxStored
+                        })
+                        .map(|message| (message.conversation.clone(), message.id.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let mut changed = false;
+            for inbox in inboxes {
+                if matches!(async_mailbox::poll_inbox(path_value.clone(), phrase.clone(), inbox).await, Ok(count) if count > 0)
+                {
+                    changed = true;
+                }
+            }
+            for (conversation, message_id) in queued_mailbox_messages {
+                if async_mailbox::send(path_value.clone(), phrase.clone(), conversation, message_id)
+                    .await
+                    .is_ok()
+                {
+                    changed = true;
+                }
+            }
+            for (conversation, message_id) in pending_receipts {
+                if matches!(
+                    async_mailbox::poll_delivery_receipt(
+                        path_value.clone(),
+                        phrase.clone(),
+                        conversation,
+                        message_id
+                    )
+                    .await,
+                    Ok(async_mailbox::DeliveryPoll::Delivered
+                        | async_mailbox::DeliveryPoll::Expired,)
+                ) {
+                    changed = true;
+                }
+            }
+            if changed && let Ok(data) = load_vault(&path_value, &phrase) {
+                vault.set(Some(data));
+            }
+        }
+    });
+
     use_future(move || {
         let receiver = receiver.clone();
         async move {
@@ -219,25 +298,25 @@ fn App() -> Element {
                         push_trace(&mut trace, format!("Conversation active · {peer_name}"));
                         let phrase = passphrase.read().clone();
                         let vault_path = path.read().clone();
-                        if let Ok(data) = load_vault(&vault_path, &phrase) {
-                            if let Some(conversation) = active_conversation.read().as_ref() {
-                                for message in data.messages.iter().filter(|message| {
-                                    message.conversation == *conversation
-                                        && message.outgoing
-                                        && message.delivery.needs_delivery()
-                                }) {
-                                    if handle
-                                        .send_text(message.id.clone(), message.text.clone())
-                                        .is_ok()
-                                    {
-                                        push_trace(
-                                            &mut trace,
-                                            format!(
-                                                "Reprise d’un message · {}",
-                                                &message.id[..8.min(message.id.len())]
-                                            ),
-                                        );
-                                    }
+                        if let Ok(data) = load_vault(&vault_path, &phrase)
+                            && let Some(conversation) = active_conversation.read().as_ref()
+                        {
+                            for message in data.messages.iter().filter(|message| {
+                                message.conversation == *conversation
+                                    && message.outgoing
+                                    && message.delivery.needs_delivery()
+                            }) {
+                                if handle
+                                    .send_text(message.id.clone(), message.text.clone())
+                                    .is_ok()
+                                {
+                                    push_trace(
+                                        &mut trace,
+                                        format!(
+                                            "Reprise d’un message · {}",
+                                            &message.id[..8.min(message.id.len())]
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -323,6 +402,31 @@ fn App() -> Element {
                             ),
                         );
                     }
+                    UiEvent::MailboxResult {
+                        conversation,
+                        id,
+                        result,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        if let Ok(data) = load_vault(&vault_path, &phrase) {
+                            vault.set(Some(data));
+                        }
+                        match result {
+                            Ok(()) => push_trace(
+                                &mut trace,
+                                format!(
+                                    "Message chiffré et stocké dans la boîte · {}",
+                                    &id[..8.min(id.len())]
+                                ),
+                            ),
+                            Err(error) => push_trace(
+                                &mut trace,
+                                format!("Envoi différé en attente · {error}"),
+                            ),
+                        }
+                        let _ = conversation;
+                    }
                     UiEvent::Closed {
                         conversation,
                         reason,
@@ -331,6 +435,16 @@ fn App() -> Element {
                         let phrase = passphrase.read().clone();
                         let vault_path = path.read().clone();
                         if let Ok(mut data) = load_vault(&vault_path, &phrase) {
+                            let pending = data
+                                .messages
+                                .iter()
+                                .filter(|message| {
+                                    message.conversation == conversation
+                                        && message.outgoing
+                                        && message.delivery.needs_delivery()
+                                })
+                                .map(|message| message.id.clone())
+                                .collect::<Vec<_>>();
                             for message in &mut data.messages {
                                 if message.conversation == conversation
                                     && message.outgoing
@@ -341,6 +455,15 @@ fn App() -> Element {
                             }
                             if save_vault(&vault_path, &mut data, &phrase).is_ok() {
                                 vault.set(Some(data));
+                                for id in pending {
+                                    start_async_mailbox_fallback(
+                                        conversation.clone(),
+                                        id,
+                                        vault_path.clone(),
+                                        phrase.clone(),
+                                        event_sender,
+                                    );
+                                }
                             }
                         }
                         push_trace(&mut trace, format!("Session fermée · {reason}"));
@@ -426,7 +549,7 @@ fn App() -> Element {
                     main { class: "content",
                         match page() {
                             Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace, event_sender, on_setup: move |_| page.set(if identities == 0 { Page::Identities } else { Page::Contacts }) } },
-                            Page::Network => rsx! { NetworkPage { vault, listen_stops } },
+                            Page::Network => rsx! { NetworkPage { vault, listen_stops, path: path_value.clone(), passphrase, notice } },
                             Page::Contacts => rsx! { ContactsPage { vault, passphrase, path: path_value.clone(), import_uri, contact_name, notice } },
                             Page::Identities => rsx! { IdentitiesPage { vault, passphrase, path: path_value, identity_name, invitation_result, notice } },
                             Page::Settings => rsx! { SettingsPage { path: path_value, notice, update_status,
@@ -933,7 +1056,7 @@ fn ContactsPage(
                                 contact.manually_verified = false;
                                 true
                             } else {
-                                data.contacts.push(Contact { fingerprint: invitation.fingerprint, name, public_key: invitation.public_key, transport_id: invitation.transport_id, legacy_address: String::new(), manually_verified: false });
+                                data.contacts.push(Contact { fingerprint: invitation.fingerprint, name, public_key: invitation.public_key, transport_id: invitation.transport_id, legacy_address: String::new(), manually_verified: false, mailbox_route: None, mailbox_replicas: Vec::new() });
                                 false
                             };
                             match save_vault(&import_path, &mut data, &phrase) {
@@ -964,18 +1087,153 @@ fn ContactRow(
 ) -> Element {
     let verified = contact.manually_verified;
     let fp = contact.fingerprint.clone();
+    let verify_path = path.clone();
     let transport_id = contact.transport_id.clone();
-    rsx! { div { class: "contact-row", div { class: "record-icon", "⌁" } div { class: "record-main", strong { "{contact.name}" } span { class: "fingerprint", "{contact.fingerprint}" } span { class: "quiet", if transport_id.is_empty() { "Ancienne invitation · à réimporter" } else { "Identité réseau stable · itinérance" } } } if verified { span { class: "verified", "VÉRIFIÉ" } } else { button { class: "secondary compact", onclick: move |_| {
-        let phrase = passphrase.read().clone(); let mut d = match load_vault(&path, &phrase) { Ok(d) => d, Err(e) => { notice.set(format!("Coffre inaccessible : {e}")); return; } };
+    let mut endpoint = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| r.endpoint.clone())
+            .unwrap_or_default()
+    });
+    let mut noise_key = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| hex::encode(&r.server_noise_public_key))
+            .unwrap_or_default()
+    });
+    let mut signing_key = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| hex::encode(&r.server_signing_public_key))
+            .unwrap_or_default()
+    });
+    let mut mailbox_id = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| r.mailbox_id.clone())
+            .unwrap_or_default()
+    });
+    let mut write_capability = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| r.write_capability.clone())
+            .unwrap_or_default()
+    });
+    let mut bundle_capability = use_signal(|| {
+        contact
+            .mailbox_route
+            .as_ref()
+            .map(|r| r.bundle_capability.clone())
+            .unwrap_or_default()
+    });
+    let mut replica_endpoint = use_signal(String::new);
+    let mut replica_noise_key = use_signal(String::new);
+    let mut replica_signing_key = use_signal(String::new);
+    let mut replica_mailbox_id = use_signal(String::new);
+    let mut replica_write_capability = use_signal(String::new);
+    let mut replica_bundle_capability = use_signal(String::new);
+    let route_fp = fp.clone();
+    let replicas_fp = fp.clone();
+    let replicas_path = path.clone();
+    rsx! { section { class: "contact-record",
+        div { class: "contact-row", div { class: "record-icon", "⌁" } div { class: "record-main", strong { "{contact.name}" } span { class: "fingerprint", "{contact.fingerprint}" } span { class: "quiet", if transport_id.is_empty() { "Ancienne invitation · à réimporter" } else { "Identité réseau stable · itinérance" } } } if verified { span { class: "verified", "VÉRIFIÉ" } } else { button { class: "secondary compact", onclick: move |_| {
+        let phrase = passphrase.read().clone(); let mut d = match load_vault(&verify_path, &phrase) { Ok(d) => d, Err(e) => { notice.set(format!("Coffre inaccessible : {e}")); return; } };
         if let Some(item) = d.contacts.iter_mut().find(|c| c.fingerprint == fp) { item.manually_verified = true; }
-        match save_vault(&path, &mut d, &phrase) { Ok(()) => { vault.set(Some(d)); notice.set("Contact marqué comme vérifié. Confirmez son empreinte avec lui en personne ou par un canal sûr.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
-    }, "Empreinte comparée hors AKRAT" } } } }
+        match save_vault(&verify_path, &mut d, &phrase) { Ok(()) => { vault.set(Some(d)); notice.set("Contact marqué comme vérifié. Confirmez son empreinte avec lui en personne ou par un canal sûr.".into()); }, Err(e) => notice.set(format!("Enregistrement impossible : {e}")) }
+    }, "Empreinte comparée hors AKRAT" } } }
+        if verified {
+            div { class: "mailbox-route-form",
+                strong { "Boîte différée de ce contact" }
+                p { class: "quiet", "Ces informations sont fournies par le contact. L’empreinte Noise du serveur doit être vérifiée par un canal sûr." }
+                label { "Serveur · hôte:port" input { value: "{endpoint}", placeholder: "mail.example.net:47475", oninput: move |e| endpoint.set(e.value()) } }
+                label { "Clé publique Noise du serveur · hex" input { value: "{noise_key}", placeholder: "64 caractères hexadécimaux", oninput: move |e| noise_key.set(e.value()) } }
+                label { "Clé de signature du serveur · hex" input { value: "{signing_key}", placeholder: "64 caractères hexadécimaux", oninput: move |e| signing_key.set(e.value()) } }
+                label { "Identifiant de boîte" input { value: "{mailbox_id}", oninput: move |e| mailbox_id.set(e.value()) } }
+                label { "Capacité de dépôt" input { r#type: "password", value: "{write_capability}", oninput: move |e| write_capability.set(e.value()) } }
+                label { "Capacité de lecture des préclés" input { r#type: "password", value: "{bundle_capability}", oninput: move |e| bundle_capability.set(e.value()) } }
+                button { class: "secondary compact", onclick: move |_| {
+                    let phrase = passphrase.read().clone();
+                    let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                    let endpoint_value = endpoint.read().trim().to_string();
+                    let key = match hex::decode(noise_key.read().trim()) { Ok(key) if key.len() == 32 => key, _ => { notice.set("La clé Noise doit contenir 32 octets en hexadécimal.".into()); return; } };
+                    let signing = match hex::decode(signing_key.read().trim()) { Ok(key) if key.len() == 32 => key, _ => { notice.set("La clé de signature doit contenir 32 octets en hexadécimal.".into()); return; } };
+                    let mailbox_value = mailbox_id.read().trim().to_string();
+                    let write_value = write_capability.read().trim().to_string();
+                    let bundle_value = bundle_capability.read().trim().to_string();
+                    if endpoint_value.is_empty() || mailbox_value.is_empty() || write_value.is_empty() || bundle_value.is_empty() { notice.set("Complétez les paramètres de la boîte.".into()); return; }
+                    if let Some(item) = data.contacts.iter_mut().find(|item| item.fingerprint == route_fp) {
+                        item.mailbox_route = Some(MailboxRoute { endpoint: endpoint_value, server_noise_public_key: key, server_signing_public_key: signing, server_key_generation: 0, server_revocation_sequence: 0, mailbox_id: mailbox_value, write_capability: write_value, bundle_capability: bundle_value });
+                    }
+                    match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Boîte différée enregistrée dans le coffre chiffré.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                }, "Enregistrer la boîte" }
+                div { class: "mailbox-replicas",
+                    strong { "Copies autorisées · {contact.mailbox_replicas.len()}/{akrat_core::MAX_MAILBOX_REPLICAS}" }
+                    p { class: "quiet", "AKRAT dépose le même ciphertext sur chaque boîte choisie. La boîte personnelle correspondante doit aussi être enregistrée dans Réseau sur l’appareil du contact." }
+                    for route in contact.mailbox_replicas.iter() {
+                        div { class: "mailbox-replica-row",
+                            span { "{route.endpoint} · boîte {route.mailbox_id}" }
+                            button { class: "secondary compact", onclick: {
+                                let endpoint = route.endpoint.clone();
+                                let mailbox = route.mailbox_id.clone();
+                                let fingerprint = replicas_fp.clone();
+                                let route_path = replicas_path.clone();
+                                move |_| {
+                                    let phrase = passphrase.read().clone();
+                                    let mut data = match load_vault(&route_path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                                    if let Some(item) = data.contacts.iter_mut().find(|item| item.fingerprint == fingerprint) {
+                                        item.mailbox_replicas.retain(|route| route.endpoint != endpoint || route.mailbox_id != mailbox);
+                                    }
+                                    match save_vault(&route_path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Copie de boîte retirée de cette route.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                                }
+                            }, "Retirer" }
+                        }
+                    }
+                    if contact.mailbox_replicas.len() < akrat_core::MAX_MAILBOX_REPLICAS {
+                        label { "Serveur de copie · hôte:port" input { value: "{replica_endpoint}", placeholder: "mail.example.net:47475", oninput: move |e| replica_endpoint.set(e.value()) } }
+                        label { "Clé publique Noise · hex" input { value: "{replica_noise_key}", oninput: move |e| replica_noise_key.set(e.value()) } }
+                        label { "Clé de signature · hex" input { value: "{replica_signing_key}", oninput: move |e| replica_signing_key.set(e.value()) } }
+                        label { "Identifiant de boîte" input { value: "{replica_mailbox_id}", oninput: move |e| replica_mailbox_id.set(e.value()) } }
+                        label { "Capacité de dépôt" input { r#type: "password", value: "{replica_write_capability}", oninput: move |e| replica_write_capability.set(e.value()) } }
+                        label { "Capacité de lecture des préclés" input { r#type: "password", value: "{replica_bundle_capability}", oninput: move |e| replica_bundle_capability.set(e.value()) } }
+                        button { class: "secondary compact", onclick: {
+                            let route_path = replicas_path.clone();
+                            let fingerprint = replicas_fp.clone();
+                            move |_| {
+                            let phrase = passphrase.read().clone();
+                            let mut data = match load_vault(&route_path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                            let endpoint_value = replica_endpoint.read().trim().to_string();
+                            let noise = match hex::decode(replica_noise_key.read().trim()) { Ok(key) if key.len() == 32 => key, _ => { notice.set("La clé Noise de la copie doit contenir 32 octets en hexadécimal.".into()); return; } };
+                            let signing = match hex::decode(replica_signing_key.read().trim()) { Ok(key) if key.len() == 32 => key, _ => { notice.set("La clé de signature de la copie doit contenir 32 octets en hexadécimal.".into()); return; } };
+                            let mailbox = replica_mailbox_id.read().trim().to_string();
+                            let write = replica_write_capability.read().trim().to_string();
+                            let bundle = replica_bundle_capability.read().trim().to_string();
+                            if endpoint_value.is_empty() || mailbox.is_empty() || write.is_empty() || bundle.is_empty() { notice.set("Complétez les paramètres de la Mailbox de copie.".into()); return; }
+                            let Some(item) = data.contacts.iter_mut().find(|item| item.fingerprint == fingerprint) else { notice.set("Contact introuvable.".into()); return; };
+                            if item.mailbox_route.as_ref().is_some_and(|route| route.endpoint == endpoint_value && route.mailbox_id == mailbox)
+                                || item.mailbox_replicas.iter().any(|route| route.endpoint == endpoint_value && route.mailbox_id == mailbox)
+                            { notice.set("Cette boîte figure déjà dans les routes de copie.".into()); return; }
+                            item.mailbox_replicas.push(MailboxRoute { endpoint: endpoint_value, server_noise_public_key: noise, server_signing_public_key: signing, server_key_generation: 0, server_revocation_sequence: 0, mailbox_id: mailbox, write_capability: write, bundle_capability: bundle });
+                            match save_vault(&route_path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); replica_endpoint.set(String::new()); replica_noise_key.set(String::new()); replica_signing_key.set(String::new()); replica_mailbox_id.set(String::new()); replica_write_capability.set(String::new()); replica_bundle_capability.set(String::new()); notice.set("Boîte de copie ajoutée aux destinations autorisées.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                        } }, "Ajouter une copie" }
+                    }
+                }
+            }
+        }
+    } }
 }
 
 #[component]
 fn NetworkPage(
     vault: Signal<Option<VaultData>>,
     listen_stops: Signal<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    notice: Signal<String>,
 ) -> Element {
     let identities = vault
         .read()
@@ -988,6 +1246,20 @@ fn NetworkPage(
         })
         .unwrap_or_default();
     let online_ids = listen_stops.read().keys().cloned().collect::<Vec<_>>();
+    let mut selected_identity = use_signal(|| {
+        identities
+            .first()
+            .map(|item| item.0.clone())
+            .unwrap_or_default()
+    });
+    let mut endpoint = use_signal(String::new);
+    let mut noise_key = use_signal(String::new);
+    let mut signing_key = use_signal(String::new);
+    let mut mailbox_id = use_signal(String::new);
+    let mut write_capability = use_signal(String::new);
+    let mut read_capability = use_signal(String::new);
+    let mut bundle_capability = use_signal(String::new);
+    let inbox_path = path.clone();
     rsx! {
         section { class: "page-scroll",
             div { class: "eyebrow", "RÉSEAU PAIR À PAIR" }
@@ -1004,6 +1276,40 @@ fn NetworkPage(
                             div { class: "record-main", strong { "{name}" } span { class: "quiet", if online_ids.contains(id) { "Service démarré · relais dans le journal" } else { "Démarrage du service réseau…" } } }
                         }
                     }
+                }
+            }
+            section { class: "panel mailbox-inbox-form",
+                div { class: "panel-title", "Boîte personnelle · messages différés" }
+                p { class: "quiet", "Quand le coffre est déverrouillé, AKRAT publie automatiquement vos préclés et relève cette boîte toutes les 15 secondes." }
+                if !identities.is_empty() {
+                    label { "Identité concernée" select { value: "{selected_identity}", onchange: move |e| selected_identity.set(e.value()), for (id, name) in identities.iter() { option { value: "{id}", "{name}" } } } }
+                    label { "Serveur · hôte:port" input { value: "{endpoint}", placeholder: "mail.example.net:47475", oninput: move |e| endpoint.set(e.value()) } }
+                    label { "Clé publique Noise du serveur · hex" input { value: "{noise_key}", oninput: move |e| noise_key.set(e.value()) } }
+                    label { "Clé de signature du serveur · hex" input { value: "{signing_key}", oninput: move |e| signing_key.set(e.value()) } }
+                    label { "Identifiant de boîte" input { value: "{mailbox_id}", oninput: move |e| mailbox_id.set(e.value()) } }
+                    label { "Capacité de dépôt · publication des préclés" input { r#type: "password", value: "{write_capability}", oninput: move |e| write_capability.set(e.value()) } }
+                    label { "Capacité de récupération" input { r#type: "password", value: "{read_capability}", oninput: move |e| read_capability.set(e.value()) } }
+                    label { "Capacité de lecture des préclés" input { r#type: "password", value: "{bundle_capability}", oninput: move |e| bundle_capability.set(e.value()) } }
+                    button { class: "primary", onclick: move |_| {
+                        let phrase = passphrase.read().clone();
+                        let mut data = match load_vault(&inbox_path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                        let endpoint_value = endpoint.read().trim().to_string();
+                        let decode_key = |value: String| -> Result<Vec<u8>, ()> { match hex::decode(value.trim()) { Ok(key) if key.len() == 32 => Ok(key), _ => Err(()) } };
+                        let noise = match decode_key(noise_key.read().clone()) { Ok(key) => key, Err(()) => { notice.set("La clé Noise doit contenir 32 octets en hexadécimal.".into()); return; } };
+                        let signing = match decode_key(signing_key.read().clone()) { Ok(key) => key, Err(()) => { notice.set("La clé de signature doit contenir 32 octets en hexadécimal.".into()); return; } };
+                        let mailbox_value = mailbox_id.read().trim().to_string();
+                        let write_value = write_capability.read().trim().to_string();
+                        let read_value = read_capability.read().trim().to_string();
+                        let bundle_value = bundle_capability.read().trim().to_string();
+                        if endpoint_value.is_empty() || mailbox_value.is_empty() || write_value.is_empty() || read_value.is_empty() || bundle_value.is_empty() { notice.set("Complétez tous les paramètres de la boîte.".into()); return; }
+                        let identity_id = selected_identity.read().clone();
+                        data.mailbox_inboxes.retain(|item| item.identity_id != identity_id || item.endpoint != endpoint_value || item.mailbox_id != mailbox_value);
+                        data.mailbox_inboxes.push(MailboxInbox { identity_id, endpoint: endpoint_value, server_noise_public_key: noise, server_signing_public_key: signing, server_key_generation: 0, server_revocation_sequence: 0, mailbox_id: mailbox_value, write_capability: write_value, read_capability: read_value, bundle_capability: bundle_value });
+                        match save_vault(&inbox_path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Boîte personnelle enregistrée dans le coffre chiffré.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                    }, "Enregistrer la boîte personnelle" }
+                }
+                if let Some(inboxes) = vault.read().as_ref().map(|data| data.mailbox_inboxes.clone()) {
+                    for inbox in inboxes { div { class: "mailbox-route-summary", "{inbox.endpoint} · boîte {inbox.mailbox_id} · relève automatique active quand le coffre est ouvert" } }
                 }
             }
             div { class: "callout", strong { "Comment AKRAT vous trouve" } p { "L’application annonce votre identifiant réseau stable au service de découverte, tente une liaison directe puis utilise un relais chiffré si nécessaire. Les deux appareils doivent être allumés, connectés à Internet et avoir AKRAT ouvert." } }
@@ -1178,7 +1484,19 @@ fn ChatPage(
                     }
                     div { class: "message-list", id: "message-list",
                         if messages.is_empty() { div { class: "chat-empty", "Conversation prête · envoyez le premier message." } }
-                        for message in messages { MessageCard { message } }
+                        for message in messages {
+                            MessageCard {
+                                message,
+                                draft,
+                                path: path.clone(),
+                                passphrase,
+                                vault,
+                                sessions,
+                                notice,
+                                trace,
+                                event_sender,
+                            }
+                        }
                     }
                     div { class: "composer",
                         textarea {
@@ -1206,16 +1524,28 @@ fn ChatPage(
 }
 
 #[component]
-fn MessageCard(message: StoredMessage) -> Element {
+fn MessageCard(
+    message: StoredMessage,
+    mut draft: Signal<String>,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    mut notice: Signal<String>,
+    mut trace: Signal<Vec<String>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) -> Element {
     let short_id = message.id.chars().take(8).collect::<String>();
     let outgoing = message.outgoing;
     let status = match message.delivery {
         DeliveryState::Pending => "EN ATTENTE",
         DeliveryState::Queued => "DANS LA FILE",
         DeliveryState::Sent => "TRANSMIS · ACCUSÉ EN ATTENTE",
+        DeliveryState::MailboxStored => "STOCKÉ EN BOÎTE · EN ATTENTE DU DESTINATAIRE",
         DeliveryState::Received => "REÇU",
         DeliveryState::Acknowledged => "REMIS",
         DeliveryState::Unconfirmed => "NON CONFIRMÉ",
+        DeliveryState::Expired => "EXPIRÉ · RENVOI DISPONIBLE",
     };
     let steps = match message.delivery {
         DeliveryState::Pending => vec![
@@ -1230,6 +1560,11 @@ fn MessageCard(message: StoredMessage) -> Element {
             "Enregistré dans le coffre local",
             "Chiffré et transmis",
             "Accusé authentifié en attente",
+        ],
+        DeliveryState::MailboxStored => vec![
+            "Chiffré de bout en bout avec PQXDH / Double Ratchet",
+            "Dépôt confirmé par une boîte aux lettres",
+            "En attente de récupération par le destinataire",
         ],
         DeliveryState::Received => vec![
             "Reçu sur le canal chiffré",
@@ -1246,14 +1581,63 @@ fn MessageCard(message: StoredMessage) -> Element {
             "Enregistré dans le coffre local",
             "État de transmission incertain",
         ],
+        DeliveryState::Expired => vec![
+            "La boîte a signé l'expiration du ciphertext",
+            "Le destinataire n'a pas confirmé la livraison",
+            "Un renvoi peut être déclenché depuis le message",
+        ],
     };
     rsx! {
         div { class: if outgoing { "message outgoing" } else { "message incoming" },
             p { "{message.text}" }
             div { class: "message-meta", span { class: "message-time", "{format_timestamp(message.timestamp)}" } span { class: "message-status", "{status}" } }
+            if outgoing && message.delivery == DeliveryState::Expired {
+                button { class: "secondary compact", onclick: move |_| {
+                    draft.set(message.text.clone());
+                    submit_message(
+                        message.conversation.clone(),
+                        draft,
+                        path.clone(),
+                        passphrase,
+                        vault,
+                        sessions,
+                        notice,
+                        trace,
+                        event_sender,
+                    );
+                }, "Renvoyer" }
+            }
             details { class: "message-details",
                 summary { "Détails techniques · {short_id}" }
                 div { class: "message-steps", for (index, step) in steps.iter().enumerate() { div { class: "message-step", span { "0{index}" } "{step}" } } }
+                h4 { class: "delivery-timeline-title", "Parcours du message" }
+                if message.delivery_events.is_empty() {
+                    p { class: "quiet delivery-timeline-empty", "Aucun événement de livraison conservé pour cet ancien message." }
+                } else {
+                    div { class: "delivery-timeline",
+                        for event in message.delivery_events.iter() {
+                            div { class: "delivery-event",
+                                span { class: if event.verified { "delivery-event-mark verified" } else { "delivery-event-mark" }, if event.verified { "✓" } else { "·" } }
+                                div { class: "delivery-event-body",
+                                    strong { "{delivery_event_label(event.kind)}" }
+                                    span { class: "delivery-event-meta", "{delivery_actor_label(event.actor, event.actor_name.as_deref())} · {format_timestamp(event.timestamp)}" }
+                                    if let Some(fingerprint) = event.actor_fingerprint.as_deref() {
+                                        span { class: "delivery-event-proof", "Empreinte · {fingerprint}" }
+                                    }
+                                    if let Some(receipt) = event.receipt_sha256.as_deref() {
+                                        details { class: "delivery-event-receipt",
+                                            summary { if event.verified { "Reçu vérifié" } else { "Détails du reçu" } }
+                                            code { "SHA-256 · {receipt}" }
+                                            if let Some(bytes) = event.receipt_bytes.as_deref() {
+                                                code { "{format_receipt(bytes)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1269,6 +1653,35 @@ fn format_timestamp(timestamp: u64) -> String {
         .unwrap_or_else(|| "Heure inconnue".into())
 }
 
+fn delivery_event_label(kind: DeliveryEventKind) -> &'static str {
+    match kind {
+        DeliveryEventKind::SavedLocally => "Message enregistré localement",
+        DeliveryEventKind::Encrypted => "Message chiffré",
+        DeliveryEventKind::SentDirectly => "Message transmis directement",
+        DeliveryEventKind::Deposited => "Dépôt accepté par la Mailbox",
+        DeliveryEventKind::Retrieved => "Enveloppe récupérée",
+        DeliveryEventKind::AuthenticatedAndSaved => "Message authentifié et enregistré",
+        DeliveryEventKind::RecipientConfirmed => "Réception confirmée par le destinataire",
+        DeliveryEventKind::Expired => "Expiration attestée par la Mailbox",
+    }
+}
+
+fn delivery_actor_label(actor: DeliveryActor, name: Option<&str>) -> String {
+    match (actor, name) {
+        (DeliveryActor::SenderClient, Some(name)) => format!("{name} · expéditeur"),
+        (DeliveryActor::RecipientClient, Some(name)) => format!("{name} · destinataire"),
+        (DeliveryActor::Mailbox, Some(name)) => name.to_owned(),
+        (DeliveryActor::SenderClient, None) => "Client expéditeur".into(),
+        (DeliveryActor::RecipientClient, None) => "Client destinataire".into(),
+        (DeliveryActor::Mailbox, None) => "Mailbox".into(),
+    }
+}
+
+fn format_receipt(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn submit_message(
     conversation: String,
     mut draft: Signal<String>,
@@ -1340,6 +1753,7 @@ fn submit_message(
                 "Message conservé · reconnexion P2P automatique lancée".into(),
             );
             start_retry_for_conversation(&conversation, vault, event_sender);
+            start_async_mailbox_fallback(conversation, id, path, phrase, event_sender);
         }
         None => {
             update_message_status(
@@ -1356,8 +1770,27 @@ fn submit_message(
                 "Message conservé · reconnexion P2P automatique lancée".into(),
             );
             start_retry_for_conversation(&conversation, vault, event_sender);
+            start_async_mailbox_fallback(conversation, id, path, phrase, event_sender);
         }
     }
+}
+
+fn start_async_mailbox_fallback(
+    conversation: String,
+    id: String,
+    path: PathBuf,
+    passphrase: String,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) {
+    let sender = event_sender.read().clone();
+    spawn(async move {
+        let result = async_mailbox::send(path, passphrase, conversation.clone(), id.clone()).await;
+        let _ = sender.send(UiEvent::MailboxResult {
+            conversation,
+            id,
+            result,
+        });
+    });
 }
 
 fn start_retry_for_conversation(
@@ -1405,6 +1838,26 @@ fn update_delivery(data: &mut VaultData, conversation: &str, id: &str, state: De
         .find(|m| m.conversation == conversation && m.id == id && m.outgoing)
     {
         message.delivery = state;
+        if state == DeliveryState::Sent
+            && !message
+                .delivery_events
+                .iter()
+                .any(|event| event.kind == DeliveryEventKind::SentDirectly)
+        {
+            message.record_delivery_event(akrat_core::DeliveryEvent {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default(),
+                kind: DeliveryEventKind::SentDirectly,
+                actor: DeliveryActor::SenderClient,
+                actor_fingerprint: None,
+                actor_name: None,
+                receipt_sha256: None,
+                receipt_bytes: None,
+                verified: false,
+            });
+        }
     }
 }
 

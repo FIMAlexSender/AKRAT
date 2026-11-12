@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 akrat-core = { path = "../akrat-core" }
+akrat-mailbox = { path = "../akrat-mailbox" }
+base64.workspace = true
 dioxus = { workspace = true }
 dioxus-desktop = { workspace = true, optional = true }
 directories.workspace = true
@@ -24,6 +26,10 @@ tokio.workspace = true
 zeroize.workspace = true
 zip = { workspace = true, optional = true }
 self-replace = { version = "1.5.1", optional = true }
+
+[dev-dependencies]
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+tempfile = "3"
 
 [features]
 default = ["desktop"]

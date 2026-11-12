@@ -1,0 +1,26 @@
+[package]
+name = "akrat-mailbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+akrat-core = { path = "../akrat-core" }
+base64.workspace = true
+clap.workspace = true
+directories.workspace = true
+ed25519-dalek = { version = "2.2.0", features = ["rand_core", "serde"] }
+getrandom.workspace = true
+hex.workspace = true
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle = "2.6.1"
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

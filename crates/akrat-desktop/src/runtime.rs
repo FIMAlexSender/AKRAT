@@ -10,13 +10,14 @@ use tokio::sync::{Mutex, mpsc, watch};
 use zeroize::Zeroize;
 
 const IROH_ALPN: &[u8] = b"akrat-chat/0.1";
-static SERVICES: OnceLock<StdMutex<HashMap<String, (u64, mpsc::UnboundedSender<ServiceCommand>)>>> =
-    OnceLock::new();
+type ServiceEntry = (u64, mpsc::UnboundedSender<ServiceCommand>);
+type ServiceRegistry = StdMutex<HashMap<String, ServiceEntry>>;
+static SERVICES: OnceLock<ServiceRegistry> = OnceLock::new();
 static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIAL_ID: AtomicU64 = AtomicU64::new(1);
 
 enum ServiceCommand {
-    Dial(Contact, mpsc::UnboundedSender<UiEvent>),
+    Dial(Box<Contact>, mpsc::UnboundedSender<UiEvent>),
     CancelDial(String),
     DialFinished(String, u64),
     UpdateContacts(Vec<Contact>),
@@ -73,6 +74,11 @@ pub enum UiEvent {
         conversation: String,
         id: String,
     },
+    MailboxResult {
+        conversation: String,
+        id: String,
+        result: Result<(), String>,
+    },
     Closed {
         conversation: String,
         reason: String,
@@ -98,7 +104,7 @@ pub fn connect(identity: Identity, contact: Contact, events: mpsc::UnboundedSend
         .and_then(|services| services.get(&identity.id).map(|(_, sender)| sender.clone()));
     match sender.and_then(|sender| {
         sender
-            .send(ServiceCommand::Dial(contact, events.clone()))
+            .send(ServiceCommand::Dial(Box::new(contact), events.clone()))
             .ok()
     }) {
         Some(()) => {}
@@ -141,12 +147,11 @@ pub fn listen(
     let (commands, mut command_rx) = mpsc::unbounded_channel();
     let service_id = NEXT_SERVICE_ID.fetch_add(1, Ordering::Relaxed);
     let registry = SERVICES.get_or_init(|| StdMutex::new(HashMap::new()));
-    if let Ok(mut services) = registry.lock() {
-        if let Some((_, previous)) =
+    if let Ok(mut services) = registry.lock()
+        && let Some((_, previous)) =
             services.insert(identity.id.clone(), (service_id, commands.clone()))
-        {
-            let _ = previous.send(ServiceCommand::Stop);
-        }
+    {
+        let _ = previous.send(ServiceCommand::Stop);
     }
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -206,7 +211,7 @@ pub fn listen(
                                 let active = active_conversations.clone();
                                 let finished = commands.clone();
                                 tokio::spawn(async move {
-                                    dial_contact(endpoint, identity, contact, command_events, active, stopped).await;
+                                    dial_contact(endpoint, identity, *contact, command_events, active, stopped).await;
                                     let _ = finished.send(ServiceCommand::DialFinished(peer_key, worker_id));
                                 });
                             }
@@ -274,15 +279,13 @@ pub fn listen(
 }
 
 fn remove_service(identity_id: &str, service_id: u64) {
-    if let Some(registry) = SERVICES.get() {
-        if let Ok(mut services) = registry.lock() {
-            if services
-                .get(identity_id)
-                .is_some_and(|(id, _)| *id == service_id)
-            {
-                services.remove(identity_id);
-            }
-        }
+    if let Some(registry) = SERVICES.get()
+        && let Ok(mut services) = registry.lock()
+        && services
+            .get(identity_id)
+            .is_some_and(|(id, _)| *id == service_id)
+    {
+        services.remove(identity_id);
     }
 }
 
@@ -640,6 +643,20 @@ pub fn new_message(conversation: String, id: String, text: String) -> StoredMess
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default(),
+        delivery_events: vec![akrat_core::DeliveryEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            kind: akrat_core::DeliveryEventKind::SavedLocally,
+            actor: akrat_core::DeliveryActor::SenderClient,
+            actor_fingerprint: None,
+            actor_name: None,
+            receipt_sha256: None,
+            receipt_bytes: None,
+            verified: false,
+        }],
+        received_ciphertext_sha256: None,
     }
 }
 
@@ -654,6 +671,20 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default(),
+        delivery_events: vec![akrat_core::DeliveryEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            kind: akrat_core::DeliveryEventKind::AuthenticatedAndSaved,
+            actor: akrat_core::DeliveryActor::RecipientClient,
+            actor_fingerprint: None,
+            actor_name: None,
+            receipt_sha256: None,
+            receipt_bytes: None,
+            verified: false,
+        }],
+        received_ciphertext_sha256: None,
     }
 }
 

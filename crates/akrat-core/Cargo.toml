@@ -12,6 +12,8 @@ base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 iroh.workspace = true
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
+rand = "0.9"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -1,6 +1,7 @@
 use akrat_core::network::{self, ChannelReceiver, ChannelSender, SecureChannel};
 use akrat_core::{
-    Contact, DeliveryState, Identity, Invitation, StoredMessage, VaultData, load_vault, save_vault,
+    Contact, DeliveryActor, DeliveryEvent, DeliveryEventKind, DeliveryState, Identity, Invitation,
+    StoredMessage, VaultData, load_vault, save_vault,
 };
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
@@ -157,6 +158,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     transport_id: invitation.transport_id,
                     legacy_address: String::new(),
                     manually_verified: false,
+                    mailbox_route: None,
+                    mailbox_replicas: Vec::new(),
                 });
                 false
             };
@@ -527,6 +530,17 @@ where
                     text: text.clone(),
                     delivery: DeliveryState::Pending,
                     timestamp: unix_time(),
+                    delivery_events: vec![DeliveryEvent {
+                        timestamp: unix_time(),
+                        kind: DeliveryEventKind::SavedLocally,
+                        actor: DeliveryActor::SenderClient,
+                        actor_fingerprint: None,
+                        actor_name: None,
+                        receipt_sha256: None,
+                        receipt_bytes: None,
+                        verified: false,
+                    }],
+                    received_ciphertext_sha256: None,
                 });
                 save_vault(path, data, passphrase)?;
                 println!("Message enregistré localement; chiffrement et envoi.");
@@ -577,6 +591,23 @@ fn update_delivery(
         message.conversation == conversation && message.id == id && message.outgoing
     }) {
         message.delivery = state;
+        if state == DeliveryState::Sent
+            && !message
+                .delivery_events
+                .iter()
+                .any(|event| event.kind == DeliveryEventKind::SentDirectly)
+        {
+            message.record_delivery_event(DeliveryEvent {
+                timestamp: unix_time(),
+                kind: DeliveryEventKind::SentDirectly,
+                actor: DeliveryActor::SenderClient,
+                actor_fingerprint: None,
+                actor_name: None,
+                receipt_sha256: None,
+                receipt_bytes: None,
+                verified: false,
+            });
+        }
         true
     } else {
         false
@@ -608,6 +639,17 @@ fn store_incoming(
         text: text.to_string(),
         delivery: DeliveryState::Received,
         timestamp: unix_time(),
+        delivery_events: vec![DeliveryEvent {
+            timestamp: unix_time(),
+            kind: DeliveryEventKind::AuthenticatedAndSaved,
+            actor: DeliveryActor::RecipientClient,
+            actor_fingerprint: None,
+            actor_name: None,
+            receipt_sha256: None,
+            receipt_bytes: None,
+            verified: true,
+        }],
+        received_ciphertext_sha256: None,
     });
     Ok(true)
 }
@@ -692,8 +734,14 @@ mod tests {
                 text: "hello".to_string(),
                 delivery: DeliveryState::Unconfirmed,
                 timestamp: 1,
+                delivery_events: Vec::new(),
+                received_ciphertext_sha256: None,
             }],
             conversation_keys: Vec::new(),
+            async_protocol_states: Vec::new(),
+            mailbox_inboxes: Vec::new(),
+            async_outbox: Vec::new(),
+            pending_recipient_receipts: Vec::new(),
         };
         assert!(!update_delivery(
             &mut data,

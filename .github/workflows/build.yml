@@ -2,7 +2,7 @@ name: Build AKRAT
 
 on:
   push:
-    branches: [main]
+    branches: [main, v0.1.9-mailbox-federation]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -17,42 +17,40 @@ concurrency:
 jobs:
   desktop:
     name: Desktop · ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: akrat-linux-local
             artifact: linux-x64
             app: target/release/akrat-desktop
             cli: target/release/akrat
-          - os: macos-15
-            artifact: macos-aarch64
-            app: target/release/akrat-desktop
-            cli: target/release/akrat
-          - os: macos-15-intel
-            artifact: macos-x64
-            app: target/release/akrat-desktop
-            cli: target/release/akrat
-    runs-on: ${{ matrix.os }}
+            mailbox: target/release/akrat-mailbox
+    runs-on: [self-hosted, Linux, X64, ${{ matrix.os }}]
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Linux desktop libraries
+      - name: Verify Linux runner prerequisites
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            build-essential curl file libayatana-appindicator3-dev \
-            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf
+          pkg-config --exists webkit2gtk-4.1 gtk+-3.0 openssl
+          protoc --version
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Test workspace and formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --workspace
+
       - name: Build desktop app and CLI
         run: |
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
+          cargo build --locked --release -p akrat-mailbox
 
       - uses: actions/upload-artifact@v4
         with:
@@ -60,6 +58,7 @@ jobs:
           path: |
             ${{ matrix.app }}
             ${{ matrix.cli }}
+            ${{ matrix.mailbox }}
           if-no-files-found: error
           retention-days: 14
 
@@ -70,6 +69,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install pinned protobuf compiler
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
+          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') { throw "protoc archive SHA-256 mismatch: $hash" }
+          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$root\bin\protoc.exe" --version
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify Rust toolchain on the AKRAT PC
@@ -77,6 +88,12 @@ jobs:
         run: |
           cargo --version
           rustc --version
+
+      - name: Test workspace and formatting
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --workspace
 
       - name: Build desktop app and CLI with MSVC
         shell: pwsh
@@ -86,7 +103,7 @@ jobs:
           if (-not $vsPath) { throw 'Visual Studio C++ Build Tools are required on the AKRAT runner.' }
           $devCmd = Join-Path $vsPath 'Common7\Tools\VsDevCmd.bat'
           if (-not (Test-Path $devCmd)) { throw "MSVC setup script not found: $devCmd" }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && cargo build --locked --release -p akrat-desktop --features desktop && cargo build --locked --release -p akrat'
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && cargo build --locked --release -p akrat-desktop --features desktop && cargo build --locked --release -p akrat && cargo build --locked --release -p akrat-mailbox'
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -114,25 +131,44 @@ jobs:
           path: |
             target/release/akrat-desktop.exe
             target/release/akrat.exe
+            target/release/akrat-mailbox.exe
             target/release/AKRAT-Setup-*.exe
           if-no-files-found: error
           retention-days: 14
 
   desktop-windows-pr:
-    name: Desktop Windows · GitHub runner (pull requests)
-    if: github.event_name == 'pull_request'
-    runs-on: windows-latest
+    name: Desktop Windows · PC AKRAT (pull requests)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64, akrat-local]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install pinned protobuf compiler
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
+          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') { throw "protoc archive SHA-256 mismatch: $hash" }
+          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$root\bin\protoc.exe" --version
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Test workspace and formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --workspace
+
       - name: Build desktop app and CLI
         run: |
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
+          cargo build --locked --release -p akrat-mailbox
 
       - uses: actions/upload-artifact@v4
         with:
@@ -140,6 +176,7 @@ jobs:
           path: |
             target/release/akrat-desktop.exe
             target/release/akrat.exe
+            target/release/akrat-mailbox.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -147,7 +184,7 @@ jobs:
     name: Publier la release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [desktop, desktop-windows-local, android]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, akrat-linux-local]
     permissions:
       contents: write
     steps:
@@ -162,50 +199,61 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
-          for target in windows-x64 linux-x64 macos-aarch64 macos-x64; do
+          for target in windows-x64 linux-x64; do
             folder="dist/akrat-${target}"
             if [[ "$target" == windows-* ]]; then
               zip -j "dist/AKRAT-${version}-${target}.zip" \
-                "$folder/akrat-desktop.exe" "$folder/akrat.exe"
+                "$folder/akrat-desktop.exe" "$folder/akrat.exe" "$folder/akrat-mailbox.exe"
             else
-              chmod +x "$folder/akrat-desktop" "$folder/akrat"
+              chmod +x "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox"
               zip -j "dist/AKRAT-${version}-${target}.zip" \
-                "$folder/akrat-desktop" "$folder/akrat"
+                "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox"
             fi
           done
           cp dist/akrat-android-apk/app-debug.apk "dist/AKRAT-${version}-android.apk"
+          cp dist/akrat-windows-x64/akrat-mailbox.exe "dist/AKRAT-${version}-mailbox-windows-x64.exe"
+          cp dist/akrat-linux-x64/akrat-mailbox "dist/AKRAT-${version}-mailbox-linux-x64"
+          cp dist/akrat-windows-x64/AKRAT-Setup-v"${version#v}".exe "dist/AKRAT-${version}-windows-installer.exe"
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
-          Build automatique depuis GitHub Actions.
+          AKRAT v0.1.9 apporte la livraison asynchrone chiffrée, la fédération de serveurs, la rotation authentifiée des clés de reçus et des limites anti-abus configurables.
 
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
-          - macOS Apple Silicon et Intel : application et CLI
           - Android : la compilation de l’APK est vérifiée par la CI ; l’APK signé pour les installations de test est publié séparément.
+          - macOS : non compilé pour cette version ; aucun Mac n’est utilisé.
 
-          Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256.
+          La continuité des clés de reçus est authentifiée par une racine persistante ; les anciennes signatures ne sont acceptées que pendant la période d’activité de leur clé. La compromission de cette racine nécessite un réépinglage hors bande. Le prekey Kyber signé n’est pas un pool de prekeys PQ à usage unique. Aucun audit cryptographique indépendant n’a été réalisé.
+
+          Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256. L’APK Android est signé avec la clé de test persistante du projet.
           EOF
+          (cd dist && sha256sum AKRAT-* > SHA256SUMS)
 
       - name: Publier la release GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/akrat-windows-x64/AKRAT-Setup-*.exe \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-windows-installer.exe \
             dist/AKRAT-"${GITHUB_REF_NAME}"-windows-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-linux-x64.zip \
-            dist/AKRAT-"${GITHUB_REF_NAME}"-macos-aarch64.zip \
-            dist/AKRAT-"${GITHUB_REF_NAME}"-macos-x64.zip \
             dist/AKRAT-"${GITHUB_REF_NAME}"-android.apk \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-mailbox-windows-x64.exe \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-mailbox-linux-x64 \
+            dist/SHA256SUMS \
             --title "AKRAT ${GITHUB_REF_NAME}" \
             --notes-file dist/release-notes.md
 
   android:
     name: Android · APK de test
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, akrat-linux-local]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Verify Android runner prerequisites
+        run: protoc --version
 
       - uses: actions/setup-java@v6
         with:
@@ -248,8 +296,20 @@ jobs:
           echo "$expected  $RUNNER_TEMP/dx.tar.gz" | sha256sum --check --status
           mkdir -p "$RUNNER_TEMP/dx"
           tar -xzf "$RUNNER_TEMP/dx.tar.gz" -C "$RUNNER_TEMP/dx"
-          sudo install -m 0755 "$RUNNER_TEMP/dx/dx" /usr/local/bin/dx
+          chmod +x "$RUNNER_TEMP/dx/dx"
+          echo "$RUNNER_TEMP/dx" >> "$GITHUB_PATH"
           dx --version
+
+      - name: Clear launcher images from a previous local build
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          resources = Path("target/dx/akrat-desktop/release/android/app/app/src/main/res")
+          for density in ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"):
+              (resources / f"mipmap-{density}" / "ic_launcher.png").unlink(missing_ok=True)
+          PY
 
       - name: Build installable Android test APK
         run: >-
