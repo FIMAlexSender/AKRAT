@@ -485,7 +485,19 @@ impl LocalRegistry {
         let cursor = changes
             .last()
             .map_or(after_sequence, |(sequence, _)| *sequence);
-        let announcements = changes
+        // A node can publish several updates between syncs. Keep only its
+        // newest announcement in each page: receivers reject duplicate
+        // fingerprints within a signed delta.
+        let mut latest_by_fingerprint = std::collections::HashMap::new();
+        for (sequence, announcement) in changes {
+            latest_by_fingerprint.insert(
+                announcement.node_fingerprint.clone(),
+                (sequence, announcement),
+            );
+        }
+        let mut latest: Vec<_> = latest_by_fingerprint.into_values().collect();
+        latest.sort_by_key(|(sequence, _)| *sequence);
+        let announcements = latest
             .into_iter()
             .map(|(_, item)| item)
             .filter(|item| item.verify(now).is_ok())
@@ -986,5 +998,48 @@ mod tests {
                 .expect("cursor"),
             second.cursor
         );
+    }
+
+    #[test]
+    fn signed_federation_delta_keeps_only_latest_announcement_per_node() {
+        let now = 1_800_000_000;
+        let source = ServerSigner::generate().expect("source signer");
+        let node = ServerSigner::generate().expect("node signer");
+        let noise = ServerSigner::generate().expect("noise signer");
+        let directory = tempfile::tempdir().expect("directory");
+        let mut registry =
+            LocalRegistry::open(directory.path().join("source.sqlite3")).expect("source registry");
+        for (sequence, name) in [(1, "old"), (2, "new")] {
+            let announcement = NodeAnnouncement::create_profile(
+                &node,
+                &noise.public_key(),
+                "node.example:47475".into(),
+                "operator".into(),
+                name.into(),
+                String::new(),
+                String::new(),
+                1,
+                1,
+                vec!["mailbox".into()],
+                100_000,
+                sequence,
+                now,
+                now + 3600,
+            )
+            .expect("announcement");
+            registry
+                .publish_announcement(&announcement, now)
+                .expect("publish announcement");
+        }
+
+        let delta = registry
+            .signed_delta(&source, 0, now)
+            .expect("signed delta");
+        assert_eq!(delta.announcements.len(), 1);
+        assert_eq!(delta.announcements[0].sequence, 2);
+        assert_eq!(delta.announcements[0].name, "new");
+        delta
+            .verify(&source.public_key(), now)
+            .expect("valid delta");
     }
 }
