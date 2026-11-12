@@ -42,6 +42,8 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       - name: Test workspace and formatting
         run: |
@@ -162,6 +164,8 @@ jobs:
           & "$root\bin\protoc.exe" --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       - name: Test workspace and formatting
         run: |
@@ -287,6 +291,8 @@ jobs:
           targets: aarch64-linux-android
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       - name: Install Dioxus CLI
         shell: bash
