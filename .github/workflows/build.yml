@@ -300,7 +300,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/dx.tar.gz" -C "$RUNNER_TEMP/dx"
           chmod +x "$RUNNER_TEMP/dx/dx"
           echo "$RUNNER_TEMP/dx" >> "$GITHUB_PATH"
-          dx --version
+          "$RUNNER_TEMP/dx/dx" --version
 
       - name: Clear launcher images from a previous local build
         shell: bash
