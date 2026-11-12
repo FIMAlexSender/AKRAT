@@ -276,9 +276,9 @@ pub fn load_encrypted_chunks(
         let path = directory.join(format!("{index:08}.chunk"));
         let file = File::open(path)?;
         let mut bytes = Vec::new();
-        file.take((ATTACHMENT_CHUNK_BYTES + 4096) as u64)
+        file.take((ATTACHMENT_CHUNK_BYTES * 4 + 4096) as u64)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > ATTACHMENT_CHUNK_BYTES + 4096 {
+        if bytes.len() > ATTACHMENT_CHUNK_BYTES * 4 + 4096 {
             return Err(AttachmentError::TooLarge);
         }
         let chunk: AttachmentChunk =
@@ -439,6 +439,35 @@ mod tests {
                 .windows(image.len().min(16))
                 .any(|window| window == &image[..image.len().min(16)])
         );
+    }
+
+    #[test]
+    fn sidecar_reads_full_sized_json_chunk_records() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let manifest = AttachmentManifest {
+            version: 1,
+            attachment_id: "00112233445566778899aabbccddeeff".into(),
+            message_id: "message-1".into(),
+            conversation_id: "dm:test".into(),
+            display_name: "photo.png".into(),
+            media_type: "image/png".into(),
+            plaintext_size: 1,
+            chunk_size: ATTACHMENT_CHUNK_BYTES as u32,
+            chunk_count: 1,
+            plaintext_sha256: hex::encode(Sha256::digest([0u8])),
+            content_key: vec![7; 32],
+        };
+        let chunk = AttachmentChunk {
+            version: 1,
+            attachment_id: manifest.attachment_id.clone(),
+            index: 0,
+            nonce: vec![8; 12],
+            ciphertext: vec![9; ATTACHMENT_CHUNK_BYTES + 16],
+        };
+        let sidecar = directory.path().join("vault.akrat.attachments");
+        store_encrypted_chunks(&sidecar, &[chunk.clone()]).expect("save full chunk");
+        let restored = load_encrypted_chunks(&sidecar, &manifest).expect("load full chunk");
+        assert_eq!(restored, [chunk]);
     }
 
     #[test]

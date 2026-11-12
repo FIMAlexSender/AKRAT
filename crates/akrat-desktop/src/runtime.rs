@@ -1,5 +1,8 @@
+use akrat_core::attachments::{AttachmentChunk, AttachmentManifest};
 use akrat_core::network::{self, SecureChannel};
 use akrat_core::{Contact, DeliveryState, GroupEvent, GroupMessage, Identity, StoredMessage};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,6 +51,21 @@ impl SessionHandle {
             .map_err(|_| "La session est fermée".to_string())
     }
 
+    pub fn send_attachment_chunk(
+        &self,
+        message_id: String,
+        manifest: AttachmentManifest,
+        chunk: AttachmentChunk,
+    ) -> Result<(), String> {
+        self.commands
+            .send(SessionCommand::AttachmentChunk {
+                message_id,
+                manifest,
+                chunk,
+            })
+            .map_err(|_| "La session est fermée".to_string())
+    }
+
     pub fn acknowledge_group_message(
         &self,
         group_id: String,
@@ -81,6 +99,11 @@ enum SessionCommand {
     },
     GroupEvent(GroupEvent),
     GroupMessage(GroupMessage),
+    AttachmentChunk {
+        message_id: String,
+        manifest: AttachmentManifest,
+        chunk: AttachmentChunk,
+    },
     GroupAcknowledgement {
         group_id: String,
         message_id: String,
@@ -90,6 +113,41 @@ enum SessionCommand {
         id: String,
     },
     Close,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireAttachmentChunk {
+    version: u8,
+    attachment_id: String,
+    index: u32,
+    nonce: Vec<u8>,
+    ciphertext: String,
+}
+
+impl From<AttachmentChunk> for WireAttachmentChunk {
+    fn from(chunk: AttachmentChunk) -> Self {
+        Self {
+            version: chunk.version,
+            attachment_id: chunk.attachment_id,
+            index: chunk.index,
+            nonce: chunk.nonce,
+            ciphertext: STANDARD.encode(chunk.ciphertext),
+        }
+    }
+}
+
+impl TryFrom<WireAttachmentChunk> for AttachmentChunk {
+    type Error = base64::DecodeError;
+
+    fn try_from(chunk: WireAttachmentChunk) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: chunk.version,
+            attachment_id: chunk.attachment_id,
+            index: chunk.index,
+            nonce: chunk.nonce,
+            ciphertext: STANDARD.decode(chunk.ciphertext)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +174,12 @@ pub enum UiEvent {
     IncomingGroupMessage {
         conversation: String,
         message: GroupMessage,
+    },
+    IncomingAttachmentChunk {
+        conversation: String,
+        message_id: String,
+        manifest: AttachmentManifest,
+        chunk: AttachmentChunk,
     },
     IncomingGroupAcknowledgement {
         conversation: String,
@@ -149,6 +213,11 @@ enum WireMessage {
     },
     GroupMessage {
         message: GroupMessage,
+    },
+    AttachmentChunk {
+        message_id: String,
+        manifest: AttachmentManifest,
+        chunk: WireAttachmentChunk,
     },
     GroupAcknowledgement {
         group_id: String,
@@ -668,6 +737,10 @@ async fn start_session<S>(
                     let packet = match serde_json::to_vec(&WireMessage::GroupMessage { message }) { Ok(packet) => packet, Err(_) => continue };
                     if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
                 }
+                Some(SessionCommand::AttachmentChunk { message_id, manifest, chunk }) => {
+                    let packet = match serde_json::to_vec(&WireMessage::AttachmentChunk { message_id, manifest, chunk: chunk.into() }) { Ok(packet) => packet, Err(_) => continue };
+                    if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
+                }
                 Some(SessionCommand::GroupAcknowledgement { group_id, message_id, recipient_public_key }) => {
                     let packet = match serde_json::to_vec(&WireMessage::GroupAcknowledgement { group_id, message_id, recipient_public_key }) { Ok(packet) => packet, Err(_) => continue };
                     if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
@@ -698,6 +771,12 @@ async fn start_session<S>(
                     }
                     Ok(WireMessage::GroupMessage { message }) => {
                         let _ = events.send(UiEvent::IncomingGroupMessage { conversation: conversation.clone(), message });
+                    }
+                    Ok(WireMessage::AttachmentChunk { message_id, manifest, chunk }) => {
+                        match AttachmentChunk::try_from(chunk) {
+                            Ok(chunk) => { let _ = events.send(UiEvent::IncomingAttachmentChunk { conversation: conversation.clone(), message_id, manifest, chunk }); }
+                            Err(_) => { let _ = events.send(UiEvent::Trace("Fragment d’image rejeté · encodage invalide".into())); }
+                        }
                     }
                     Ok(WireMessage::GroupAcknowledgement { group_id, message_id, recipient_public_key }) => {
                         let _ = events.send(UiEvent::IncomingGroupAcknowledgement { conversation: conversation.clone(), group_id, message_id, recipient_public_key });
@@ -781,6 +860,7 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
 #[cfg(test)]
 mod tests {
     use super::{SessionHandle, UiEvent, next_retry_delay, start_session};
+    use akrat_core::attachments::{AttachmentChunk, AttachmentManifest};
     use akrat_core::network;
     use akrat_core::{
         GroupChange, GroupEvent, GroupMember, GroupMessage, GroupRole, GroupState, Identity,
@@ -947,6 +1027,7 @@ mod tests {
             sender_public_key: alice_public_key,
             timestamp: 1,
             text: "**Group hello**".into(),
+            has_attachment: false,
         };
         alice
             .send_group_message(group_message)
@@ -963,6 +1044,45 @@ mod tests {
         .expect("group payload timeout");
         assert!(
             matches!(incoming_group, UiEvent::IncomingGroupMessage { ref message, .. } if message.message_id == "group-message-1" && message.text == "**Group hello**")
+        );
+        let manifest = AttachmentManifest {
+            version: 1,
+            attachment_id: "00112233445566778899aabbccddeeff".into(),
+            message_id: "message-1".into(),
+            conversation_id: "alice:bob".into(),
+            display_name: "photo.png".into(),
+            media_type: "image/png".into(),
+            plaintext_size: 1,
+            chunk_size: 32 * 1024,
+            chunk_count: 1,
+            plaintext_sha256: "00".repeat(32),
+            content_key: vec![7; 32],
+        };
+        alice
+            .send_attachment_chunk(
+                "message-1".into(),
+                manifest.clone(),
+                AttachmentChunk {
+                    version: 1,
+                    attachment_id: manifest.attachment_id.clone(),
+                    index: 0,
+                    nonce: vec![8; 12],
+                    ciphertext: vec![9; 40 * 1024],
+                },
+            )
+            .expect("queue attachment chunk");
+        let attachment = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = bob_rx.recv().await.expect("attachment packet");
+                if matches!(event, UiEvent::IncomingAttachmentChunk { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("attachment timeout");
+        assert!(
+            matches!(attachment, UiEvent::IncomingAttachmentChunk { ref message_id, ref manifest, ref chunk, .. } if message_id == "message-1" && manifest.display_name == "photo.png" && chunk.index == 0)
         );
         bob.acknowledge_group_message(
             "group-transport".into(),

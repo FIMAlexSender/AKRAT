@@ -5,15 +5,18 @@ mod runtime;
 mod updater;
 mod vault_catalog;
 
+use akrat_core::attachments::{self, AttachmentChunk, AttachmentManifest};
 use akrat_core::{
     Contact, DeliveryActor, DeliveryEvent, DeliveryEventKind, DeliveryState, GroupChange,
     GroupEvent, GroupMember, GroupMessage, GroupMessageDelivery, GroupRecipientDelivery,
     GroupRecipientStatus, GroupRole, GroupState, Identity, Invitation, MailboxInbox, MailboxRoute,
-    StoredMessage, VaultData, VaultFileLock, load_vault,
+    StoredAttachment, StoredMessage, VaultData, VaultFileLock, load_vault,
     markdown::TableAlignment,
     markdown::{MarkdownNode, MarkdownNodeKind, parse_markdown},
     save_vault,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use dioxus::prelude::*;
 #[cfg(not(target_os = "android"))]
 use directories::ProjectDirs;
@@ -310,6 +313,10 @@ fn App() -> Element {
                             member.accepted && member.fingerprint == recipient.fingerprint
                         }) && (recipient.status == GroupRecipientStatus::Pending
                             || (recipient.status == GroupRecipientStatus::Sent && retry_elapsed))
+                            && !data.attachments.iter().any(|attachment| {
+                                attachment.conversation == format!("group:{}", group.group_id)
+                                    && attachment.message_id == message.id
+                            })
                         {
                             queued_group_messages.push((
                                 direct_conversation,
@@ -322,6 +329,11 @@ fn App() -> Element {
                                     sender_public_key: identity.public_key().to_vec(),
                                     timestamp: message.timestamp,
                                     text: message.text.clone(),
+                                    has_attachment: data.attachments.iter().any(|attachment| {
+                                        attachment.conversation
+                                            == format!("group:{}", group.group_id)
+                                            && attachment.message_id == message.id
+                                    }),
                                 },
                             ));
                         }
@@ -459,10 +471,39 @@ fn App() -> Element {
                                     && message.outgoing
                                     && message.delivery.needs_delivery()
                             }) {
-                                if handle
-                                    .send_text(message.id.clone(), message.text.clone())
-                                    .is_ok()
-                                {
+                                let attachment = data.attachments.iter().find(|attachment| {
+                                    attachment.conversation == message.conversation
+                                        && attachment.message_id == message.id
+                                });
+                                let resumed = if let Some(attachment) = attachment {
+                                    if let Ok(chunks) = attachments::load_encrypted_chunks(
+                                        &attachments::attachment_sidecar_path(&vault_path),
+                                        &attachment.manifest,
+                                    ) {
+                                        let mut all_queued = true;
+                                        for chunk in chunks {
+                                            if handle
+                                                .send_attachment_chunk(
+                                                    message.id.clone(),
+                                                    attachment.manifest.clone(),
+                                                    chunk,
+                                                )
+                                                .is_err()
+                                            {
+                                                all_queued = false;
+                                                break;
+                                            }
+                                        }
+                                        all_queued
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    handle
+                                        .send_text(message.id.clone(), message.text.clone())
+                                        .is_ok()
+                                };
+                                if resumed {
                                     push_trace(
                                         &mut trace,
                                         format!(
@@ -570,7 +611,7 @@ fn App() -> Element {
                         ) {
                             Ok((data, accepted, own_public_key)) => {
                                 vault.set(Some(data));
-                                if accepted {
+                                if accepted && !message.has_attachment {
                                     if let Some(handle) = sessions.read().get(&conversation) {
                                         let _ = handle.acknowledge_group_message(
                                             message.group_id,
@@ -589,6 +630,62 @@ fn App() -> Element {
                                 &mut trace,
                                 format!("Message de groupe refusé · {error}"),
                             ),
+                        }
+                    }
+                    UiEvent::IncomingAttachmentChunk {
+                        conversation,
+                        message_id,
+                        manifest,
+                        chunk,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        let group_id = manifest
+                            .conversation_id
+                            .strip_prefix("group:")
+                            .map(str::to_string);
+                        match store_incoming_attachment_chunk(
+                            &vault_path,
+                            &phrase,
+                            &conversation,
+                            &message_id,
+                            manifest,
+                            chunk,
+                        ) {
+                            Ok(Some(data)) => {
+                                let local_key = conversation
+                                    .split_once(':')
+                                    .and_then(|(identity_id, _)| {
+                                        data.identities
+                                            .iter()
+                                            .find(|identity| identity.id == identity_id)
+                                    })
+                                    .map(|identity| identity.public_key().to_vec());
+                                vault.set(Some(data));
+                                if let Some(handle) = sessions.read().get(&conversation) {
+                                    if let (Some(group_id), Some(local_key)) = (group_id, local_key)
+                                    {
+                                        let _ = handle.acknowledge_group_message(
+                                            group_id,
+                                            message_id.clone(),
+                                            local_key,
+                                        );
+                                    } else {
+                                        let _ = handle.acknowledge(message_id.clone());
+                                    }
+                                }
+                                push_trace(
+                                    &mut trace,
+                                    format!(
+                                        "Image authentifiée et enregistrée · {}",
+                                        &message_id[..8.min(message_id.len())]
+                                    ),
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                push_trace(&mut trace, format!("Pièce jointe refusée · {error}"))
+                            }
                         }
                     }
                     UiEvent::IncomingGroupAcknowledgement {
@@ -2206,6 +2303,8 @@ fn ChatPage(
     let button_conversation = conversation.clone();
     let input_path = path.clone();
     let button_path = path.clone();
+    let image_path = path.clone();
+    let image_conversation = conversation.clone().unwrap_or_default();
     let group_create_path = path.clone();
     let group_accept_path = path.clone();
     let group_connect_path = path.clone();
@@ -2296,6 +2395,17 @@ fn ChatPage(
                             }, "Se connecter" }
                         }
                     }
+                    if let Some(group) = active_group.cloned() {
+                        GroupAdminPanel {
+                            group,
+                            path: path.clone(),
+                            passphrase,
+                            vault,
+                            sessions,
+                            event_sender,
+                            notice,
+                        }
+                    }
                     div { class: "message-list", id: "message-list",
                         if messages.is_empty() { div { class: "chat-empty", "Conversation prête · envoyez le premier message." } }
                         for message in messages {
@@ -2313,6 +2423,21 @@ fn ChatPage(
                         }
                     }
                     div { class: "composer",
+                        label { class: "attachment-picker", title: "Joindre une image", "＋ Image"
+                            input { r#type: "file", accept: "image/png,image/jpeg,image/webp", onchange: move |event| {
+                                let Some(file) = event.files().into_iter().next() else { return; };
+                                if file.size() > attachments::MAX_ATTACHMENT_BYTES as u64 { notice.set("Image limitée à 16 Mio.".into()); return; }
+                                let name = file.name();
+                                let path = image_path.clone();
+                                let conversation = image_conversation.clone();
+                                spawn(async move {
+                                    match file.read_bytes().await {
+                                        Ok(bytes) => send_image_action(conversation, name, bytes.to_vec(), path, passphrase, vault, sessions, notice, trace, event_sender),
+                                        Err(error) => notice.set(format!("Lecture de l’image impossible : {error}")),
+                                    }
+                                });
+                            } }
+                        }
                         textarea {
                             value: "{draft}", placeholder: "Écrire un message… · Entrée pour envoyer",
                             oninput: move |e| draft.set(e.value()),
@@ -2332,6 +2457,78 @@ fn ChatPage(
                         button { class: "primary empty-action", onclick: on_setup, "Ajouter un contact" }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn GroupAdminPanel(
+    group: GroupState,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+    notice: Signal<String>,
+) -> Element {
+    let mut rename_draft = use_signal(|| group.name.clone());
+    let local_member = vault.read().as_ref().and_then(|data| {
+        data.identities.iter().find_map(|identity| {
+            group
+                .members
+                .iter()
+                .find(|member| member.accepted && member.public_key == identity.public_key())
+                .map(|member| (identity.fingerprint(), member.role))
+        })
+    });
+    let can_manage = local_member
+        .as_ref()
+        .is_some_and(|(_, role)| matches!(role, GroupRole::Owner | GroupRole::Admin));
+    let is_owner = local_member
+        .as_ref()
+        .is_some_and(|(_, role)| *role == GroupRole::Owner);
+    let can_leave = local_member
+        .as_ref()
+        .is_some_and(|(_, role)| *role != GroupRole::Owner);
+    let group_id = group.group_id.clone();
+    let group_id_for_rename = group_id.clone();
+    let path_for_rename = path.clone();
+    let path_for_remove = path.clone();
+    let path_for_role = path.clone();
+    let path_for_leave = path.clone();
+    rsx! {
+        details { class: "group-admin-panel",
+            summary { "Membres et administration · {group.members.len()}" }
+            if can_manage {
+                div { class: "group-admin-rename",
+                    input { value: "{rename_draft}", maxlength: "64", placeholder: "Nom du groupe", oninput: move |event| rename_draft.set(event.value()) }
+                    button { class: "secondary compact", onclick: move |_| {
+                        apply_group_change_action(group_id_for_rename.clone(), GroupChange::Rename { name: rename_draft.read().trim().to_string() }, path_for_rename.clone(), passphrase, vault, sessions, event_sender, notice);
+                    }, "Renommer" }
+                }
+            }
+            div { class: "group-admin-members",
+                for member in group.members.iter() {
+                    div { class: "group-admin-member",
+                        div { strong { "{member.display_name}" } span { "{member.role:?} · " if member.accepted { "accepté" } else { "invité" } } }
+                        if can_manage && member.accepted && member.role != GroupRole::Owner {
+                            if is_owner {
+                                button { class: "secondary compact", onclick: { let fingerprint = member.fingerprint.clone(); let role = if member.role == GroupRole::Admin { GroupRole::Member } else { GroupRole::Admin }; let group_id = group_id.clone(); let path = path_for_role.clone(); move |_| {
+                                    apply_group_change_action(group_id.clone(), GroupChange::SetRole { fingerprint: fingerprint.clone(), role }, path.clone(), passphrase, vault, sessions, event_sender, notice);
+                                } }, if member.role == GroupRole::Admin { "Rétrograder" } else { "Promouvoir admin" } }
+                            }
+                            button { class: "secondary compact danger", onclick: { let fingerprint = member.fingerprint.clone(); let group_id = group_id.clone(); let path = path_for_remove.clone(); move |_| {
+                                apply_group_change_action(group_id.clone(), GroupChange::Remove { fingerprint: fingerprint.clone() }, path.clone(), passphrase, vault, sessions, event_sender, notice);
+                            } }, "Retirer" }
+                        }
+                    }
+                }
+            }
+            if can_leave {
+                button { class: "secondary compact danger", onclick: move |_| {
+                    apply_group_change_action(group_id.clone(), GroupChange::Leave, path_for_leave.clone(), passphrase, vault, sessions, event_sender, notice);
+                }, "Quitter le groupe" }
             }
         }
     }
@@ -2432,6 +2629,9 @@ fn MessageCard(
     };
     rsx! {
         div { class: if outgoing { "message outgoing" } else { "message incoming" },
+            if let Some(image_data) = message_attachment_data(&path, &message, &vault) {
+                img { class: "message-attachment", src: "data:image/png;base64,{image_data}", alt: "Image jointe · {message.id}" }
+            }
             div { class: "message-markdown", MarkdownNodeView { node: parse_markdown(&message.text).unwrap_or_else(|_| MarkdownNode { kind: MarkdownNodeKind::Text(message.text.clone()), children: Vec::new() }) } }
             div { class: "message-meta", span { class: "message-time", "{format_timestamp(message.timestamp)}" } span { class: "message-status", "{status}" } }
             if outgoing && message.delivery == DeliveryState::Expired {
@@ -2799,6 +2999,411 @@ fn store_incoming_group_message(
     }
     save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
     Ok((data, true, own_key))
+}
+
+fn store_incoming_attachment_chunk(
+    path: &Path,
+    passphrase: &str,
+    conversation: &str,
+    message_id: &str,
+    manifest: AttachmentManifest,
+    chunk: AttachmentChunk,
+) -> Result<Option<VaultData>, String> {
+    if manifest.message_id != message_id || !message_id.is_ascii() {
+        return Err("la pièce jointe ne correspond pas au message".into());
+    }
+    attachments::validate_manifest(&manifest).map_err(|error| error.to_string())?;
+    if chunk.attachment_id != manifest.attachment_id || chunk.index >= manifest.chunk_count {
+        return Err("fragment de pièce jointe invalide".into());
+    }
+    let mut data = load_vault(path, passphrase).map_err(|error| error.to_string())?;
+    let identity = data
+        .identities
+        .iter()
+        .find(|identity| {
+            identity.id
+                == conversation
+                    .split_once(':')
+                    .map(|(id, _)| id)
+                    .unwrap_or_default()
+        })
+        .ok_or("identité locale introuvable")?;
+    let stored_conversation =
+        if let Some(group_id) = manifest.conversation_id.strip_prefix("group:") {
+            let group = data
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .ok_or("groupe de la pièce jointe inconnu")?;
+            if !group.members.iter().any(|member| {
+                member.accepted
+                    && member.fingerprint
+                        == conversation
+                            .split_once(':')
+                            .map(|(_, fingerprint)| fingerprint)
+                            .unwrap_or_default()
+            }) || !group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+            {
+                return Err("l’expéditeur ou le destinataire n’appartient pas au groupe".into());
+            }
+            format!("group:{group_id}")
+        } else {
+            conversation.to_string()
+        };
+    let parent_exists = data.messages.iter().any(|message| {
+        message.conversation == stored_conversation && message.id == message_id && !message.outgoing
+    });
+    if stored_conversation.starts_with("group:") && !parent_exists {
+        return Err("message de groupe parent absent du coffre".into());
+    }
+    if data
+        .attachments
+        .iter()
+        .any(|item| item.manifest.attachment_id == manifest.attachment_id)
+    {
+        return Ok(Some(data));
+    }
+    let sidecar = attachments::attachment_sidecar_path(path);
+    attachments::store_encrypted_chunks(&sidecar, std::slice::from_ref(&chunk))
+        .map_err(|error| error.to_string())?;
+    let chunks = match attachments::load_encrypted_chunks(&sidecar, &manifest) {
+        Ok(chunks) => chunks,
+        Err(attachments::AttachmentError::Io(_)) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut plaintext =
+        attachments::decrypt_image(&manifest, &chunks).map_err(|error| error.to_string())?;
+    use zeroize::Zeroize;
+    let (mut sanitized, _) = attachments::sanitize_image(&plaintext)
+        .map_err(|error| format!("image invalide: {error}"))?;
+    sanitized.zeroize();
+    plaintext.zeroize();
+    if !parent_exists {
+        data.messages.push(runtime::received_message(
+            stored_conversation.clone(),
+            message_id.to_string(),
+            format!("Image · {}", manifest.display_name),
+        ));
+    }
+    data.attachments.push(StoredAttachment {
+        conversation: stored_conversation,
+        message_id: message_id.to_string(),
+        manifest,
+    });
+    save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
+    Ok(Some(data))
+}
+
+fn message_attachment_data(
+    path: &Path,
+    message: &StoredMessage,
+    vault: &Signal<Option<VaultData>>,
+) -> Option<String> {
+    let manifest = vault
+        .read()
+        .as_ref()?
+        .attachments
+        .iter()
+        .find(|item| item.conversation == message.conversation && item.message_id == message.id)?
+        .manifest
+        .clone();
+    let sidecar = attachments::attachment_sidecar_path(path);
+    let chunks = attachments::load_encrypted_chunks(&sidecar, &manifest).ok()?;
+    let mut image = attachments::decrypt_image(&manifest, &chunks).ok()?;
+    let encoded = STANDARD.encode(&image);
+    use zeroize::Zeroize;
+    image.zeroize();
+    Some(encoded)
+}
+
+fn send_image_action(
+    conversation: String,
+    display_name: String,
+    bytes: Vec<u8>,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    mut notice: Signal<String>,
+    mut trace: Signal<Vec<String>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) {
+    if conversation.starts_with("group:") {
+        send_group_image_action(
+            conversation,
+            display_name,
+            bytes,
+            path,
+            passphrase,
+            vault,
+            sessions,
+            notice,
+            trace,
+        );
+        return;
+    }
+    let session = sessions.read().get(&conversation).cloned();
+    let message_id = match runtime::message_id() {
+        Ok(id) => id,
+        Err(error) => {
+            notice.set(error);
+            return;
+        }
+    };
+    let (manifest, chunks) = match attachments::encrypt_image(
+        &bytes,
+        message_id.clone(),
+        message_id.clone(),
+        conversation.clone(),
+        &display_name,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            notice.set(format!("Image refusée : {error}"));
+            return;
+        }
+    };
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(format!("Coffre inaccessible : {error}"));
+            return;
+        }
+    };
+    let sidecar = attachments::attachment_sidecar_path(&path);
+    if let Err(error) = attachments::store_encrypted_chunks(&sidecar, &chunks) {
+        notice.set(format!("Enregistrement chiffré impossible : {error}"));
+        return;
+    }
+    let mut outgoing = runtime::new_message(
+        conversation.clone(),
+        message_id.clone(),
+        format!("Image · {}", manifest.display_name),
+    );
+    if session.is_none() {
+        outgoing.delivery = DeliveryState::Queued;
+    }
+    data.messages.push(outgoing);
+    data.attachments.push(StoredAttachment {
+        conversation: conversation.clone(),
+        message_id: message_id.clone(),
+        manifest: manifest.clone(),
+    });
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(format!("Coffre non modifié : {error}"));
+        return;
+    }
+    vault.set(Some(data));
+    if let Some(session) = session {
+        for chunk in chunks {
+            if let Err(error) =
+                session.send_attachment_chunk(message_id.clone(), manifest.clone(), chunk)
+            {
+                notice.set(format!(
+                    "Transfert interrompu après enregistrement local : {error}"
+                ));
+                return;
+            }
+        }
+        if let Ok(mut data) = load_vault(&path, &phrase) {
+            update_delivery(&mut data, &conversation, &message_id, DeliveryState::Sent);
+            if save_vault(&path, &mut data, &phrase).is_ok() {
+                vault.set(Some(data));
+            }
+        }
+        push_trace(
+            &mut trace,
+            format!(
+                "Image assainie, chiffrée par fragments et transmise · {}",
+                &message_id[..8.min(message_id.len())]
+            ),
+        );
+        notice.set("Image chiffrée et envoyée sur la session active.".into());
+    } else {
+        start_retry_for_conversation(&conversation, vault, event_sender);
+        notice.set(
+            "Image chiffrée dans le coffre · tentative P2P lancée. Elle partira à la reconnexion."
+                .into(),
+        );
+    }
+}
+
+fn send_group_image_action(
+    conversation: String,
+    display_name: String,
+    bytes: Vec<u8>,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    mut notice: Signal<String>,
+    mut trace: Signal<Vec<String>>,
+) {
+    let group_id = conversation.trim_start_matches("group:");
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(format!("Coffre inaccessible : {error}"));
+            return;
+        }
+    };
+    let Some(group) = data
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .cloned()
+    else {
+        notice.set("Groupe introuvable.".into());
+        return;
+    };
+    let Some(identity) = data
+        .identities
+        .iter()
+        .find(|identity| {
+            group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+        })
+        .map(Identity::detached_copy)
+    else {
+        notice.set("Aucune identité locale ne participe au groupe.".into());
+        return;
+    };
+    let recipients = group
+        .members
+        .iter()
+        .filter(|member| member.accepted && member.fingerprint != identity.fingerprint())
+        .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        notice.set("Le groupe n’a aucun autre membre accepté.".into());
+        return;
+    }
+    let handles = sessions.read();
+    let mut peers = Vec::with_capacity(recipients.len());
+    for member in &recipients {
+        let key = format!("{}:{}", identity.id, member.fingerprint);
+        let Some(handle) = handles.get(&key).cloned() else {
+            notice.set(
+                "Connectez tous les membres acceptés pour envoyer une image de groupe.".into(),
+            );
+            return;
+        };
+        peers.push(handle);
+    }
+    drop(handles);
+    let message_id = match runtime::message_id() {
+        Ok(id) => id,
+        Err(error) => {
+            notice.set(error);
+            return;
+        }
+    };
+    let (manifest, chunks) = match attachments::encrypt_image(
+        &bytes,
+        message_id.clone(),
+        message_id.clone(),
+        conversation.clone(),
+        &display_name,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            notice.set(format!("Image refusée : {error}"));
+            return;
+        }
+    };
+    let sidecar = attachments::attachment_sidecar_path(&path);
+    if let Err(error) = attachments::store_encrypted_chunks(&sidecar, &chunks) {
+        notice.set(format!("Enregistrement chiffré impossible : {error}"));
+        return;
+    }
+    let caption = format!("Image · {}", manifest.display_name);
+    let mut stored =
+        runtime::new_message(conversation.clone(), message_id.clone(), caption.clone());
+    stored.delivery = DeliveryState::Queued;
+    data.messages.push(stored);
+    data.attachments.push(StoredAttachment {
+        conversation: conversation.clone(),
+        message_id: message_id.clone(),
+        manifest: manifest.clone(),
+    });
+    data.group_deliveries.push(GroupMessageDelivery {
+        group_id: group.group_id.clone(),
+        message_id: message_id.clone(),
+        epoch: group.epoch,
+        sequence: group.sequence,
+        recipients: recipients
+            .iter()
+            .map(|member| GroupRecipientDelivery {
+                fingerprint: member.fingerprint.clone(),
+                status: GroupRecipientStatus::Pending,
+                updated_at: now_seconds(),
+            })
+            .collect(),
+    });
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(format!("Sauvegarde impossible : {error}"));
+        return;
+    }
+    vault.set(Some(data));
+    let payload = GroupMessage {
+        version: 1,
+        group_id: group.group_id,
+        epoch: group.epoch,
+        sequence: group.sequence,
+        message_id: message_id.clone(),
+        sender_public_key: identity.public_key().to_vec(),
+        timestamp: now_seconds(),
+        text: caption,
+        has_attachment: true,
+    };
+    for handle in &peers {
+        if let Err(error) = handle.send_group_message(payload.clone()) {
+            notice.set(format!("Envoi de groupe interrompu : {error}"));
+            return;
+        }
+        for chunk in chunks.iter().cloned() {
+            if let Err(error) =
+                handle.send_attachment_chunk(message_id.clone(), manifest.clone(), chunk)
+            {
+                notice.set(format!("Transfert d’image interrompu : {error}"));
+                return;
+            }
+        }
+    }
+    if let Ok(mut data) = load_vault(&path, &phrase) {
+        if let Some(delivery) = data
+            .group_deliveries
+            .iter_mut()
+            .find(|delivery| delivery.group_id == group_id && delivery.message_id == message_id)
+        {
+            for recipient in &mut delivery.recipients {
+                recipient.status = GroupRecipientStatus::Sent;
+                recipient.updated_at = now_seconds();
+            }
+        }
+        if let Some(message) = data.messages.iter_mut().find(|message| {
+            message.conversation == conversation && message.id == message_id && message.outgoing
+        }) {
+            message.delivery = DeliveryState::Sent;
+        }
+        if save_vault(&path, &mut data, &phrase).is_ok() {
+            vault.set(Some(data));
+        }
+    }
+    push_trace(
+        &mut trace,
+        format!(
+            "Image de groupe chiffrée et fragmentée · {}",
+            &message_id[..8.min(message_id.len())]
+        ),
+    );
+    notice.set("Image envoyée aux membres actuellement connectés.".into());
 }
 
 fn store_group_acknowledgement(
@@ -3194,6 +3799,116 @@ fn connect_group_members(
     }
 }
 
+fn apply_group_change_action(
+    group_id: String,
+    change: GroupChange,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+    mut notice: Signal<String>,
+) {
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(format!("Coffre inaccessible : {error}"));
+            return;
+        }
+    };
+    let Some(group_index) = data
+        .groups
+        .iter()
+        .position(|group| group.group_id == group_id)
+    else {
+        notice.set("Groupe introuvable.".into());
+        return;
+    };
+    let group = &data.groups[group_index];
+    let actor = data.identities.iter().find(|identity| {
+        group.members.iter().any(|member| {
+            member.accepted
+                && member.public_key == identity.public_key()
+                && match &change {
+                    GroupChange::Leave => true,
+                    GroupChange::SetRole { .. } => member.role == GroupRole::Owner,
+                    _ => matches!(member.role, GroupRole::Owner | GroupRole::Admin),
+                }
+        })
+    });
+    let Some(actor) = actor.map(Identity::detached_copy) else {
+        notice.set("Aucune identité locale autorisée à gérer ce groupe.".into());
+        return;
+    };
+    let former_members = group.members.clone();
+    let sequence = group.sequence.saturating_add(1);
+    let epoch = group.epoch.saturating_add(u64::from(matches!(
+        &change,
+        GroupChange::Remove { .. } | GroupChange::Leave | GroupChange::Rotate
+    )));
+    let previous = group.last_event_sha256.clone();
+    let event = match GroupEvent::signed(
+        &actor,
+        group_id.clone(),
+        sequence,
+        epoch,
+        Some(previous),
+        change,
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            notice.set(error.to_string());
+            return;
+        }
+    };
+    let group = &mut data.groups[group_index];
+    if let Err(error) = group.apply(&event).and_then(|()| group.validate()) {
+        notice.set(format!("Modification du groupe refusée : {error}"));
+        return;
+    }
+    let updated = group.clone();
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(format!("Enregistrement impossible : {error}"));
+        return;
+    }
+    vault.set(load_vault(&path, &phrase).ok());
+    let event_tx = event_sender.read().clone();
+    let mut notified = 0usize;
+    for member in former_members
+        .iter()
+        .filter(|member| member.fingerprint != actor.fingerprint())
+    {
+        let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == member.fingerprint && contact.manually_verified)
+            .cloned()
+        else {
+            continue;
+        };
+        let direct_conversation = format!("{}:{}", actor.id, member.fingerprint);
+        if let Some(handle) = sessions.read().get(&direct_conversation) {
+            for group_event in &updated.events {
+                let _ = handle.send_group_event(group_event.clone());
+            }
+        } else {
+            start_async_group_event_fallback(
+                path.clone(),
+                phrase.clone(),
+                direct_conversation,
+                updated.events.clone(),
+                event_sender,
+            );
+            runtime::connect(actor.detached_copy(), contact, event_tx.clone());
+        }
+        notified += 1;
+    }
+    notice.set(format!(
+        "Groupe mis à jour · événement signé transmis à {notified} membre(s)."
+    ));
+}
+
 fn accept_group_invitation(
     group_id: String,
     path: PathBuf,
@@ -3362,8 +4077,41 @@ fn sync_group_on_ready(
                 sender_public_key: identity.public_key().to_vec(),
                 timestamp: message.timestamp,
                 text: message.text,
+                has_attachment: data.attachments.iter().any(|attachment| {
+                    attachment.conversation == format!("group:{}", group.group_id)
+                        && attachment.message_id == delivery.message_id
+                }),
             };
-            if handle.send_group_message(outgoing).is_ok()
+            let mut delivered = handle.send_group_message(outgoing).is_ok();
+            if delivered
+                && let Some(attachment) = data.attachments.iter().find(|attachment| {
+                    attachment.conversation == format!("group:{}", delivery.group_id)
+                        && attachment.message_id == delivery.message_id
+                })
+            {
+                match attachments::load_encrypted_chunks(
+                    &attachments::attachment_sidecar_path(path),
+                    &attachment.manifest,
+                ) {
+                    Ok(chunks) => {
+                        for chunk in chunks {
+                            if handle
+                                .send_attachment_chunk(
+                                    delivery.message_id.clone(),
+                                    attachment.manifest.clone(),
+                                    chunk,
+                                )
+                                .is_err()
+                            {
+                                delivered = false;
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => delivered = false,
+                }
+            }
+            if delivered
                 && let Some(saved) = data.group_deliveries.iter_mut().find(|saved| {
                     saved.group_id == delivery.group_id && saved.message_id == delivery.message_id
                 })
@@ -3708,6 +4456,66 @@ const CSS: &str = include_str!("../assets/theme.css");
 #[cfg(test)]
 mod vault_manager_tests {
     use super::*;
+
+    #[test]
+    fn incoming_image_is_saved_and_acked_only_after_all_chunks_authenticate() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_path = directory.path().join("receiver.akrat");
+        let identity = Identity::generate("Receiver".into()).unwrap();
+        let conversation = format!("{}:remote", identity.id);
+        let mut data = VaultData::default();
+        data.identities.push(identity);
+        save_vault(&vault_path, &mut data, "test passphrase").unwrap();
+        let message_id = runtime::message_id().unwrap();
+        let (manifest, chunks) = attachments::encrypt_image(
+            include_bytes!("../assets/akrat-logo.png"),
+            message_id.clone(),
+            message_id.clone(),
+            "remote:receiver".into(),
+            "logo.png",
+        )
+        .unwrap();
+        assert!(chunks.len() > 1);
+        for chunk in &chunks[..chunks.len() - 1] {
+            assert!(
+                store_incoming_attachment_chunk(
+                    &vault_path,
+                    "test passphrase",
+                    &conversation,
+                    &message_id,
+                    manifest.clone(),
+                    chunk.clone(),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let complete = store_incoming_attachment_chunk(
+            &vault_path,
+            "test passphrase",
+            &conversation,
+            &message_id,
+            manifest.clone(),
+            chunks.last().unwrap().clone(),
+        )
+        .unwrap()
+        .expect("complete image");
+        assert_eq!(complete.attachments.len(), 1);
+        assert!(complete.messages.iter().any(|message| {
+            message.id == message_id && message.conversation == conversation && !message.outgoing
+        }));
+        let restored = attachments::load_encrypted_chunks(
+            &attachments::attachment_sidecar_path(&vault_path),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            attachments::decrypt_image(&manifest, &restored)
+                .unwrap()
+                .len(),
+            manifest.plaintext_size as usize
+        );
+    }
 
     #[test]
     fn generated_name_has_one_extension_and_rejects_invalid_names() {

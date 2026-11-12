@@ -488,6 +488,8 @@ pub struct GroupMessage {
     pub sender_public_key: Vec<u8>,
     pub timestamp: u64,
     pub text: String,
+    #[serde(default)]
+    pub has_attachment: bool,
 }
 
 impl GroupMessage {
@@ -1497,8 +1499,7 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
     for attachment in &data.attachments {
         attachments::validate_manifest(&attachment.manifest)
             .map_err(|_| AkratError::InvalidVault)?;
-        if attachment.conversation != attachment.manifest.conversation_id
-            || attachment.message_id != attachment.manifest.message_id
+        if attachment.message_id != attachment.manifest.message_id
             || !attachment_ids.insert(attachment.manifest.attachment_id.as_str())
             || !data.messages.iter().any(|message| {
                 message.conversation == attachment.conversation
@@ -1932,6 +1933,7 @@ mod tests {
             sender_public_key: bob.public_key().to_vec(),
             timestamp: 1,
             text: "sent before removal".into(),
+            has_attachment: false,
         };
         assert!(historical.validate_for(&state, bob.public_key()));
         let after_removal = GroupMessage {

@@ -159,6 +159,16 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
 .group-field-label { margin-top: 3px; color: var(--muted); font: 700 10px var(--mono); text-transform: uppercase; letter-spacing: .06em; }
 .group-contact-choice { display: flex; align-items: center; gap: 8px; padding: 5px 2px; color: var(--text); font-size: 12px; }
 .group-contact-choice input { accent-color: var(--accent); }
+.group-admin-panel { margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; background: #ffffff04; }
+.group-admin-panel > summary { color: var(--muted); cursor: pointer; font: 700 10px var(--mono); letter-spacing: .04em; }
+.group-admin-rename, .group-admin-member { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.group-admin-rename { margin: 12px 0 8px; }
+.group-admin-rename input { flex: 1; min-width: 0; min-height: 34px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--panel); }
+.group-admin-members { display: grid; gap: 7px; margin: 10px 0; }
+.group-admin-member { flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.group-admin-member > div { display: grid; gap: 3px; }
+.group-admin-member span { color: var(--muted); font-size: 10px; }
+.danger { color: #ff9b91; }
 .group-delivery-list { display: grid; gap: 5px; margin: 6px 0; }
 .group-delivery-list > div { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
 .group-delivery-list strong { color: var(--accent-soft); font: 650 10px var(--mono); }
@@ -332,3 +342,8 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
   .composer button { min-width: 80px; }
   .toast { bottom: calc(74px + env(safe-area-inset-bottom)); max-width: calc(100vw - 28px); font-size: 12px; }
 }
+
+.attachment-picker { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); cursor: pointer; }
+.attachment-picker input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.message-attachment { display: block; max-width: min(100%, 560px); max-height: 520px; object-fit: contain; border-radius: 12px; margin: 8px 0; }
+@media (max-width: 760px) { .message-attachment { max-width: 100%; max-height: 52vh; } }
