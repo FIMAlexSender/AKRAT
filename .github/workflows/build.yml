@@ -27,7 +27,7 @@ jobs:
             app: target/release/akrat-desktop
             cli: target/release/akrat
             mailbox: target/release/akrat-mailbox
-    runs-on: [self-hosted, Linux, X64, ${{ matrix.os }}]
+    runs-on: [self-hosted, Linux, X64, "${{ matrix.os }}"]
     steps:
       - uses: actions/checkout@v6
 
