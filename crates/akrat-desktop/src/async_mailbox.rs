@@ -1,7 +1,8 @@
 use akrat_core::{
     AsyncOutboxItem, AsyncProtocolState, DeliveryActor, DeliveryEvent, DeliveryEventKind,
-    DeliveryState, Identity, MailboxInbox, MailboxRoute, PendingRecipientReceipt, StoredMessage,
-    VaultData, async_crypto, load_vault, save_vault,
+    DeliveryState, GroupChange, GroupEvent, GroupEventOutboxRef, GroupMessage,
+    GroupRecipientStatus, GroupState, Identity, MailboxInbox, MailboxRoute,
+    PendingRecipientReceipt, StoredMessage, VaultData, async_crypto, load_vault, save_vault,
 };
 use akrat_mailbox::server::{self, Request, Response};
 use base64::Engine;
@@ -34,6 +35,10 @@ struct AsyncPlaintext {
     sender_public_key: Vec<u8>,
     recipient_public_key: Vec<u8>,
     text: String,
+    #[serde(default)]
+    group_event: Option<GroupEvent>,
+    #[serde(default)]
+    group_message: Option<GroupMessage>,
 }
 
 pub async fn send(
@@ -41,6 +46,52 @@ pub async fn send(
     passphrase: String,
     conversation: String,
     message_id: String,
+) -> Result<(), String> {
+    send_application(path, passphrase, conversation, message_id, None, None).await
+}
+
+pub async fn send_group_event(
+    path: PathBuf,
+    passphrase: String,
+    conversation: String,
+    message_id: String,
+    event: GroupEvent,
+) -> Result<(), String> {
+    send_application(
+        path,
+        passphrase,
+        conversation,
+        message_id,
+        Some(event),
+        None,
+    )
+    .await
+}
+
+pub async fn send_group_message(
+    path: PathBuf,
+    passphrase: String,
+    conversation: String,
+    message: GroupMessage,
+) -> Result<(), String> {
+    send_application(
+        path,
+        passphrase,
+        conversation,
+        message.message_id.clone(),
+        None,
+        Some(message),
+    )
+    .await
+}
+
+async fn send_application(
+    path: PathBuf,
+    passphrase: String,
+    conversation: String,
+    message_id: String,
+    group_event: Option<GroupEvent>,
+    group_message: Option<GroupMessage>,
 ) -> Result<(), String> {
     let mut data = load_vault(&path, &passphrase).map_err(|e| e.to_string())?;
     let (identity_id, fingerprint) = conversation
@@ -56,20 +107,24 @@ pub async fn send(
         .contacts
         .iter()
         .find(|c| c.fingerprint == fingerprint && c.manually_verified)
-        .ok_or("verified contact not found")?;
+        .ok_or("verified contact not found")?
+        .clone();
     let route = contact
         .mailbox_route
         .clone()
         .ok_or("no asynchronous mailbox configured for this contact")?;
     let mut routes = vec![route];
     routes.extend(contact.mailbox_replicas.iter().cloned());
-    let message_text = data
-        .messages
-        .iter()
-        .find(|m| m.conversation == conversation && m.id == message_id && m.outgoing)
-        .ok_or("outgoing message not found")?
-        .text
-        .clone();
+    let message_text = if group_message.is_some() || group_event.is_some() {
+        String::new()
+    } else {
+        data.messages
+            .iter()
+            .find(|m| m.conversation == conversation && m.id == message_id && m.outgoing)
+            .ok_or("outgoing message not found")?
+            .text
+            .clone()
+    };
     let envelope = if let Some(item) = data
         .async_outbox
         .iter()
@@ -100,6 +155,8 @@ pub async fn send(
             sender_public_key: identity.public_key().to_vec(),
             recipient_public_key: contact.public_key.clone(),
             text: message_text,
+            group_event: group_event.clone(),
+            group_message: group_message.clone(),
         })
         .map_err(|e| e.to_string())?;
         let (ciphertext, next_state) = async_crypto::encrypt(
@@ -136,6 +193,11 @@ pub async fn send(
             conversation: conversation.clone(),
             message_id: message_id.clone(),
             envelope: envelope.clone(),
+            group_event: group_event.as_ref().map(|event| GroupEventOutboxRef {
+                group_id: event.group_id.clone(),
+                sequence: event.sequence,
+                event_sha256: event.digest().unwrap_or_default(),
+            }),
         });
         save_vault(&path, &mut data, &passphrase).map_err(|e| e.to_string())?;
         envelope
@@ -220,6 +282,28 @@ pub async fn send(
             "dépôt impossible sur les Mailbox autorisées : {}",
             failures.join("; ")
         ));
+    }
+    if let Some(group_message) = group_message {
+        if let Some(delivery) = data.group_deliveries.iter_mut().find(|delivery| {
+            delivery.group_id == group_message.group_id
+                && delivery.message_id == group_message.message_id
+        }) && let Some(recipient) = delivery
+            .recipients
+            .iter_mut()
+            .find(|recipient| recipient.fingerprint == contact.fingerprint)
+            && recipient.status != GroupRecipientStatus::Received
+        {
+            recipient.status = GroupRecipientStatus::Deposited;
+            recipient.updated_at = now();
+        }
+        if let Some(message) = data.messages.iter_mut().find(|message| {
+            message.conversation == format!("group:{}", group_message.group_id)
+                && message.id == group_message.message_id
+                && message.outgoing
+                && message.delivery != DeliveryState::Acknowledged
+        }) {
+            message.delivery = DeliveryState::MailboxStored;
+        }
     }
     save_vault(&path, &mut data, &passphrase).map_err(|e| e.to_string())?;
     Ok(())
@@ -338,21 +422,18 @@ pub async fn poll_inbox(
         let conversation = format!("{}:{}", identity.id, contact.fingerprint);
         let ciphertext_digest = hex::encode(Sha256::digest(&bytes));
         if let Some(existing) = data.messages.iter().find(|message| {
-            message.conversation == conversation
-                && message.id == item.message_id
+            message.id == item.message_id
                 && !message.outgoing
+                && message.received_ciphertext_sha256.as_deref() == Some(ciphertext_digest.as_str())
         }) {
-            if existing.received_ciphertext_sha256.as_deref() == Some(ciphertext_digest.as_str())
-                && !existing.delivery_events.iter().any(|event| {
-                    event.kind == DeliveryEventKind::RecipientConfirmed
-                        && event.actor_name.as_deref()
-                            == Some(format!("{} · {}", identity.name, inbox.mailbox_id).as_str())
-                })
-                && !data.pending_recipient_receipts.iter().any(|pending| {
-                    pending.mailbox_id == inbox.mailbox_id
-                        && pending.receipt.message_id == item.message_id
-                })
-            {
+            if !existing.delivery_events.iter().any(|event| {
+                event.kind == DeliveryEventKind::RecipientConfirmed
+                    && event.actor_name.as_deref()
+                        == Some(format!("{} · {}", identity.name, inbox.mailbox_id).as_str())
+            }) && !data.pending_recipient_receipts.iter().any(|pending| {
+                pending.mailbox_id == inbox.mailbox_id
+                    && pending.receipt.message_id == item.message_id
+            }) {
                 let receipt = match async_crypto::RecipientReceipt::create(
                     &identity,
                     &contact.public_key,
@@ -396,7 +477,71 @@ pub async fn poll_inbox(
         {
             continue;
         }
-        let text = payload.text;
+        if payload.group_event.is_some() && payload.group_message.is_some() {
+            continue;
+        }
+        let mut stored_conversation = conversation.clone();
+        let mut stored_text = payload.text.clone();
+        let mut stored_timestamp = item.accepted_at;
+        if let Some(event) = payload.group_event.as_ref() {
+            let group_index = data
+                .groups
+                .iter()
+                .position(|group| group.group_id == event.group_id);
+            let applied = if let Some(index) = group_index {
+                let group = &mut data.groups[index];
+                if event.sequence <= group.sequence {
+                    group
+                        .events
+                        .get(event.sequence as usize)
+                        .and_then(|existing| existing.digest().ok())
+                        .as_deref()
+                        == event.digest().ok().as_deref()
+                } else {
+                    group.apply(event).is_ok() && group.validate().is_ok()
+                }
+            } else if matches!(&event.change, GroupChange::Create { .. }) {
+                match GroupState::from_creation(event) {
+                    Ok(group) => {
+                        data.groups.push(group);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if !applied {
+                continue;
+            }
+            stored_text.clear();
+        }
+        if let Some(group_message) = payload.group_message.as_ref() {
+            let Some(group) = data
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_message.group_id)
+            else {
+                continue;
+            };
+            if !group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+                || !group_message.validate_for(group, &contact.public_key)
+            {
+                continue;
+            }
+            stored_conversation = format!("group:{}", group_message.group_id);
+            stored_text = group_message.text.clone();
+            stored_timestamp = group_message.timestamp;
+        }
+        if payload.group_event.is_none()
+            && payload.group_message.is_none()
+            && stored_text.is_empty()
+        {
+            continue;
+        }
         let receipt = match async_crypto::RecipientReceipt::create(
             &identity,
             &contact.public_key,
@@ -423,39 +568,54 @@ pub async fn poll_inbox(
                 .push(pending_receipt.clone());
         }
         upsert_state(&mut data, &identity.id, next_state);
-        data.messages.push(StoredMessage {
-            conversation,
-            id: item.message_id.clone(),
-            outgoing: false,
-            text,
-            delivery: DeliveryState::Received,
-            timestamp: item.accepted_at,
-            received_ciphertext_sha256: Some(ciphertext_digest),
-            delivery_events: vec![
-                DeliveryEvent {
-                    timestamp: now(),
-                    kind: DeliveryEventKind::Retrieved,
-                    actor: DeliveryActor::Mailbox,
-                    actor_fingerprint: Some(hex::encode(Sha256::digest(
-                        &inbox.server_signing_public_key,
-                    ))),
-                    actor_name: Some(format!("Mailbox {}", inbox.mailbox_id)),
-                    receipt_sha256: None,
-                    receipt_bytes: None,
-                    verified: false,
-                },
-                DeliveryEvent {
+        if payload.group_event.is_none() {
+            let mut message = StoredMessage {
+                conversation: stored_conversation,
+                id: item.message_id.clone(),
+                outgoing: false,
+                text: stored_text,
+                delivery: DeliveryState::Received,
+                timestamp: stored_timestamp,
+                received_ciphertext_sha256: Some(ciphertext_digest),
+                delivery_events: vec![
+                    DeliveryEvent {
+                        timestamp: now(),
+                        kind: DeliveryEventKind::Retrieved,
+                        actor: DeliveryActor::Mailbox,
+                        actor_fingerprint: Some(hex::encode(Sha256::digest(
+                            &inbox.server_signing_public_key,
+                        ))),
+                        actor_name: Some(format!("Mailbox {}", inbox.mailbox_id)),
+                        receipt_sha256: None,
+                        receipt_bytes: None,
+                        verified: false,
+                    },
+                    DeliveryEvent {
+                        timestamp: now(),
+                        kind: DeliveryEventKind::AuthenticatedAndSaved,
+                        actor: DeliveryActor::RecipientClient,
+                        actor_fingerprint: Some(identity.fingerprint()),
+                        actor_name: Some(identity.name.clone()),
+                        receipt_sha256: None,
+                        receipt_bytes: None,
+                        verified: true,
+                    },
+                ],
+            };
+            if payload.group_message.is_some() {
+                message.record_delivery_event(DeliveryEvent {
                     timestamp: now(),
                     kind: DeliveryEventKind::AuthenticatedAndSaved,
                     actor: DeliveryActor::RecipientClient,
-                    actor_fingerprint: Some(identity.fingerprint()),
-                    actor_name: Some(identity.name.clone()),
+                    actor_fingerprint: Some(contact.fingerprint.clone()),
+                    actor_name: Some(contact.name.clone()),
                     receipt_sha256: None,
                     receipt_bytes: None,
                     verified: true,
-                },
-            ],
-        });
+                });
+            }
+            data.messages.push(message);
+        }
         save_vault(&path, &mut data, &passphrase).map_err(|e| e.to_string())?;
         if send_recipient_receipt(&mut channel, &pending_receipt)
             .await
@@ -590,11 +750,19 @@ pub async fn poll_delivery_receipt(
                         actor: DeliveryActor::RecipientClient,
                         actor_fingerprint: Some(contact.fingerprint.clone()),
                         actor_name: Some(format!("{} · {}", contact.name, route.mailbox_id)),
-                        receipt_sha256: Some(receipt_digest),
-                        receipt_bytes: Some(receipt_bytes),
+                        receipt_sha256: Some(receipt_digest.clone()),
+                        receipt_bytes: Some(receipt_bytes.clone()),
                         verified: true,
                     });
                 }
+                mark_group_receipt(
+                    &mut data,
+                    &contact,
+                    &message_id,
+                    receipt.received_at,
+                    &receipt_digest,
+                    &receipt_bytes,
+                );
                 data.async_outbox.retain(|item| {
                     !(item.conversation == conversation && item.message_id == message_id)
                 });
@@ -718,6 +886,57 @@ fn record_recipient_confirmation(
         });
     }
     Ok(())
+}
+
+fn mark_group_receipt(
+    data: &mut VaultData,
+    contact: &akrat_core::Contact,
+    message_id: &str,
+    timestamp: u64,
+    receipt_digest: &str,
+    receipt_bytes: &[u8],
+) {
+    let mut fully_received = false;
+    for delivery in data
+        .group_deliveries
+        .iter_mut()
+        .filter(|delivery| delivery.message_id == message_id)
+    {
+        if let Some(recipient) = delivery
+            .recipients
+            .iter_mut()
+            .find(|recipient| recipient.fingerprint == contact.fingerprint)
+        {
+            recipient.status = GroupRecipientStatus::Received;
+            recipient.updated_at = timestamp;
+            fully_received = delivery
+                .recipients
+                .iter()
+                .all(|recipient| recipient.status == GroupRecipientStatus::Received);
+        }
+    }
+    for message in data.messages.iter_mut().filter(|message| {
+        message.id == message_id && message.outgoing && message.conversation.starts_with("group:")
+    }) {
+        if !message.delivery_events.iter().any(|event| {
+            event.kind == DeliveryEventKind::RecipientConfirmed
+                && event.actor_fingerprint.as_deref() == Some(contact.fingerprint.as_str())
+        }) {
+            message.record_delivery_event(DeliveryEvent {
+                timestamp,
+                kind: DeliveryEventKind::RecipientConfirmed,
+                actor: DeliveryActor::RecipientClient,
+                actor_fingerprint: Some(contact.fingerprint.clone()),
+                actor_name: Some(contact.name.clone()),
+                receipt_sha256: Some(receipt_digest.to_owned()),
+                receipt_bytes: Some(receipt_bytes.to_vec()),
+                verified: true,
+            });
+        }
+        if fully_received {
+            message.delivery = DeliveryState::Acknowledged;
+        }
+    }
 }
 
 async fn fetch_bundle(
@@ -875,7 +1094,11 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use akrat_core::{Contact, MailboxInbox, MailboxRoute};
+    use akrat_core::{
+        Contact, GroupChange, GroupEvent, GroupMember, GroupMessage, GroupMessageDelivery,
+        GroupRecipientDelivery, GroupRecipientStatus, GroupRole, GroupState, MailboxInbox,
+        MailboxRoute,
+    };
     use akrat_mailbox::{ServerSigner, Store, server::ServerConfig};
     use std::net::{SocketAddr, TcpListener as StdTcpListener};
     use std::process::{Child, Command, Stdio};
@@ -885,6 +1108,7 @@ mod tests {
     const MESSAGE_ID: &str = "d35a4b0c0ffee123";
     const EXPIRED_MESSAGE_ID: &str = "d35a4b0c0ffee124";
     const PARTIAL_RETRY_MESSAGE_ID: &str = "d35a4b0c0ffee125";
+    const GROUP_MESSAGE_ID: &str = "d35a4b0c0ffee126";
 
     struct ServerProcess(Child);
 
@@ -1100,6 +1324,75 @@ mod tests {
         )
         .await
         .expect("publish Bob pre-keys to the replica Mailbox");
+        let creation = GroupEvent::signed(
+            &alice,
+            "offline-group".into(),
+            0,
+            0,
+            None,
+            GroupChange::Create {
+                name: "Offline group".into(),
+                creator_name: "Alice".into(),
+            },
+        )
+        .expect("group creation event");
+        let mut group = GroupState::from_creation(&creation).expect("group creation");
+        let invite = GroupEvent::signed(
+            &alice,
+            "offline-group".into(),
+            1,
+            0,
+            Some(group.last_event_sha256.clone()),
+            GroupChange::Invite {
+                member: GroupMember {
+                    fingerprint: bob.fingerprint(),
+                    public_key: bob.public_key().to_vec(),
+                    display_name: "Bob".into(),
+                    role: GroupRole::Member,
+                    accepted: false,
+                },
+            },
+        )
+        .expect("group invite event");
+        group.apply(&invite).expect("apply group invite");
+        let acceptance = GroupEvent::signed(
+            &bob,
+            "offline-group".into(),
+            2,
+            1,
+            Some(group.last_event_sha256.clone()),
+            GroupChange::Accept,
+        )
+        .expect("group acceptance event");
+        group.apply(&acceptance).expect("apply group acceptance");
+        alice_data.groups.push(group.clone());
+        let group_conversation = "group:offline-group".to_string();
+        alice_data.messages.push(StoredMessage {
+            conversation: group_conversation.clone(),
+            id: GROUP_MESSAGE_ID.into(),
+            outgoing: true,
+            text: "**Image caption follows**".into(),
+            delivery: DeliveryState::Queued,
+            timestamp: now(),
+            delivery_events: Vec::new(),
+            received_ciphertext_sha256: None,
+        });
+        alice_data.group_deliveries.push(GroupMessageDelivery {
+            group_id: group.group_id.clone(),
+            message_id: GROUP_MESSAGE_ID.into(),
+            epoch: group.epoch,
+            sequence: group.sequence,
+            recipients: vec![GroupRecipientDelivery {
+                fingerprint: bob.fingerprint(),
+                status: GroupRecipientStatus::Pending,
+                updated_at: now(),
+            }],
+        });
+        save_vault(&alice_vault, &mut alice_data, PHRASE).expect("persist offline group");
+        let mut bob_stored =
+            load_vault(&bob_vault, PHRASE).expect("reload Bob after bundle publication");
+        bob_stored.groups.push(group.clone());
+        save_vault(&bob_vault, &mut bob_stored, PHRASE).expect("persist Bob group state");
         send(
             alice_vault.clone(),
             PHRASE.into(),
@@ -1108,6 +1401,24 @@ mod tests {
         )
         .await
         .expect("deposit asynchronous message");
+        load_vault(&alice_vault, PHRASE).expect("reload Alice vault before group deposit");
+        send_group_message(
+            alice_vault.clone(),
+            PHRASE.into(),
+            conversation.clone(),
+            GroupMessage {
+                version: 1,
+                group_id: group.group_id.clone(),
+                epoch: group.epoch,
+                sequence: group.sequence,
+                message_id: GROUP_MESSAGE_ID.into(),
+                sender_public_key: alice.public_key().to_vec(),
+                timestamp: now(),
+                text: "**Group delivery**\n\n| Peer | State |\n|---|---|\n| Bob | offline |".into(),
+            },
+        )
+        .await
+        .expect("deposit encrypted group message");
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload Alice vault");
         assert_eq!(
             alice_data.messages[0].delivery,
@@ -1124,7 +1435,11 @@ mod tests {
                 && event.verified
                 && event.receipt_bytes.is_some()
         }));
-        assert_eq!(alice_data.async_outbox.len(), 1);
+        assert_eq!(alice_data.async_outbox.len(), 2);
+        assert_eq!(
+            alice_data.group_deliveries[0].recipients[0].status,
+            GroupRecipientStatus::Deposited
+        );
         assert_eq!(
             alice_data.messages[0]
                 .delivery_events
@@ -1142,7 +1457,7 @@ mod tests {
         )
         .await
         .expect("receive from the surviving replica after the primary is stopped");
-        assert_eq!(received, 1);
+        assert_eq!(received, 2);
         assert!(matches!(
             poll_delivery_receipt(
                 alice_vault.clone(),
@@ -1152,6 +1467,17 @@ mod tests {
             )
             .await
             .expect("verify Bob's receipt from the surviving replica"),
+            DeliveryPoll::Delivered
+        ));
+        assert!(matches!(
+            poll_delivery_receipt(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                GROUP_MESSAGE_ID.into()
+            )
+            .await
+            .expect("verify group receipt"),
             DeliveryPoll::Delivered
         ));
 
@@ -1178,8 +1504,15 @@ mod tests {
         assert_eq!(duplicate, 0);
         let bob_data = load_vault(&bob_vault, PHRASE).expect("reload Bob vault");
         assert_eq!(bob_data.mailbox_inboxes[0].server_key_generation, 2);
-        assert_eq!(bob_data.messages.len(), 1);
+        assert_eq!(bob_data.messages.len(), 2);
         assert_eq!(bob_data.messages[0].text, message);
+        assert!(
+            bob_data
+                .messages
+                .iter()
+                .any(|message| message.conversation == group_conversation
+                    && message.text.contains("Group delivery"))
+        );
         assert!(
             bob_data.messages[0]
                 .delivery_events
@@ -1213,6 +1546,19 @@ mod tests {
         assert_eq!(mailbox_message_count(address2, &alice, &config2).await, 0);
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload delivered Alice vault");
         assert_eq!(alice_data.messages[0].delivery, DeliveryState::Acknowledged);
+        assert_eq!(
+            alice_data.group_deliveries[0].recipients[0].status,
+            GroupRecipientStatus::Received
+        );
+        assert_eq!(
+            alice_data
+                .messages
+                .iter()
+                .find(|message| message.id == GROUP_MESSAGE_ID)
+                .unwrap()
+                .delivery,
+            DeliveryState::Acknowledged
+        );
         assert!(alice_data.messages[0].delivery_events.iter().any(|event| {
             event.kind == DeliveryEventKind::RecipientConfirmed
                 && event.verified

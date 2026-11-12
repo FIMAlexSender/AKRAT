@@ -1,5 +1,5 @@
 use akrat_core::network::{self, SecureChannel};
-use akrat_core::{Contact, DeliveryState, Identity, StoredMessage};
+use akrat_core::{Contact, DeliveryState, GroupEvent, GroupMessage, Identity, StoredMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,6 +36,33 @@ impl SessionHandle {
             .map_err(|_| "La session est fermée".to_string())
     }
 
+    pub fn send_group_event(&self, event: GroupEvent) -> Result<(), String> {
+        self.commands
+            .send(SessionCommand::GroupEvent(event))
+            .map_err(|_| "La session est fermée".to_string())
+    }
+
+    pub fn send_group_message(&self, message: GroupMessage) -> Result<(), String> {
+        self.commands
+            .send(SessionCommand::GroupMessage(message))
+            .map_err(|_| "La session est fermée".to_string())
+    }
+
+    pub fn acknowledge_group_message(
+        &self,
+        group_id: String,
+        message_id: String,
+        recipient_public_key: Vec<u8>,
+    ) -> Result<(), String> {
+        self.commands
+            .send(SessionCommand::GroupAcknowledgement {
+                group_id,
+                message_id,
+                recipient_public_key,
+            })
+            .map_err(|_| "La session est fermée".to_string())
+    }
+
     pub fn acknowledge(&self, id: String) -> Result<(), String> {
         self.commands
             .send(SessionCommand::Acknowledge { id })
@@ -48,8 +75,20 @@ impl SessionHandle {
 }
 
 enum SessionCommand {
-    Text { id: String, text: String },
-    Acknowledge { id: String },
+    Text {
+        id: String,
+        text: String,
+    },
+    GroupEvent(GroupEvent),
+    GroupMessage(GroupMessage),
+    GroupAcknowledgement {
+        group_id: String,
+        message_id: String,
+        recipient_public_key: Vec<u8>,
+    },
+    Acknowledge {
+        id: String,
+    },
     Close,
 }
 
@@ -70,6 +109,20 @@ pub enum UiEvent {
         id: String,
         text: String,
     },
+    IncomingGroupEvent {
+        conversation: String,
+        event: GroupEvent,
+    },
+    IncomingGroupMessage {
+        conversation: String,
+        message: GroupMessage,
+    },
+    IncomingGroupAcknowledgement {
+        conversation: String,
+        group_id: String,
+        message_id: String,
+        recipient_public_key: Vec<u8>,
+    },
     Acknowledged {
         conversation: String,
         id: String,
@@ -87,8 +140,24 @@ pub enum UiEvent {
 
 #[derive(Serialize, Deserialize)]
 enum WireMessage {
-    Text { id: String, text: String },
-    Acknowledgement { id: String },
+    Text {
+        id: String,
+        text: String,
+    },
+    GroupEvent {
+        event: GroupEvent,
+    },
+    GroupMessage {
+        message: GroupMessage,
+    },
+    GroupAcknowledgement {
+        group_id: String,
+        message_id: String,
+        recipient_public_key: Vec<u8>,
+    },
+    Acknowledgement {
+        id: String,
+    },
     Close,
 }
 
@@ -591,6 +660,18 @@ async fn start_session<S>(
                     let result = sender.lock().await.send(&packet).await;
                     match result { Ok(()) => { let _ = events.send(UiEvent::Transmitted { conversation: conversation.clone(), id }); }, Err(error) => { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; } }
                 }
+                Some(SessionCommand::GroupEvent(event)) => {
+                    let packet = match serde_json::to_vec(&WireMessage::GroupEvent { event }) { Ok(packet) => packet, Err(_) => continue };
+                    if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
+                }
+                Some(SessionCommand::GroupMessage(message)) => {
+                    let packet = match serde_json::to_vec(&WireMessage::GroupMessage { message }) { Ok(packet) => packet, Err(_) => continue };
+                    if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
+                }
+                Some(SessionCommand::GroupAcknowledgement { group_id, message_id, recipient_public_key }) => {
+                    let packet = match serde_json::to_vec(&WireMessage::GroupAcknowledgement { group_id, message_id, recipient_public_key }) { Ok(packet) => packet, Err(_) => continue };
+                    if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
+                }
                 Some(SessionCommand::Acknowledge { id }) => {
                     let packet = match serde_json::to_vec(&WireMessage::Acknowledgement { id }) { Ok(packet) => packet, Err(_) => continue };
                     if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
@@ -611,6 +692,15 @@ async fn start_session<S>(
                     Ok(WireMessage::Text { id, text }) => {
                         let _ = events.send(UiEvent::Trace("Paquet reçu · authentification AEAD et déchiffrement réussis".into()));
                         let _ = events.send(UiEvent::Incoming { conversation: conversation.clone(), id, text });
+                    }
+                    Ok(WireMessage::GroupEvent { event }) => {
+                        let _ = events.send(UiEvent::IncomingGroupEvent { conversation: conversation.clone(), event });
+                    }
+                    Ok(WireMessage::GroupMessage { message }) => {
+                        let _ = events.send(UiEvent::IncomingGroupMessage { conversation: conversation.clone(), message });
+                    }
+                    Ok(WireMessage::GroupAcknowledgement { group_id, message_id, recipient_public_key }) => {
+                        let _ = events.send(UiEvent::IncomingGroupAcknowledgement { conversation: conversation.clone(), group_id, message_id, recipient_public_key });
                     }
                     Ok(WireMessage::Acknowledgement { id }) => { let _ = events.send(UiEvent::Acknowledged { conversation: conversation.clone(), id }); }
                     Ok(WireMessage::Close) => { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: "Le pair a fermé la session".into() }); return; }
@@ -691,8 +781,10 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
 #[cfg(test)]
 mod tests {
     use super::{SessionHandle, UiEvent, next_retry_delay, start_session};
-    use akrat_core::Identity;
     use akrat_core::network;
+    use akrat_core::{
+        GroupChange, GroupEvent, GroupMember, GroupMessage, GroupRole, GroupState, Identity,
+    };
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -711,6 +803,49 @@ mod tests {
     async fn session_actor_delivers_messages_and_authenticated_acknowledgements() {
         let alice = Identity::generate("Alice UI test".into()).expect("Alice identity");
         let bob = Identity::generate("Bob UI test".into()).expect("Bob identity");
+        let alice_public_key = alice.public_key().to_vec();
+        let bob_public_key = bob.public_key().to_vec();
+        let creation = GroupEvent::signed(
+            &alice,
+            "group-transport".into(),
+            0,
+            0,
+            None,
+            GroupChange::Create {
+                name: "Transport".into(),
+                creator_name: "Alice".into(),
+            },
+        )
+        .expect("create event");
+        let mut group = GroupState::from_creation(&creation).expect("create group");
+        let invitation = GroupEvent::signed(
+            &alice,
+            "group-transport".into(),
+            1,
+            0,
+            Some(group.last_event_sha256.clone()),
+            GroupChange::Invite {
+                member: GroupMember {
+                    fingerprint: bob.fingerprint(),
+                    public_key: bob_public_key.clone(),
+                    display_name: "Bob".into(),
+                    role: GroupRole::Member,
+                    accepted: false,
+                },
+            },
+        )
+        .expect("invite event");
+        group.apply(&invitation).expect("apply invite");
+        let acceptance = GroupEvent::signed(
+            &bob,
+            "group-transport".into(),
+            2,
+            1,
+            Some(group.last_event_sha256.clone()),
+            GroupChange::Accept,
+        )
+        .expect("accept event");
+        group.apply(&acceptance).expect("apply acceptance");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("listener address");
         let bob_copy = bob.detached_copy();
@@ -779,6 +914,75 @@ mod tests {
         .await
         .expect("acknowledgement timeout");
         assert!(matches!(acknowledged, UiEvent::Acknowledged { ref id, .. } if id == "message-1"));
+        alice
+            .send_group_event(creation)
+            .expect("send group creation");
+        alice
+            .send_group_event(invitation)
+            .expect("send group invitation");
+        alice
+            .send_group_event(acceptance)
+            .expect("send group acceptance");
+        for expected_sequence in 0..3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = bob_rx.recv().await.expect("group event");
+                    if matches!(event, UiEvent::IncomingGroupEvent { .. }) {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("group event timeout");
+            assert!(
+                matches!(event, UiEvent::IncomingGroupEvent { ref event, .. } if event.sequence == expected_sequence)
+            );
+        }
+        let group_message = GroupMessage {
+            version: 1,
+            group_id: "group-transport".into(),
+            epoch: 1,
+            sequence: 2,
+            message_id: "group-message-1".into(),
+            sender_public_key: alice_public_key,
+            timestamp: 1,
+            text: "**Group hello**".into(),
+        };
+        alice
+            .send_group_message(group_message)
+            .expect("send group payload");
+        let incoming_group = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = bob_rx.recv().await.expect("group payload");
+                if matches!(event, UiEvent::IncomingGroupMessage { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("group payload timeout");
+        assert!(
+            matches!(incoming_group, UiEvent::IncomingGroupMessage { ref message, .. } if message.message_id == "group-message-1" && message.text == "**Group hello**")
+        );
+        bob.acknowledge_group_message(
+            "group-transport".into(),
+            "group-message-1".into(),
+            bob_public_key.clone(),
+        )
+        .expect("ack group message");
+        let group_ack = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = alice_rx.recv().await.expect("group ack");
+                if matches!(event, UiEvent::IncomingGroupAcknowledgement { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("group ack timeout");
+        assert!(
+            matches!(group_ack, UiEvent::IncomingGroupAcknowledgement { ref message_id, ref recipient_public_key, .. } if message_id == "group-message-1" && recipient_public_key == &bob_public_key)
+        );
         alice.close();
         bob.close();
     }

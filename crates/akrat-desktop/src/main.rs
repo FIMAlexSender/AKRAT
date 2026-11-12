@@ -6,8 +6,13 @@ mod updater;
 mod vault_catalog;
 
 use akrat_core::{
-    Contact, DeliveryActor, DeliveryEventKind, DeliveryState, Identity, Invitation, MailboxInbox,
-    MailboxRoute, StoredMessage, VaultData, load_vault, save_vault,
+    Contact, DeliveryActor, DeliveryEvent, DeliveryEventKind, DeliveryState, GroupChange,
+    GroupEvent, GroupMember, GroupMessage, GroupMessageDelivery, GroupRecipientDelivery,
+    GroupRecipientStatus, GroupRole, GroupState, Identity, Invitation, MailboxInbox, MailboxRoute,
+    StoredMessage, VaultData, load_vault,
+    markdown::TableAlignment,
+    markdown::{MarkdownNode, MarkdownNodeKind, parse_markdown},
+    save_vault,
 };
 use dioxus::prelude::*;
 #[cfg(not(target_os = "android"))]
@@ -80,6 +85,16 @@ struct VaultCreationSignals {
     create_phrase: Signal<String>,
     confirm_phrase: Signal<String>,
     notice: Signal<String>,
+}
+
+struct GroupUiContext {
+    path: PathBuf,
+    passphrase: Signal<String>,
+    vault: Signal<Option<VaultData>>,
+    active_conversation: Signal<Option<String>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    notice: Signal<String>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
 }
 
 #[component]
@@ -238,11 +253,80 @@ fn App() -> Element {
     use_future(move || async move {
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
-            let (path_value, phrase, inboxes, queued_mailbox_messages, pending_receipts) = {
+            let (
+                path_value,
+                phrase,
+                inboxes,
+                queued_mailbox_messages,
+                pending_receipts,
+                queued_group_messages,
+                group_receipts,
+            ) = {
                 let snapshot = vault.read();
                 let Some(data) = snapshot.as_ref() else {
                     continue;
                 };
+                let mut queued_group_messages = Vec::new();
+                let mut group_receipts = Vec::new();
+                for delivery in &data.group_deliveries {
+                    let Some(group) = data
+                        .groups
+                        .iter()
+                        .find(|group| group.group_id == delivery.group_id)
+                    else {
+                        continue;
+                    };
+                    let Some(message) = data.messages.iter().find(|message| {
+                        message.conversation == format!("group:{}", delivery.group_id)
+                            && message.id == delivery.message_id
+                            && message.outgoing
+                    }) else {
+                        continue;
+                    };
+                    let Some(identity) = data.identities.iter().find(|identity| {
+                        group.members.iter().any(|member| {
+                            member.accepted && member.public_key == identity.public_key()
+                        })
+                    }) else {
+                        continue;
+                    };
+                    for recipient in &delivery.recipients {
+                        let Some(contact) = data.contacts.iter().find(|contact| {
+                            contact.fingerprint == recipient.fingerprint
+                                && contact.manually_verified
+                                && contact.mailbox_route.is_some()
+                        }) else {
+                            continue;
+                        };
+                        let direct_conversation =
+                            format!("{}:{}", identity.id, contact.fingerprint);
+                        if recipient.status == GroupRecipientStatus::Deposited {
+                            group_receipts
+                                .push((direct_conversation.clone(), delivery.message_id.clone()));
+                        }
+                        let retry_elapsed =
+                            recipient.updated_at.saturating_add(60) <= now_seconds();
+                        if group.members.iter().any(|member| {
+                            member.accepted && member.fingerprint == recipient.fingerprint
+                        }) && (recipient.status == GroupRecipientStatus::Pending
+                            || (recipient.status == GroupRecipientStatus::Sent && retry_elapsed))
+                        {
+                            queued_group_messages.push((
+                                direct_conversation,
+                                GroupMessage {
+                                    version: 1,
+                                    group_id: group.group_id.clone(),
+                                    epoch: group.epoch,
+                                    sequence: group.sequence,
+                                    message_id: message.id.clone(),
+                                    sender_public_key: identity.public_key().to_vec(),
+                                    timestamp: message.timestamp,
+                                    text: message.text.clone(),
+                                },
+                            ));
+                        }
+                    }
+                }
                 (
                     path.read().clone(),
                     passphrase.read().clone(),
@@ -270,10 +354,14 @@ fn App() -> Element {
                     data.messages
                         .iter()
                         .filter(|message| {
-                            message.outgoing && message.delivery == DeliveryState::MailboxStored
+                            message.outgoing
+                                && message.delivery == DeliveryState::MailboxStored
+                                && !message.conversation.starts_with("group:")
                         })
                         .map(|message| (message.conversation.clone(), message.id.clone()))
                         .collect::<Vec<_>>(),
+                    queued_group_messages,
+                    group_receipts,
                 )
             };
             let mut changed = false;
@@ -306,6 +394,34 @@ fn App() -> Element {
                     changed = true;
                 }
             }
+            for (conversation, message) in queued_group_messages {
+                if async_mailbox::send_group_message(
+                    path_value.clone(),
+                    phrase.clone(),
+                    conversation,
+                    message,
+                )
+                .await
+                .is_ok()
+                {
+                    changed = true;
+                }
+            }
+            for (conversation, message_id) in group_receipts {
+                if matches!(
+                    async_mailbox::poll_delivery_receipt(
+                        path_value.clone(),
+                        phrase.clone(),
+                        conversation,
+                        message_id
+                    )
+                    .await,
+                    Ok(async_mailbox::DeliveryPoll::Delivered
+                        | async_mailbox::DeliveryPoll::Expired)
+                ) {
+                    changed = true;
+                }
+            }
             if changed && let Ok(data) = load_vault(&path_value, &phrase) {
                 vault.set(Some(data));
             }
@@ -330,7 +446,7 @@ fn App() -> Element {
                         sessions
                             .write()
                             .insert(conversation.clone(), handle.clone());
-                        active_conversation.set(Some(conversation));
+                        active_conversation.set(Some(conversation.clone()));
                         page.set(Page::Messages);
                         push_trace(&mut trace, format!("Conversation active · {peer_name}"));
                         let phrase = passphrase.read().clone();
@@ -357,6 +473,7 @@ fn App() -> Element {
                                 }
                             }
                         }
+                        sync_group_on_ready(&vault_path, &phrase, &conversation, &handle);
                     }
                     UiEvent::Transmitted { conversation, id } => {
                         let phrase = passphrase.read().clone();
@@ -415,6 +532,85 @@ fn App() -> Element {
                                 &mut trace,
                                 "Échec de sauvegarde · aucun accusé envoyé".into(),
                             );
+                        }
+                    }
+                    UiEvent::IncomingGroupEvent {
+                        conversation,
+                        event,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        match apply_incoming_group_event(&vault_path, &phrase, &conversation, event)
+                        {
+                            Ok(data) => {
+                                broadcast_group_events(&data, &sessions.read());
+                                vault.set(Some(data));
+                                push_trace(
+                                    &mut trace,
+                                    "Événement de groupe signé · état validé et enregistré".into(),
+                                );
+                            }
+                            Err(error) => push_trace(
+                                &mut trace,
+                                format!("Événement de groupe refusé · {error}"),
+                            ),
+                        }
+                    }
+                    UiEvent::IncomingGroupMessage {
+                        conversation,
+                        message,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        match store_incoming_group_message(
+                            &vault_path,
+                            &phrase,
+                            &conversation,
+                            message.clone(),
+                        ) {
+                            Ok((data, accepted, own_public_key)) => {
+                                vault.set(Some(data));
+                                if accepted {
+                                    if let Some(handle) = sessions.read().get(&conversation) {
+                                        let _ = handle.acknowledge_group_message(
+                                            message.group_id,
+                                            message.message_id,
+                                            own_public_key,
+                                        );
+                                    }
+                                    push_trace(
+                                        &mut trace,
+                                        "Message de groupe authentifié · enregistré dans le coffre"
+                                            .into(),
+                                    );
+                                }
+                            }
+                            Err(error) => push_trace(
+                                &mut trace,
+                                format!("Message de groupe refusé · {error}"),
+                            ),
+                        }
+                    }
+                    UiEvent::IncomingGroupAcknowledgement {
+                        conversation,
+                        group_id,
+                        message_id,
+                        recipient_public_key,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        match store_group_acknowledgement(
+                            &vault_path,
+                            &phrase,
+                            &conversation,
+                            &group_id,
+                            &message_id,
+                            &recipient_public_key,
+                        ) {
+                            Ok(data) => vault.set(Some(data)),
+                            Err(error) => {
+                                push_trace(&mut trace, format!("Accusé de groupe refusé · {error}"))
+                            }
                         }
                     }
                     UiEvent::Acknowledged { conversation, id } => {
@@ -1063,14 +1259,36 @@ fn rename_vault_file(
     if destination.exists() {
         return Err("Un fichier existe déjà avec ce nom.".into());
     }
-    std::fs::rename(source, &destination)
-        .map_err(|error| format!("Renommage impossible : {error}"))?;
+    let source_sidecar = akrat_core::attachments::attachment_sidecar_path(source);
+    let destination_sidecar = akrat_core::attachments::attachment_sidecar_path(&destination);
+    if destination_sidecar.exists() {
+        return Err("Un dossier de pièces jointes existe déjà avec ce nom.".into());
+    }
+    if source_sidecar.exists() {
+        std::fs::rename(&source_sidecar, &destination_sidecar)
+            .map_err(|error| format!("Déplacement des pièces jointes impossible : {error}"))?;
+    }
+    std::fs::rename(source, &destination).map_err(|error| {
+        if source_sidecar.exists() || destination_sidecar.exists() {
+            let _ = std::fs::rename(&destination_sidecar, &source_sidecar);
+        }
+        format!("Renommage impossible : {error}")
+    })?;
     let paths = match vault_catalog::replace_and_save(default_path, source, destination.clone()) {
         Ok(paths) => paths,
         Err(error) => {
             let rollback = std::fs::rename(&destination, source);
+            let sidecar_rollback = if destination_sidecar.exists() {
+                std::fs::rename(&destination_sidecar, &source_sidecar)
+            } else {
+                Ok(())
+            };
             return Err(match rollback {
-                Ok(()) => error,
+                Ok(()) if sidecar_rollback.is_ok() => error,
+                Ok(()) => format!(
+                    "{error}. Retour des pièces jointes impossible : {}",
+                    sidecar_rollback.unwrap_err()
+                ),
                 Err(rollback_error) => format!(
                     "Catalogue non enregistré ({error}) et retour arrière impossible ({rollback_error})."
                 ),
@@ -1104,26 +1322,76 @@ fn delete_vault_file(
 }
 
 fn move_vault_to_trash(path: &Path) -> Result<(), String> {
+    let sidecar = akrat_core::attachments::attachment_sidecar_path(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let bundle = parent.join(format!(".akrat-delete-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&bundle)
+        .map_err(|error| format!("Préparation de la suppression impossible : {error}"))?;
+    let staged_vault = bundle.join("vault.akrat");
+    let staged_sidecar = bundle.join("vault.akrat.attachments");
+    std::fs::rename(path, &staged_vault).map_err(|error| {
+        let _ = std::fs::remove_dir(&bundle);
+        format!("Déplacement du coffre impossible : {error}")
+    })?;
+    if sidecar.exists()
+        && let Err(error) = std::fs::rename(&sidecar, &staged_sidecar)
+    {
+        let rollback = std::fs::rename(&staged_vault, path);
+        let _ = std::fs::remove_dir(&bundle);
+        return Err(match rollback {
+            Ok(()) => format!("Déplacement des pièces jointes impossible : {error}"),
+            Err(rollback) => format!(
+                "Déplacement des pièces jointes impossible : {error}; restauration du coffre impossible : {rollback}"
+            ),
+        });
+    }
     #[cfg(all(
         feature = "desktop",
         not(test),
         not(target_os = "android"),
         not(target_os = "ios")
     ))]
-    {
-        trash::delete(path)
-            .map_err(|error| format!("Impossible de placer le coffre dans la Corbeille : {error}"))
-    }
+    let result = trash::delete(&bundle).map_err(|error| {
+        format!("Impossible de placer le coffre et ses pièces jointes dans la Corbeille : {error}")
+    });
     #[cfg(any(
         test,
         not(feature = "desktop"),
         target_os = "android",
         target_os = "ios"
     ))]
-    {
-        std::fs::remove_file(path)
-            .map_err(|error| format!("Suppression du fichier impossible : {error}"))
+    let result = std::fs::remove_dir_all(&bundle).map_err(|error| {
+        format!("Suppression du coffre et de ses pièces jointes impossible : {error}")
+    });
+    if let Err(error) = result {
+        let sidecar_rollback = if staged_sidecar.exists() {
+            std::fs::rename(&staged_sidecar, &sidecar)
+        } else {
+            Ok(())
+        };
+        let vault_rollback = if staged_vault.exists() {
+            std::fs::rename(&staged_vault, path)
+        } else {
+            Ok(())
+        };
+        let _ = std::fs::remove_dir(&bundle);
+        return Err(match (vault_rollback, sidecar_rollback) {
+            (Ok(()), Ok(())) => error,
+            (vault_result, sidecar_result) => format!(
+                "{error}. Restauration du coffre : {}; pièces jointes : {}",
+                vault_result
+                    .err()
+                    .map_or_else(|| "réussie".into(), |value| value.to_string()),
+                sidecar_result
+                    .err()
+                    .map_or_else(|| "réussie".into(), |value| value.to_string())
+            ),
+        });
     }
+    Ok(())
 }
 
 fn apply_created_vault(
@@ -1688,7 +1956,12 @@ fn ChatPage(
     on_setup: EventHandler<MouseEvent>,
 ) -> Element {
     let stored = vault.read();
+    let mut show_group_form = use_signal(|| false);
+    let mut group_name_draft = use_signal(String::new);
+    let mut group_identity_choice = use_signal(String::new);
+    let mut group_contact_choices = use_signal(Vec::<String>::new);
     let mut conversation_items = Vec::<(String, String, String, u64, bool)>::new();
+    let mut group_contacts = Vec::<(String, String)>::new();
     if let Some(data) = stored.as_ref() {
         for identity in &data.identities {
             for contact in data
@@ -1716,6 +1989,58 @@ fn ChatPage(
                 ));
             }
         }
+        group_contacts = data
+            .contacts
+            .iter()
+            .filter(|contact| contact.manually_verified)
+            .map(|contact| (contact.fingerprint.clone(), contact.name.clone()))
+            .collect();
+        for group in data.groups.iter().filter(|group| {
+            group.members.iter().any(|member| {
+                data.identities
+                    .iter()
+                    .any(|identity| member.public_key == identity.public_key())
+            })
+        }) {
+            let key = format!("group:{}", group.group_id);
+            let latest = data
+                .messages
+                .iter()
+                .filter(|message| message.conversation == key)
+                .max_by_key(|message| message.timestamp);
+            let preview = latest
+                .map(|message| message.text.chars().take(54).collect::<String>())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} membre(s) · époque {}",
+                        group
+                            .members
+                            .iter()
+                            .filter(|member| member.accepted)
+                            .count(),
+                        group.epoch
+                    )
+                });
+            let timestamp = latest.map(|message| message.timestamp).unwrap_or_default();
+            let connected = group
+                .members
+                .iter()
+                .filter(|member| member.accepted && member.fingerprint != group.creator_fingerprint)
+                .any(|member| {
+                    data.identities.iter().any(|identity| {
+                        sessions
+                            .read()
+                            .contains_key(&format!("{}:{}", identity.id, member.fingerprint))
+                    })
+                });
+            conversation_items.push((
+                key,
+                format!("{} · Groupe", group.name),
+                preview,
+                timestamp,
+                connected,
+            ));
+        }
     }
     conversation_items.sort_by_key(|item| std::cmp::Reverse(item.3));
     let conversation = active_conversation
@@ -1735,26 +2060,75 @@ fn ChatPage(
         })
         .unwrap_or_default();
     messages.sort_by_key(|message| message.timestamp);
-    let peer_name = conversation
-        .as_ref()
-        .and_then(|key| key.split_once(':').map(|(_, fp)| fp))
-        .and_then(|fp| {
-            stored
-                .as_ref()?
-                .contacts
-                .iter()
-                .find(|c| c.fingerprint == fp)
-                .map(|c| c.name.clone())
+    let active_group_id = conversation
+        .as_deref()
+        .and_then(|key| key.strip_prefix("group:").map(str::to_string));
+    let active_group = active_group_id.as_deref().and_then(|group_id| {
+        stored
+            .as_ref()?
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+    });
+    let peer_name = active_group
+        .map(|group| group.name.clone())
+        .or_else(|| {
+            conversation
+                .as_ref()
+                .and_then(|key| key.split_once(':').map(|(_, fp)| fp))
+                .and_then(|fp| {
+                    stored
+                        .as_ref()?
+                        .contacts
+                        .iter()
+                        .find(|c| c.fingerprint == fp)
+                        .map(|c| c.name.clone())
+                })
         })
         .unwrap_or_else(|| "Conversation".into());
-    let connected = conversation
-        .as_ref()
-        .is_some_and(|key| sessions.read().contains_key(key));
+    let connected = conversation.as_ref().is_some_and(|key| {
+        if let Some(group_id) = key.strip_prefix("group:") {
+            stored
+                .as_ref()
+                .and_then(|data| data.groups.iter().find(|group| group.group_id == group_id))
+                .is_some_and(|group| {
+                    group.members.iter().any(|member| {
+                        member.accepted
+                            && stored.as_ref().is_some_and(|data| {
+                                data.identities.iter().any(|identity| {
+                                    sessions.read().contains_key(&format!(
+                                        "{}:{}",
+                                        identity.id, member.fingerprint
+                                    ))
+                                })
+                            })
+                    })
+                })
+        } else {
+            sessions.read().contains_key(key)
+        }
+    });
+    let group_pending = active_group.is_some_and(|group| {
+        stored.as_ref().is_some_and(|data| {
+            group.members.iter().any(|member| {
+                !member.accepted
+                    && data
+                        .identities
+                        .iter()
+                        .any(|identity| identity.public_key() == member.public_key)
+            })
+        })
+    });
     let connect_conversation = conversation.clone();
     let input_conversation = conversation.clone();
     let button_conversation = conversation.clone();
     let input_path = path.clone();
     let button_path = path.clone();
+    let group_create_path = path.clone();
+    let group_accept_path = path.clone();
+    let group_connect_path = path.clone();
+    let group_accept_id = active_group_id.clone();
+    let group_connect_id = active_group_id.clone();
     use_effect(move || {
         let selected = active_conversation.read().clone();
         let count = vault
@@ -1775,7 +2149,37 @@ fn ChatPage(
     rsx! {
         section { class: "chat-layout",
             aside { class: "conversation-list",
-                div { class: "conversation-list-head", strong { "Conversations" } button { class: "icon-button", title: "Ajouter un contact", onclick: on_setup, "+" } }
+                div { class: "conversation-list-head", strong { "Conversations" } div { class: "conversation-list-actions", button { class: "icon-button", title: "Ajouter un contact", onclick: on_setup, "+" } button { class: "icon-button", title: "Créer un groupe", onclick: move |_| { let next = !*show_group_form.read(); show_group_form.set(next); }, "G+" } } }
+                if *show_group_form.read() {
+                    div { class: "group-create-panel",
+                        strong { "Nouveau groupe" }
+                        input { value: "{group_name_draft}", placeholder: "Nom du groupe", oninput: move |e| group_name_draft.set(e.value()) }
+                        if let Some(data) = stored.as_ref() {
+                            label { class: "group-field-label", "Identité du groupe" }
+                            select { value: "{group_identity_choice}", onchange: move |e| group_identity_choice.set(e.value()),
+                                for identity in data.identities.iter() { option { value: "{identity.id}", "{identity.name}" } }
+                            }
+                        }
+                        label { class: "group-field-label", "Inviter des contacts vérifiés" }
+                        if group_contacts.is_empty() { p { class: "quiet", "Vérifiez d’abord un contact dans Identités & contacts." } }
+                        for (fingerprint, contact_name) in group_contacts.iter() {
+                            label { class: "group-contact-choice",
+                                input { r#type: "checkbox", checked: group_contact_choices.read().contains(fingerprint), onclick: { let fingerprint = fingerprint.clone(); move |_| { let mut choices = group_contact_choices.write(); if choices.contains(&fingerprint) { choices.retain(|choice| choice != &fingerprint); } else { choices.push(fingerprint.clone()); } } } }
+                                span { "{contact_name}" }
+                            }
+                        }
+                        button { class: "primary", onclick: move |_| {
+                            let name = group_name_draft.read().trim().to_string();
+                            let identity_id = group_identity_choice.read().clone();
+                            let selected_contacts = group_contact_choices.read().clone();
+                            if create_group_action(name, identity_id, selected_contacts, GroupUiContext { path: group_create_path.clone(), passphrase, vault, active_conversation, sessions, notice, event_sender }) {
+                                show_group_form.set(false);
+                                group_name_draft.set(String::new());
+                                group_contact_choices.set(Vec::new());
+                            }
+                        }, "Créer et inviter" }
+                    }
+                }
                 if conversation_items.is_empty() { p { class: "quiet conversation-empty", "Ajoutez puis vérifiez un contact pour commencer." } }
                 for (key, title, preview, timestamp, online) in conversation_items.iter() {
                     button {
@@ -1790,8 +2194,13 @@ fn ChatPage(
             main { class: "chat-stage",
                 if conversation.is_some() {
                     div { class: "chat-head",
-                        div { class: "chat-head-copy", div { class: "eyebrow", "MESSAGERIE CHIFFRÉE · NOISE XX" } h1 { "{peer_name}" } span { class: if connected { "verified" } else { "quiet" }, if connected { "SESSION ACTIVE" } else { "HORS LIGNE" } } }
-                        if !connected {
+                        div { class: "chat-head-copy", div { class: "eyebrow", if active_group_id.is_some() { "GROUPE · FAN-OUT CHIFFRÉ PAIRWISE" } else { "MESSAGERIE CHIFFRÉE · NOISE XX" } } h1 { "{peer_name}" } span { class: if connected { "verified" } else { "quiet" }, if connected { "MEMBRE JOIGNABLE" } else { "HORS LIGNE" } } }
+                        if active_group_id.is_some() {
+                            if group_pending {
+                                button { class: "primary compact", onclick: move |_| if let Some(id) = group_accept_id.clone() { accept_group_invitation(id, group_accept_path.clone(), passphrase, vault, sessions, event_sender, notice) }, "Accepter l’invitation" }
+                            }
+                            button { class: "secondary compact", onclick: move |_| if let Some(id) = group_connect_id.clone() { connect_group_members(id, group_connect_path.clone(), passphrase, event_sender) }, "Connecter le groupe" }
+                        } else if !connected {
                             button { class: "secondary compact", onclick: move |_| {
                                 if let Some(key) = connect_conversation.clone() {
                                     let Some((identity_id, fingerprint)) = key.split_once(':') else { notice.set("Conversation invalide.".into()); return; };
@@ -1827,10 +2236,10 @@ fn ChatPage(
                             oninput: move |e| draft.set(e.value()),
                             onkeydown: move |event| if event.key() == Key::Enter && !event.modifiers().shift() {
                                 event.prevent_default();
-                                    if let Some(key) = input_conversation.clone() { submit_message(key, draft, input_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); }
+                                    if let Some(key) = input_conversation.clone() { if key.starts_with("group:") { submit_group_message(key, draft, GroupUiContext { path: input_path.clone(), passphrase, vault, active_conversation, sessions, notice, event_sender }); } else { submit_message(key, draft, input_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); } }
                             }
                         }
-                        button { class: "primary", onclick: move |_| if let Some(key) = button_conversation.clone() { submit_message(key, draft, button_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); }, if connected { "Envoyer" } else { "Mettre en file" } }
+                        button { class: "primary", onclick: move |_| if let Some(key) = button_conversation.clone() { if key.starts_with("group:") { submit_group_message(key, draft, GroupUiContext { path: button_path.clone(), passphrase, vault, active_conversation, sessions, notice, event_sender }); } else { submit_message(key, draft, button_path.clone(), passphrase, vault, sessions, notice, trace, event_sender); } }, if connected { "Envoyer" } else { "Mettre en file" } }
                     }
                 } else {
                     div { class: "chat-empty-state",
@@ -1860,6 +2269,35 @@ fn MessageCard(
 ) -> Element {
     let short_id = message.id.chars().take(8).collect::<String>();
     let outgoing = message.outgoing;
+    let group_delivery_rows = vault
+        .read()
+        .as_ref()
+        .and_then(|data| {
+            let group_id = message.conversation.strip_prefix("group:")?;
+            let group = data
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)?;
+            let delivery = data.group_deliveries.iter().find(|delivery| {
+                delivery.group_id == group_id && delivery.message_id == message.id
+            })?;
+            Some(
+                delivery
+                    .recipients
+                    .iter()
+                    .map(|recipient| {
+                        let name = group
+                            .members
+                            .iter()
+                            .find(|member| member.fingerprint == recipient.fingerprint)
+                            .map(|member| member.display_name.clone())
+                            .unwrap_or_else(|| recipient.fingerprint.chars().take(12).collect());
+                        (name, recipient_status_label(recipient.status).to_string())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
     let status = match message.delivery {
         DeliveryState::Pending => "EN ATTENTE",
         DeliveryState::Queued => "DANS LA FILE",
@@ -1912,7 +2350,7 @@ fn MessageCard(
     };
     rsx! {
         div { class: if outgoing { "message outgoing" } else { "message incoming" },
-            p { "{message.text}" }
+            div { class: "message-markdown", MarkdownNodeView { node: parse_markdown(&message.text).unwrap_or_else(|_| MarkdownNode { kind: MarkdownNodeKind::Text(message.text.clone()), children: Vec::new() }) } }
             div { class: "message-meta", span { class: "message-time", "{format_timestamp(message.timestamp)}" } span { class: "message-status", "{status}" } }
             if outgoing && message.delivery == DeliveryState::Expired {
                 button { class: "secondary compact", onclick: move |_| {
@@ -1961,8 +2399,155 @@ fn MessageCard(
                         }
                     }
                 }
+                if !group_delivery_rows.is_empty() {
+                    h4 { class: "delivery-timeline-title", "Livraison par membre" }
+                    div { class: "group-delivery-list", for (name, status) in group_delivery_rows.iter() { div { span { "{name}" } strong { "{status}" } } } }
+                }
             }
         }
+    }
+}
+
+fn recipient_status_label(status: GroupRecipientStatus) -> &'static str {
+    match status {
+        GroupRecipientStatus::Pending => "En attente",
+        GroupRecipientStatus::Sent => "Transmis",
+        GroupRecipientStatus::Deposited => "Déposé sur Mailbox",
+        GroupRecipientStatus::Received => "Reçu",
+        GroupRecipientStatus::Unconfirmed => "Non confirmé",
+        GroupRecipientStatus::Expired => "Expiré",
+    }
+}
+
+#[component]
+fn MarkdownNodeView(node: MarkdownNode) -> Element {
+    let children = node.children;
+    match node.kind {
+        MarkdownNodeKind::Document | MarkdownNodeKind::Unsupported => {
+            rsx! { for child in children { MarkdownNodeView { node: child } } }
+        }
+        MarkdownNodeKind::Text(text) => rsx! { span { "{text}" } },
+        MarkdownNodeKind::InlineCode(text) => {
+            rsx! { code { class: "markdown-inline-code", "{text}" } }
+        }
+        MarkdownNodeKind::Paragraph => {
+            rsx! { p { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Heading(level) => match level {
+            1 => rsx! { h1 { for child in children { MarkdownNodeView { node: child } } } },
+            2 => rsx! { h2 { for child in children { MarkdownNodeView { node: child } } } },
+            3 => rsx! { h3 { for child in children { MarkdownNodeView { node: child } } } },
+            4 => rsx! { h4 { for child in children { MarkdownNodeView { node: child } } } },
+            5 => rsx! { h5 { for child in children { MarkdownNodeView { node: child } } } },
+            _ => rsx! { h6 { for child in children { MarkdownNodeView { node: child } } } },
+        },
+        MarkdownNodeKind::Quote => {
+            rsx! { blockquote { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::CodeBlock(language) => {
+            let class = language
+                .map(|value| {
+                    format!(
+                        "markdown-code language-{}",
+                        value
+                            .chars()
+                            .filter(|character| character.is_ascii_alphanumeric()
+                                || *character == '-'
+                                || *character == '_')
+                            .take(32)
+                            .collect::<String>()
+                    )
+                })
+                .unwrap_or_else(|| "markdown-code".into());
+            rsx! { pre { class: "{class}", code { for child in children { MarkdownNodeView { node: child } } } } }
+        }
+        MarkdownNodeKind::List(Some(_)) => {
+            rsx! { ol { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::List(None) => {
+            rsx! { ul { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Item => {
+            rsx! { li { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Table(alignments) => {
+            rsx! { MarkdownTableView { nodes: children, alignments } }
+        }
+        MarkdownNodeKind::TableHead => {
+            rsx! { thead { tr { for child in children { MarkdownNodeView { node: child } } } } }
+        }
+        MarkdownNodeKind::TableRow => {
+            rsx! { tr { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Emphasis => {
+            rsx! { em { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Strong => {
+            rsx! { strong { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Strike => {
+            rsx! { del { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Link(Some(url)) => {
+            rsx! { a { href: "{url}", target: "_blank", rel: "noopener noreferrer", for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::Link(None) => {
+            rsx! { span { class: "markdown-link-blocked", for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::TableCell => {
+            rsx! { td { for child in children { MarkdownNodeView { node: child } } } }
+        }
+        MarkdownNodeKind::SoftBreak => rsx! { span { " " } },
+        MarkdownNodeKind::HardBreak => rsx! { br {} },
+        MarkdownNodeKind::Rule => rsx! { hr {} },
+        MarkdownNodeKind::Task(checked) => {
+            rsx! { input { r#type: "checkbox", checked, disabled: true } }
+        }
+    }
+}
+
+#[component]
+fn MarkdownTableView(nodes: Vec<MarkdownNode>, alignments: Vec<TableAlignment>) -> Element {
+    rsx! {
+        div { class: "markdown-table-scroll",
+            table {
+                for child in nodes {
+                    match child.kind {
+                        MarkdownNodeKind::TableHead => rsx! {
+                            thead { tr {
+                                for (index, cell) in child.children.into_iter().enumerate() {
+                                    MarkdownTableCell { node: cell, alignment: alignments.get(index).copied().unwrap_or(TableAlignment::None), header: true }
+                                }
+                            } }
+                        },
+                        MarkdownNodeKind::TableRow => rsx! {
+                            tbody { tr {
+                                for (index, cell) in child.children.into_iter().enumerate() {
+                                    MarkdownTableCell { node: cell, alignment: alignments.get(index).copied().unwrap_or(TableAlignment::None), header: false }
+                                }
+                            } }
+                        },
+                        _ => rsx! { MarkdownNodeView { node: child } },
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MarkdownTableCell(node: MarkdownNode, alignment: TableAlignment, header: bool) -> Element {
+    let style = match alignment {
+        TableAlignment::None => "text-align: left",
+        TableAlignment::Left => "text-align: left",
+        TableAlignment::Center => "text-align: center",
+        TableAlignment::Right => "text-align: right",
+    };
+    let children = node.children;
+    if header {
+        rsx! { th { style: "{style}", for child in children { MarkdownNodeView { node: child } } } }
+    } else {
+        rsx! { td { style: "{style}", for child in children { MarkdownNodeView { node: child } } } }
     }
 }
 
@@ -2002,6 +2587,757 @@ fn delivery_actor_label(actor: DeliveryActor, name: Option<&str>) -> String {
 
 fn format_receipt(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn apply_incoming_group_event(
+    path: &Path,
+    passphrase: &str,
+    direct_conversation: &str,
+    event: GroupEvent,
+) -> Result<VaultData, String> {
+    let (identity_id, contact_fingerprint) = direct_conversation
+        .split_once(':')
+        .ok_or("conversation identity is invalid")?;
+    let mut data = load_vault(path, passphrase).map_err(|error| error.to_string())?;
+    let _contact = data
+        .contacts
+        .iter()
+        .find(|contact| contact.fingerprint == contact_fingerprint && contact.manually_verified)
+        .ok_or("group event arrived through an unverified contact")?;
+    let existing = data
+        .groups
+        .iter()
+        .position(|group| group.group_id == event.group_id);
+    if let Some(index) = existing {
+        let group = &mut data.groups[index];
+        if event.sequence <= group.sequence {
+            let existing_event = group
+                .events
+                .get(event.sequence as usize)
+                .ok_or("group event sequence is invalid")?;
+            if existing_event.digest().map_err(|error| error.to_string())?
+                != event.digest().map_err(|error| error.to_string())?
+            {
+                return Err("group event conflicts with the accepted history".into());
+            }
+            return Ok(data);
+        }
+        group.apply(&event).map_err(|error| error.to_string())?;
+        group.validate().map_err(|error| error.to_string())?;
+    } else {
+        let group = GroupState::from_creation(&event).map_err(|error| error.to_string())?;
+        data.groups.push(group);
+    }
+    let _ = identity_id;
+    save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
+    Ok(data)
+}
+
+fn store_incoming_group_message(
+    path: &Path,
+    passphrase: &str,
+    direct_conversation: &str,
+    incoming: GroupMessage,
+) -> Result<(VaultData, bool, Vec<u8>), String> {
+    let (identity_id, contact_fingerprint) = direct_conversation
+        .split_once(':')
+        .ok_or("conversation identity is invalid")?;
+    let mut data = load_vault(path, passphrase).map_err(|error| error.to_string())?;
+    let contact = data
+        .contacts
+        .iter()
+        .find(|contact| contact.fingerprint == contact_fingerprint && contact.manually_verified)
+        .ok_or("sender is not a verified contact")?;
+    if incoming.sender_public_key != contact.public_key {
+        return Err("sender identity does not match the authenticated P2P session".into());
+    }
+    let identity = data
+        .identities
+        .iter()
+        .find(|identity| identity.id == identity_id)
+        .ok_or("local identity was not found")?;
+    let own_key = identity.public_key().to_vec();
+    let group = data
+        .groups
+        .iter()
+        .find(|group| group.group_id == incoming.group_id)
+        .ok_or("group is unknown")?;
+    if !group
+        .members
+        .iter()
+        .any(|member| member.accepted && member.public_key == own_key)
+    {
+        return Err("local identity is not an accepted group member".into());
+    }
+    if !incoming.validate_for(group, &contact.public_key) {
+        return Err("message does not match the authenticated group epoch and membership".into());
+    }
+    let conversation = format!("group:{}", incoming.group_id);
+    let duplicate = data
+        .messages
+        .iter()
+        .any(|message| message.conversation == conversation && message.id == incoming.message_id);
+    if !duplicate {
+        let mut message =
+            runtime::received_message(conversation, incoming.message_id, incoming.text);
+        message.timestamp = incoming.timestamp;
+        message.record_delivery_event(DeliveryEvent {
+            timestamp: incoming.timestamp,
+            kind: DeliveryEventKind::AuthenticatedAndSaved,
+            actor: DeliveryActor::RecipientClient,
+            actor_fingerprint: Some(contact.fingerprint.clone()),
+            actor_name: Some(contact.name.clone()),
+            receipt_sha256: None,
+            receipt_bytes: None,
+            verified: true,
+        });
+        data.messages.push(message);
+    }
+    save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
+    Ok((data, true, own_key))
+}
+
+fn store_group_acknowledgement(
+    path: &Path,
+    passphrase: &str,
+    direct_conversation: &str,
+    group_id: &str,
+    message_id: &str,
+    recipient_public_key: &[u8],
+) -> Result<VaultData, String> {
+    let (_, contact_fingerprint) = direct_conversation
+        .split_once(':')
+        .ok_or("conversation identity is invalid")?;
+    let mut data = load_vault(path, passphrase).map_err(|error| error.to_string())?;
+    let contact = data
+        .contacts
+        .iter()
+        .find(|contact| contact.fingerprint == contact_fingerprint && contact.manually_verified)
+        .ok_or("acknowledging identity is not verified")?;
+    if contact.public_key != recipient_public_key {
+        return Err("acknowledgement identity does not match its authenticated session".into());
+    }
+    let expected = data
+        .group_deliveries
+        .iter_mut()
+        .find(|delivery| delivery.group_id == group_id && delivery.message_id == message_id)
+        .ok_or("group delivery record is unknown")?;
+    let recipient = expected
+        .recipients
+        .iter_mut()
+        .find(|recipient| recipient.fingerprint == contact_fingerprint)
+        .ok_or("this contact was not a recipient of the message")?;
+    recipient.status = GroupRecipientStatus::Received;
+    recipient.updated_at = now_seconds();
+    let fully_received = expected
+        .recipients
+        .iter()
+        .all(|recipient| recipient.status == GroupRecipientStatus::Received);
+    let stored = data
+        .messages
+        .iter_mut()
+        .find(|message| {
+            message.conversation == format!("group:{group_id}")
+                && message.id == message_id
+                && message.outgoing
+        })
+        .ok_or("group message is unknown")?;
+    if !stored.delivery_events.iter().any(|event| {
+        event.kind == DeliveryEventKind::RecipientConfirmed
+            && event.actor_fingerprint.as_deref() == Some(contact_fingerprint)
+    }) {
+        stored.record_delivery_event(DeliveryEvent {
+            timestamp: now_seconds(),
+            kind: DeliveryEventKind::RecipientConfirmed,
+            actor: DeliveryActor::RecipientClient,
+            actor_fingerprint: Some(contact.fingerprint.clone()),
+            actor_name: Some(contact.name.clone()),
+            receipt_sha256: None,
+            receipt_bytes: None,
+            verified: true,
+        });
+    }
+    stored.delivery = if fully_received {
+        DeliveryState::Acknowledged
+    } else {
+        DeliveryState::Sent
+    };
+    save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
+    Ok(data)
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn submit_group_message(conversation: String, mut draft: Signal<String>, context: GroupUiContext) {
+    let GroupUiContext {
+        path,
+        passphrase,
+        mut vault,
+        sessions,
+        mut notice,
+        event_sender,
+        ..
+    } = context;
+    let Some(group_id) = conversation.strip_prefix("group:").map(str::to_string) else {
+        return;
+    };
+    let text = draft.read().trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    if text.len() > 10 * 1024 {
+        notice.set("Message limité à 10 Kio.".into());
+        return;
+    }
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(format!("Coffre inaccessible : {error}"));
+            return;
+        }
+    };
+    let Some(group) = data.groups.iter().find(|group| group.group_id == group_id) else {
+        notice.set("Groupe introuvable.".into());
+        return;
+    };
+    let Some(identity) = data
+        .identities
+        .iter()
+        .find(|identity| {
+            group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+        })
+        .map(Identity::detached_copy)
+    else {
+        notice.set("Aucune identité locale ne participe à ce groupe.".into());
+        return;
+    };
+    let recipients = group
+        .members
+        .iter()
+        .filter(|member| member.accepted && member.fingerprint != identity.fingerprint())
+        .map(|member| GroupRecipientDelivery {
+            fingerprint: member.fingerprint.clone(),
+            status: GroupRecipientStatus::Pending,
+            updated_at: now_seconds(),
+        })
+        .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        notice.set("Ce groupe n’a pas encore d’autre membre accepté.".into());
+        return;
+    }
+    let group_state = group.clone();
+    let id = match runtime::message_id() {
+        Ok(id) => id,
+        Err(error) => {
+            notice.set(error);
+            return;
+        }
+    };
+    let mut message = runtime::new_message(conversation, id.clone(), text);
+    message.delivery = DeliveryState::Queued;
+    data.messages.push(message);
+    data.group_deliveries.push(GroupMessageDelivery {
+        group_id: group_id.clone(),
+        message_id: id,
+        epoch: group_state.epoch,
+        sequence: group_state.sequence,
+        recipients,
+    });
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(format!("Sauvegarde impossible : {error}"));
+        return;
+    }
+    vault.set(load_vault(&path, &phrase).ok());
+    draft.set(String::new());
+    let event_tx = event_sender.read().clone();
+    for member in group_state
+        .members
+        .iter()
+        .filter(|member| member.accepted && member.fingerprint != identity.fingerprint())
+    {
+        let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == member.fingerprint && contact.manually_verified)
+            .cloned()
+        else {
+            continue;
+        };
+        let direct_conversation = format!("{}:{}", identity.id, member.fingerprint);
+        if let Some(handle) = sessions.read().get(&direct_conversation) {
+            sync_group_on_ready(&path, &phrase, &direct_conversation, handle);
+        } else {
+            runtime::connect(identity.detached_copy(), contact, event_tx.clone());
+        }
+    }
+    notice.set("Message enregistré · envoi pairwise lancé vers les membres acceptés.".into());
+}
+
+fn create_group_action(
+    name: String,
+    selected_identity: String,
+    selected_contacts: Vec<String>,
+    context: GroupUiContext,
+) -> bool {
+    let GroupUiContext {
+        path,
+        passphrase,
+        mut vault,
+        mut active_conversation,
+        event_sender,
+        mut notice,
+        sessions,
+    } = context;
+    if name.trim().is_empty() || selected_contacts.is_empty() {
+        notice.set("Indiquez un nom et sélectionnez au moins un contact vérifié.".into());
+        return false;
+    }
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(format!("Coffre inaccessible : {error}"));
+            return false;
+        }
+    };
+    let identity = data
+        .identities
+        .iter()
+        .find(|identity| identity.id == selected_identity)
+        .or_else(|| data.identities.first())
+        .map(Identity::detached_copy);
+    let Some(identity) = identity else {
+        notice.set("Créez d’abord une identité.".into());
+        return false;
+    };
+    let group_id = match runtime::message_id() {
+        Ok(id) => id,
+        Err(error) => {
+            notice.set(error);
+            return false;
+        }
+    };
+    let creation = match GroupEvent::signed(
+        &identity,
+        group_id.clone(),
+        0,
+        0,
+        None,
+        GroupChange::Create {
+            name: name.trim().to_string(),
+            creator_name: identity.name.clone(),
+        },
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            notice.set(error.to_string());
+            return false;
+        }
+    };
+    let mut group = match GroupState::from_creation(&creation) {
+        Ok(group) => group,
+        Err(error) => {
+            notice.set(error.to_string());
+            return false;
+        }
+    };
+    for fingerprint in selected_contacts {
+        let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == fingerprint && contact.manually_verified)
+        else {
+            continue;
+        };
+        if group
+            .members
+            .iter()
+            .any(|member| member.fingerprint == contact.fingerprint)
+        {
+            continue;
+        }
+        let member = GroupMember {
+            fingerprint: contact.fingerprint.clone(),
+            public_key: contact.public_key.clone(),
+            display_name: contact.name.clone(),
+            role: GroupRole::Member,
+            accepted: false,
+        };
+        let invite = match GroupEvent::signed(
+            &identity,
+            group_id.clone(),
+            group.sequence.saturating_add(1),
+            group.epoch,
+            Some(group.last_event_sha256.clone()),
+            GroupChange::Invite { member },
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                notice.set(error.to_string());
+                return false;
+            }
+        };
+        if group.apply(&invite).is_err() {
+            notice.set("Impossible d’appliquer l’invitation signée.".into());
+            return false;
+        }
+    }
+    if group.members.len() < 2 {
+        notice.set("Sélectionnez au moins un contact distinct de l’identité propriétaire.".into());
+        return false;
+    }
+    data.groups.push(group);
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(format!("Enregistrement impossible : {error}"));
+        return false;
+    }
+    vault.set(load_vault(&path, &phrase).ok());
+    active_conversation.set(Some(format!("group:{group_id}")));
+    notice.set("Groupe créé · invitations en attente de connexion des contacts.".into());
+    let event_tx = event_sender.read().clone();
+    for member in data
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .into_iter()
+        .flat_map(|group| group.members.iter().filter(|member| !member.accepted))
+    {
+        if let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == member.fingerprint)
+            .cloned()
+        {
+            let direct_conversation = format!("{}:{}", identity.id, member.fingerprint);
+            if let Some(handle) = sessions.read().get(&direct_conversation) {
+                for event in data
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .into_iter()
+                    .flat_map(|group| group.events.iter())
+                {
+                    let _ = handle.send_group_event(event.clone());
+                }
+            } else {
+                start_async_group_event_fallback(
+                    path.clone(),
+                    phrase.clone(),
+                    direct_conversation,
+                    data.groups
+                        .iter()
+                        .find(|group| group.group_id == group_id)
+                        .map(|group| group.events.clone())
+                        .unwrap_or_default(),
+                    event_sender,
+                );
+            }
+            runtime::connect(identity.detached_copy(), contact, event_tx.clone());
+        }
+    }
+    true
+}
+
+fn connect_group_members(
+    group_id: String,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) {
+    let phrase = passphrase.read().clone();
+    let Ok(data) = load_vault(&path, &phrase) else {
+        return;
+    };
+    let Some(group) = data.groups.iter().find(|group| group.group_id == group_id) else {
+        return;
+    };
+    let Some(identity) = data
+        .identities
+        .iter()
+        .find(|identity| {
+            group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+        })
+        .map(Identity::detached_copy)
+    else {
+        return;
+    };
+    let event_tx = event_sender.read().clone();
+    for member in group
+        .members
+        .iter()
+        .filter(|member| member.fingerprint != identity.fingerprint())
+    {
+        if let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == member.fingerprint && contact.manually_verified)
+            .cloned()
+        {
+            runtime::connect(identity.detached_copy(), contact, event_tx.clone());
+        }
+    }
+}
+
+fn accept_group_invitation(
+    group_id: String,
+    path: PathBuf,
+    passphrase: Signal<String>,
+    mut vault: Signal<Option<VaultData>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+    mut notice: Signal<String>,
+) {
+    let phrase = passphrase.read().clone();
+    let mut data = match load_vault(&path, &phrase) {
+        Ok(data) => data,
+        Err(error) => {
+            notice.set(error.to_string());
+            return;
+        }
+    };
+    let group_index = match data
+        .groups
+        .iter()
+        .position(|group| group.group_id == group_id)
+    {
+        Some(index) => index,
+        None => return,
+    };
+    let identity = data
+        .identities
+        .iter()
+        .find(|identity| {
+            data.groups[group_index]
+                .members
+                .iter()
+                .any(|member| !member.accepted && member.public_key == identity.public_key())
+        })
+        .map(Identity::detached_copy);
+    let Some(identity) = identity else {
+        notice.set("Aucune invitation ne correspond à une identité locale.".into());
+        return;
+    };
+    let group = &mut data.groups[group_index];
+    let event = match GroupEvent::signed(
+        &identity,
+        group.group_id.clone(),
+        group.sequence.saturating_add(1),
+        group.epoch.saturating_add(1),
+        Some(group.last_event_sha256.clone()),
+        GroupChange::Accept,
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            notice.set(error.to_string());
+            return;
+        }
+    };
+    if let Err(error) = group.apply(&event) {
+        notice.set(error.to_string());
+        return;
+    }
+    let group_snapshot = group.clone();
+    if let Err(error) = save_vault(&path, &mut data, &phrase) {
+        notice.set(error.to_string());
+        return;
+    }
+    vault.set(load_vault(&path, &phrase).ok());
+    let event_tx = event_sender.read().clone();
+    for member in group_snapshot
+        .members
+        .iter()
+        .filter(|member| member.accepted && member.fingerprint != identity.fingerprint())
+    {
+        let Some(contact) = data
+            .contacts
+            .iter()
+            .find(|contact| contact.fingerprint == member.fingerprint)
+            .cloned()
+        else {
+            continue;
+        };
+        let key = format!("{}:{}", identity.id, member.fingerprint);
+        if let Some(handle) = sessions.read().get(&key) {
+            for group_event in &group_snapshot.events {
+                let _ = handle.send_group_event(group_event.clone());
+            }
+        } else {
+            start_async_group_event_fallback(
+                path.clone(),
+                phrase.clone(),
+                key,
+                group_snapshot.events.clone(),
+                event_sender,
+            );
+            runtime::connect(identity.detached_copy(), contact, event_tx.clone());
+        }
+    }
+    notice.set("Invitation acceptée · rotation d’époque appliquée.".into());
+}
+
+fn sync_group_on_ready(
+    path: &Path,
+    passphrase: &str,
+    direct_conversation: &str,
+    handle: &SessionHandle,
+) {
+    let Ok((identity_id, contact_fingerprint)) = direct_conversation.split_once(':').ok_or(())
+    else {
+        return;
+    };
+    let Ok(mut data) = load_vault(path, passphrase) else {
+        return;
+    };
+    let Some(identity) = data
+        .identities
+        .iter()
+        .find(|identity| identity.id == identity_id)
+        .map(Identity::detached_copy)
+    else {
+        return;
+    };
+    for group in data.groups.iter().filter(|group| {
+        group
+            .members
+            .iter()
+            .any(|member| member.fingerprint == contact_fingerprint)
+    }) {
+        for event in &group.events {
+            let _ = handle.send_group_event(event.clone());
+        }
+        let is_accepted = group
+            .members
+            .iter()
+            .any(|member| member.fingerprint == contact_fingerprint && member.accepted);
+        if !is_accepted {
+            continue;
+        }
+        let pending = data
+            .group_deliveries
+            .iter()
+            .filter(|delivery| {
+                delivery.group_id == group.group_id
+                    && delivery.recipients.iter().any(|recipient| {
+                        recipient.fingerprint == contact_fingerprint
+                            && recipient.status != GroupRecipientStatus::Received
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for delivery in pending {
+            let Some(message) = data
+                .messages
+                .iter()
+                .find(|message| {
+                    message.conversation == format!("group:{}", delivery.group_id)
+                        && message.id == delivery.message_id
+                        && message.outgoing
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let outgoing = GroupMessage {
+                version: 1,
+                group_id: group.group_id.clone(),
+                epoch: group.epoch,
+                sequence: group.sequence,
+                message_id: message.id.clone(),
+                sender_public_key: identity.public_key().to_vec(),
+                timestamp: message.timestamp,
+                text: message.text,
+            };
+            if handle.send_group_message(outgoing).is_ok()
+                && let Some(saved) = data.group_deliveries.iter_mut().find(|saved| {
+                    saved.group_id == delivery.group_id && saved.message_id == delivery.message_id
+                })
+                && let Some(recipient) = saved
+                    .recipients
+                    .iter_mut()
+                    .find(|recipient| recipient.fingerprint == contact_fingerprint)
+            {
+                recipient.status = GroupRecipientStatus::Sent;
+                recipient.updated_at = now_seconds();
+            }
+        }
+    }
+    let _ = save_vault(path, &mut data, passphrase);
+}
+
+fn broadcast_group_events(data: &VaultData, sessions: &HashMap<String, SessionHandle>) {
+    for group in &data.groups {
+        for identity in data.identities.iter().filter(|identity| {
+            group
+                .members
+                .iter()
+                .any(|member| member.accepted && member.public_key == identity.public_key())
+        }) {
+            for member in group
+                .members
+                .iter()
+                .filter(|member| member.fingerprint != identity.fingerprint())
+            {
+                let key = format!("{}:{}", identity.id, member.fingerprint);
+                if let Some(handle) = sessions.get(&key) {
+                    for event in &group.events {
+                        let _ = handle.send_group_event(event.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn start_async_group_event_fallback(
+    path: PathBuf,
+    passphrase: String,
+    direct_conversation: String,
+    events: Vec<GroupEvent>,
+    event_sender: Signal<mpsc::UnboundedSender<UiEvent>>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let sender = event_sender.read().clone();
+    spawn(async move {
+        let mut last_id = String::new();
+        let mut failure = None;
+        for event in events {
+            let Ok(message_id) = runtime::message_id() else {
+                failure = Some("identifiant d’invitation impossible".to_string());
+                break;
+            };
+            last_id = message_id.clone();
+            if let Err(error) = async_mailbox::send_group_event(
+                path.clone(),
+                passphrase.clone(),
+                direct_conversation.clone(),
+                message_id,
+                event,
+            )
+            .await
+            {
+                failure = Some(error);
+            }
+        }
+        let _ = sender.send(UiEvent::MailboxResult {
+            conversation: direct_conversation,
+            id: last_id,
+            result: failure.map_or(Ok(()), Err),
+        });
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2342,6 +3678,9 @@ mod vault_manager_tests {
             phrase,
         )
         .unwrap();
+        let original_sidecar = akrat_core::attachments::attachment_sidecar_path(&original);
+        std::fs::create_dir_all(&original_sidecar).unwrap();
+        std::fs::write(original_sidecar.join("encrypted.chunk"), b"ciphertext").unwrap();
         let bytes_before = std::fs::read(&original).unwrap();
         let id_before = vault_catalog::id_for_path(&default, &original).unwrap();
 
@@ -2350,6 +3689,12 @@ mod vault_manager_tests {
         assert!(!original.exists());
         assert_eq!(std::fs::read(&renamed).unwrap(), bytes_before);
         assert!(load_vault(&renamed, phrase).is_ok());
+        let renamed_sidecar = akrat_core::attachments::attachment_sidecar_path(&renamed);
+        assert_eq!(
+            std::fs::read(renamed_sidecar.join("encrypted.chunk")).unwrap(),
+            b"ciphertext"
+        );
+        assert!(!original_sidecar.exists());
         let id_after = vault_catalog::id_for_path(&default, &renamed).unwrap();
         assert_eq!(id_before, id_after);
 
@@ -2358,6 +3703,7 @@ mod vault_manager_tests {
         let remaining = delete_vault_file(&default, &paths, &renamed, phrase).unwrap();
         assert!(remaining.is_empty());
         assert!(!renamed.exists());
+        assert!(!renamed_sidecar.exists());
     }
 
     #[test]

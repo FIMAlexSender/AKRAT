@@ -1,4 +1,6 @@
 pub mod async_crypto;
+pub mod attachments;
+pub mod markdown;
 pub mod network;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -181,6 +183,16 @@ pub struct AsyncOutboxItem {
     pub conversation: String,
     pub message_id: String,
     pub envelope: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_event: Option<GroupEventOutboxRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupEventOutboxRef {
+    pub group_id: String,
+    pub sequence: u64,
+    pub event_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -345,11 +357,412 @@ pub struct VaultData {
     pub identities: Vec<Identity>,
     pub contacts: Vec<Contact>,
     pub messages: Vec<StoredMessage>,
+    pub groups: Vec<GroupState>,
+    pub group_deliveries: Vec<GroupMessageDelivery>,
+    pub attachments: Vec<StoredAttachment>,
     pub conversation_keys: Vec<ConversationKey>,
     pub async_protocol_states: Vec<AsyncProtocolState>,
     pub mailbox_inboxes: Vec<MailboxInbox>,
     pub async_outbox: Vec<AsyncOutboxItem>,
     pub pending_recipient_receipts: Vec<PendingRecipientReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAttachment {
+    pub conversation: String,
+    pub message_id: String,
+    pub manifest: attachments::AttachmentManifest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMessageDelivery {
+    pub group_id: String,
+    pub message_id: String,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub recipients: Vec<GroupRecipientDelivery>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRecipientStatus {
+    Pending,
+    Sent,
+    Deposited,
+    Received,
+    Unconfirmed,
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRecipientDelivery {
+    pub fingerprint: String,
+    pub status: GroupRecipientStatus,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMember {
+    pub fingerprint: String,
+    pub public_key: Vec<u8>,
+    pub display_name: String,
+    pub role: GroupRole,
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GroupChange {
+    Create {
+        name: String,
+        creator_name: String,
+    },
+    Invite {
+        member: GroupMember,
+    },
+    Accept,
+    Remove {
+        fingerprint: String,
+    },
+    Leave,
+    Rename {
+        name: String,
+    },
+    SetRole {
+        fingerprint: String,
+        role: GroupRole,
+    },
+    Rotate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupEvent {
+    pub version: u8,
+    pub group_id: String,
+    pub sequence: u64,
+    pub epoch: u64,
+    pub previous_event_sha256: Option<String>,
+    pub actor_public_key: Vec<u8>,
+    pub change: GroupChange,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupState {
+    pub protocol_version: u8,
+    pub group_id: String,
+    pub name: String,
+    pub creator_fingerprint: String,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub last_event_sha256: String,
+    pub members: Vec<GroupMember>,
+    pub events: Vec<GroupEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMessage {
+    pub version: u8,
+    pub group_id: String,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub message_id: String,
+    pub sender_public_key: Vec<u8>,
+    pub timestamp: u64,
+    pub text: String,
+}
+
+impl GroupMessage {
+    pub fn validate_for(&self, group: &GroupState, authenticated_peer_key: &[u8]) -> bool {
+        self.version == 1
+            && self.group_id == group.group_id
+            && self.epoch == group.epoch
+            && self.sequence == group.sequence
+            && self.sender_public_key == authenticated_peer_key
+            && self.message_id.len() <= 128
+            && !self.message_id.is_empty()
+            && self.text.len() <= 10 * 1024
+            && group.members.iter().any(|member| {
+                member.accepted
+                    && member.public_key == self.sender_public_key
+                    && member.fingerprint == fingerprint(&self.sender_public_key)
+            })
+    }
+}
+
+#[derive(Serialize)]
+struct GroupEventStatement<'a> {
+    domain: &'static str,
+    version: u8,
+    group_id: &'a str,
+    sequence: u64,
+    epoch: u64,
+    previous_event_sha256: &'a Option<String>,
+    actor_public_key: &'a [u8],
+    change: &'a GroupChange,
+}
+
+impl GroupEvent {
+    pub fn signed(
+        identity: &Identity,
+        group_id: String,
+        sequence: u64,
+        epoch: u64,
+        previous_event_sha256: Option<String>,
+        change: GroupChange,
+    ) -> Result<Self, AkratError> {
+        let mut event = Self {
+            version: 1,
+            group_id,
+            sequence,
+            epoch,
+            previous_event_sha256,
+            actor_public_key: identity.public_key().to_vec(),
+            change,
+            signature: Vec::new(),
+        };
+        let statement = event.signing_bytes()?;
+        event.signature = async_crypto::sign_identity_statement(identity, &statement)
+            .map_err(|_| AkratError::InvalidIdentity)?;
+        Ok(event)
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, AkratError> {
+        serde_json::to_vec(&GroupEventStatement {
+            domain: "AKRAT/group-event/v1",
+            version: self.version,
+            group_id: &self.group_id,
+            sequence: self.sequence,
+            epoch: self.epoch,
+            previous_event_sha256: &self.previous_event_sha256,
+            actor_public_key: &self.actor_public_key,
+            change: &self.change,
+        })
+        .map_err(|_| AkratError::Serialization)
+    }
+
+    pub fn digest(&self) -> Result<String, AkratError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| AkratError::Serialization)?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    pub fn verify_signature(&self) -> Result<bool, AkratError> {
+        if self.version != 1 || self.actor_public_key.len() != 32 || self.signature.is_empty() {
+            return Ok(false);
+        }
+        async_crypto::verify_identity_statement(
+            &self.actor_public_key,
+            &self.signing_bytes()?,
+            &self.signature,
+        )
+        .map_err(|_| AkratError::InvalidIdentity)
+    }
+}
+
+impl GroupState {
+    pub fn from_creation(event: &GroupEvent) -> Result<Self, AkratError> {
+        if event.sequence != 0
+            || event.epoch != 0
+            || event.previous_event_sha256.is_some()
+            || !event.verify_signature()?
+            || event.group_id.is_empty()
+            || event.group_id.len() > 128
+        {
+            return Err(AkratError::InvalidVault);
+        }
+        let GroupChange::Create { name, creator_name } = &event.change else {
+            return Err(AkratError::InvalidVault);
+        };
+        validate_group_name(name)?;
+        if creator_name.trim().is_empty() || creator_name.len() > 128 {
+            return Err(AkratError::InvalidVault);
+        }
+        let fingerprint = fingerprint(&event.actor_public_key);
+        let state = Self {
+            protocol_version: 1,
+            group_id: event.group_id.clone(),
+            name: name.clone(),
+            creator_fingerprint: fingerprint.clone(),
+            epoch: 0,
+            sequence: 0,
+            last_event_sha256: event.digest()?,
+            members: vec![GroupMember {
+                fingerprint,
+                public_key: event.actor_public_key.clone(),
+                display_name: creator_name.clone(),
+                role: GroupRole::Owner,
+                accepted: true,
+            }],
+            events: vec![event.clone()],
+        };
+        Ok(state)
+    }
+
+    pub fn apply(&mut self, event: &GroupEvent) -> Result<(), AkratError> {
+        if event.version != 1
+            || event.group_id != self.group_id
+            || Some(event.sequence) != self.sequence.checked_add(1)
+            || event.previous_event_sha256.as_deref() != Some(self.last_event_sha256.as_str())
+            || !event.verify_signature()?
+        {
+            return Err(AkratError::InvalidVault);
+        }
+        let actor_fingerprint = fingerprint(&event.actor_public_key);
+        let actor = self
+            .members
+            .iter()
+            .find(|member| {
+                member.fingerprint == actor_fingerprint
+                    && (member.accepted || matches!(&event.change, GroupChange::Accept))
+            })
+            .cloned()
+            .ok_or(AkratError::InvalidVault)?;
+        let owner_or_admin = matches!(actor.role, GroupRole::Owner | GroupRole::Admin);
+        let epoch_change = matches!(
+            &event.change,
+            GroupChange::Accept
+                | GroupChange::Remove { .. }
+                | GroupChange::Leave
+                | GroupChange::Rotate
+        );
+        let expected_epoch = self
+            .epoch
+            .checked_add(u64::from(epoch_change))
+            .ok_or(AkratError::InvalidVault)?;
+        if event.epoch != expected_epoch {
+            return Err(AkratError::InvalidVault);
+        }
+        match &event.change {
+            GroupChange::Create { .. } => return Err(AkratError::InvalidVault),
+            GroupChange::Invite { member } => {
+                if !owner_or_admin
+                    || member.public_key.len() != 32
+                    || member.fingerprint != fingerprint(&member.public_key)
+                    || member.accepted
+                    || member.role != GroupRole::Member
+                    || member.display_name.len() > 128
+                    || self
+                        .members
+                        .iter()
+                        .any(|existing| existing.fingerprint == member.fingerprint)
+                    || self.members.len() >= 256
+                {
+                    return Err(AkratError::InvalidVault);
+                }
+                self.members.push(member.clone());
+            }
+            GroupChange::Accept => {
+                let member = self
+                    .members
+                    .iter_mut()
+                    .find(|item| item.fingerprint == actor_fingerprint)
+                    .ok_or(AkratError::InvalidVault)?;
+                if member.accepted || member.role != GroupRole::Member {
+                    return Err(AkratError::InvalidVault);
+                }
+                member.accepted = true;
+            }
+            GroupChange::Remove {
+                fingerprint: target,
+            } => {
+                if !owner_or_admin
+                    || target == &self.creator_fingerprint
+                    || target == &actor_fingerprint
+                {
+                    return Err(AkratError::InvalidVault);
+                }
+                let position = self
+                    .members
+                    .iter()
+                    .position(|member| &member.fingerprint == target)
+                    .ok_or(AkratError::InvalidVault)?;
+                if self.members[position].role == GroupRole::Owner {
+                    return Err(AkratError::InvalidVault);
+                }
+                self.members.remove(position);
+            }
+            GroupChange::Leave => {
+                if actor.role == GroupRole::Owner {
+                    return Err(AkratError::InvalidVault);
+                }
+                self.members
+                    .retain(|member| member.fingerprint != actor_fingerprint);
+            }
+            GroupChange::Rename { name } => {
+                if !owner_or_admin {
+                    return Err(AkratError::InvalidVault);
+                }
+                validate_group_name(name)?;
+                self.name = name.clone();
+            }
+            GroupChange::SetRole {
+                fingerprint: target,
+                role,
+            } => {
+                if actor.role != GroupRole::Owner
+                    || target == &self.creator_fingerprint
+                    || *role == GroupRole::Owner
+                {
+                    return Err(AkratError::InvalidVault);
+                }
+                let member = self
+                    .members
+                    .iter_mut()
+                    .find(|member| &member.fingerprint == target && member.accepted)
+                    .ok_or(AkratError::InvalidVault)?;
+                member.role = *role;
+            }
+            GroupChange::Rotate => {
+                if !owner_or_admin {
+                    return Err(AkratError::InvalidVault);
+                }
+            }
+        }
+        self.epoch = event.epoch;
+        self.sequence = event.sequence;
+        self.last_event_sha256 = event.digest()?;
+        if self.events.len() >= 10_000 {
+            return Err(AkratError::InvalidVault);
+        }
+        self.events.push(event.clone());
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), AkratError> {
+        if self.protocol_version != 1 || self.events.is_empty() || self.events.len() > 10_000 {
+            return Err(AkratError::InvalidVault);
+        }
+        let mut replayed = Self::from_creation(&self.events[0])?;
+        for event in self.events.iter().skip(1) {
+            replayed.apply(event)?;
+        }
+        if replayed != *self {
+            return Err(AkratError::InvalidVault);
+        }
+        Ok(())
+    }
+}
+
+fn validate_group_name(name: &str) -> Result<(), AkratError> {
+    if name.trim().is_empty() || name.len() > 128 {
+        return Err(AkratError::InvalidVault);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -397,6 +810,22 @@ struct StoredMessageCiphertext {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredGroupCiphertext {
+    group_id: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAttachmentCiphertext {
+    conversation: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VaultStorageV2 {
     identities: Vec<Identity>,
     contacts: Vec<Contact>,
@@ -411,6 +840,12 @@ struct VaultStorageV3 {
     contacts: Vec<Contact>,
     conversation_keys: Vec<StoredConversationKey>,
     messages: Vec<StoredMessageCiphertext>,
+    #[serde(default)]
+    groups: Vec<StoredGroupCiphertext>,
+    #[serde(default)]
+    group_deliveries: Vec<GroupMessageDelivery>,
+    #[serde(default)]
+    attachments: Vec<StoredAttachmentCiphertext>,
     async_protocol_states: Vec<AsyncProtocolState>,
     #[serde(default)]
     mailbox_inboxes: Vec<MailboxInbox>,
@@ -481,6 +916,69 @@ pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result
             ciphertext,
         });
     }
+    let mut encrypted_groups = Vec::with_capacity(data.groups.len());
+    for group in &data.groups {
+        let key_name = group_conversation_key(&group.group_id);
+        let group_key = data
+            .conversation_keys
+            .iter()
+            .find(|key| key.conversation == key_name)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(group_key.key.as_ref())
+            .map_err(|_| AkratError::Authentication)?;
+        let mut group_nonce = [0u8; 12];
+        getrandom::fill(&mut group_nonce).map_err(|_| AkratError::Random)?;
+        let mut plaintext =
+            Zeroizing::new(serde_json::to_vec(group).map_err(|_| AkratError::Serialization)?);
+        let nonce =
+            Nonce::try_from(group_nonce.as_slice()).map_err(|_| AkratError::Authentication)?;
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: key_name.as_bytes(),
+                },
+            )
+            .map_err(|_| AkratError::Authentication)?;
+        plaintext.zeroize();
+        encrypted_groups.push(StoredGroupCiphertext {
+            group_id: group.group_id.clone(),
+            nonce: group_nonce.to_vec(),
+            ciphertext,
+        });
+    }
+    let mut encrypted_attachments = Vec::with_capacity(data.attachments.len());
+    for attachment in &data.attachments {
+        let conversation_key = data
+            .conversation_keys
+            .iter()
+            .find(|key| key.conversation == attachment.conversation)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(conversation_key.key.as_ref())
+            .map_err(|_| AkratError::Authentication)?;
+        let mut attachment_nonce = [0u8; 12];
+        getrandom::fill(&mut attachment_nonce).map_err(|_| AkratError::Random)?;
+        let mut plaintext =
+            Zeroizing::new(serde_json::to_vec(attachment).map_err(|_| AkratError::Serialization)?);
+        let nonce =
+            Nonce::try_from(attachment_nonce.as_slice()).map_err(|_| AkratError::Authentication)?;
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: attachment.conversation.as_bytes(),
+                },
+            )
+            .map_err(|_| AkratError::Authentication)?;
+        plaintext.zeroize();
+        encrypted_attachments.push(StoredAttachmentCiphertext {
+            conversation: attachment.conversation.clone(),
+            nonce: attachment_nonce.to_vec(),
+            ciphertext,
+        });
+    }
     let storage = VaultStorageV3 {
         identities: data
             .identities
@@ -497,6 +995,9 @@ pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result
             })
             .collect(),
         messages: encrypted_messages,
+        groups: encrypted_groups,
+        group_deliveries: data.group_deliveries.clone(),
+        attachments: encrypted_attachments,
         async_protocol_states: data.async_protocol_states.clone(),
         mailbox_inboxes: data.mailbox_inboxes.clone(),
         async_outbox: data.async_outbox.clone(),
@@ -560,6 +1061,9 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
             identities: legacy.identities,
             contacts: legacy.contacts,
             messages: legacy.messages,
+            groups: Vec::new(),
+            group_deliveries: Vec::new(),
+            attachments: Vec::new(),
             conversation_keys: Vec::new(),
             async_protocol_states: Vec::new(),
             mailbox_inboxes: Vec::new(),
@@ -580,6 +1084,9 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
             contacts: old.contacts,
             conversation_keys: old.conversation_keys,
             messages: old.messages,
+            groups: Vec::new(),
+            group_deliveries: Vec::new(),
+            attachments: Vec::new(),
             async_protocol_states: Vec::new(),
             mailbox_inboxes: Vec::new(),
             async_outbox: Vec::new(),
@@ -632,10 +1139,78 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
         }
         messages.push(message);
     }
+    let mut groups = Vec::with_capacity(stored.groups.len());
+    for stored_group in stored.groups {
+        if stored_group.nonce.len() != 12 {
+            return Err(AkratError::InvalidVault);
+        }
+        let key_name = group_conversation_key(&stored_group.group_id);
+        let group_key = conversation_keys
+            .iter()
+            .find(|key| key.conversation == key_name)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(group_key.key.as_ref())
+            .map_err(|_| AkratError::InvalidVault)?;
+        let nonce =
+            Nonce::try_from(stored_group.nonce.as_slice()).map_err(|_| AkratError::InvalidVault)?;
+        let mut group_plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: stored_group.ciphertext.as_slice(),
+                        aad: key_name.as_bytes(),
+                    },
+                )
+                .map_err(|_| AkratError::Authentication)?,
+        );
+        let group: GroupState =
+            serde_json::from_slice(&group_plaintext).map_err(|_| AkratError::InvalidVault)?;
+        group_plaintext.zeroize();
+        if group.group_id != stored_group.group_id {
+            return Err(AkratError::InvalidVault);
+        }
+        groups.push(group);
+    }
+    let mut attachments = Vec::with_capacity(stored.attachments.len());
+    for stored_attachment in stored.attachments {
+        if stored_attachment.nonce.len() != 12 {
+            return Err(AkratError::InvalidVault);
+        }
+        let conversation_key = conversation_keys
+            .iter()
+            .find(|key| key.conversation == stored_attachment.conversation)
+            .ok_or(AkratError::InvalidVault)?;
+        let cipher = Aes256Gcm::new_from_slice(conversation_key.key.as_ref())
+            .map_err(|_| AkratError::InvalidVault)?;
+        let nonce = Nonce::try_from(stored_attachment.nonce.as_slice())
+            .map_err(|_| AkratError::InvalidVault)?;
+        let mut attachment_plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: stored_attachment.ciphertext.as_slice(),
+                        aad: stored_attachment.conversation.as_bytes(),
+                    },
+                )
+                .map_err(|_| AkratError::Authentication)?,
+        );
+        let attachment: StoredAttachment =
+            serde_json::from_slice(&attachment_plaintext).map_err(|_| AkratError::InvalidVault)?;
+        attachment_plaintext.zeroize();
+        if attachment.conversation != stored_attachment.conversation {
+            return Err(AkratError::InvalidVault);
+        }
+        attachments.push(attachment);
+    }
     let result = VaultData {
         identities: stored.identities,
         contacts: stored.contacts,
         messages,
+        groups,
+        group_deliveries: stored.group_deliveries,
+        attachments,
         conversation_keys,
         async_protocol_states: stored.async_protocol_states,
         mailbox_inboxes: stored.mailbox_inboxes,
@@ -658,6 +1233,17 @@ fn ensure_conversation_keys(data: &mut VaultData) -> Result<(), AkratError> {
             return Err(AkratError::InvalidVault);
         }
     }
+    for attachment in &data.attachments {
+        if !seen.contains(&attachment.conversation) {
+            let mut key = Zeroizing::new([0u8; 32]);
+            getrandom::fill(key.as_mut()).map_err(|_| AkratError::Random)?;
+            data.conversation_keys.push(ConversationKey {
+                conversation: attachment.conversation.clone(),
+                key,
+            });
+            seen.insert(attachment.conversation.clone());
+        }
+    }
     for message in &data.messages {
         if !seen.contains(&message.conversation) {
             let mut key = Zeroizing::new([0u8; 32]);
@@ -669,7 +1255,23 @@ fn ensure_conversation_keys(data: &mut VaultData) -> Result<(), AkratError> {
             seen.insert(message.conversation.clone());
         }
     }
+    for group in &data.groups {
+        let conversation = group_conversation_key(&group.group_id);
+        if !seen.contains(&conversation) {
+            let mut key = Zeroizing::new([0u8; 32]);
+            getrandom::fill(key.as_mut()).map_err(|_| AkratError::Random)?;
+            data.conversation_keys.push(ConversationKey {
+                conversation: conversation.clone(),
+                key,
+            });
+            seen.insert(conversation);
+        }
+    }
     Ok(())
+}
+
+fn group_conversation_key(group_id: &str) -> String {
+    format!("group:{group_id}")
 }
 
 fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
@@ -680,6 +1282,58 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
             || identity.id != hex::encode(Sha256::digest(&identity.public_key))
             || identity.name.trim().is_empty()
             || !identities.insert(identity.id.as_str())
+        {
+            return Err(AkratError::InvalidVault);
+        }
+    }
+    let mut group_ids = std::collections::HashSet::new();
+    for group in &data.groups {
+        group.validate()?;
+        if !group_ids.insert(group.group_id.as_str()) {
+            return Err(AkratError::InvalidVault);
+        }
+        if group.members.is_empty()
+            || group.members.len() > 256
+            || group.members.iter().any(|member| {
+                member.public_key.len() != 32
+                    || member.fingerprint != fingerprint(&member.public_key)
+                    || member.display_name.len() > 128
+            })
+        {
+            return Err(AkratError::InvalidVault);
+        }
+    }
+    let mut group_delivery_ids = std::collections::HashSet::new();
+    for delivery in &data.group_deliveries {
+        if !group_ids.contains(delivery.group_id.as_str())
+            || delivery.message_id.is_empty()
+            || delivery.recipients.len() > 255
+            || delivery
+                .recipients
+                .iter()
+                .any(|recipient| recipient.fingerprint.is_empty())
+            || !group_delivery_ids
+                .insert((delivery.group_id.as_str(), delivery.message_id.as_str()))
+            || !data.messages.iter().any(|message| {
+                message.conversation == format!("group:{}", delivery.group_id)
+                    && message.id == delivery.message_id
+                    && message.outgoing
+            })
+        {
+            return Err(AkratError::InvalidVault);
+        }
+    }
+    let mut attachment_ids = std::collections::HashSet::new();
+    for attachment in &data.attachments {
+        attachments::validate_manifest(&attachment.manifest)
+            .map_err(|_| AkratError::InvalidVault)?;
+        if attachment.conversation != attachment.manifest.conversation_id
+            || attachment.message_id != attachment.manifest.message_id
+            || !attachment_ids.insert(attachment.manifest.attachment_id.as_str())
+            || !data.messages.iter().any(|message| {
+                message.conversation == attachment.conversation
+                    && message.id == attachment.message_id
+            })
         {
             return Err(AkratError::InvalidVault);
         }
@@ -773,13 +1427,46 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
     }
     let mut outbox_ids = std::collections::HashSet::new();
     for item in &data.async_outbox {
+        let direct_message_exists = data.messages.iter().any(|message| {
+            message.outgoing
+                && message.conversation == item.conversation
+                && message.id == item.message_id
+        });
+        let group_message_exists = item.conversation.split_once(':').is_some_and(
+            |(identity_id, recipient_fingerprint)| {
+                identities.contains(identity_id)
+                    && data.group_deliveries.iter().any(|delivery| {
+                        delivery.message_id == item.message_id
+                            && delivery
+                                .recipients
+                                .iter()
+                                .any(|recipient| recipient.fingerprint == recipient_fingerprint)
+                            && data.messages.iter().any(|message| {
+                                message.outgoing
+                                    && message.conversation
+                                        == format!("group:{}", delivery.group_id)
+                                    && message.id == item.message_id
+                            })
+                    })
+            },
+        );
+        let group_event_exists = item.group_event.as_ref().is_some_and(|reference| {
+            identities.contains(
+                item.conversation
+                    .split_once(':')
+                    .map_or("", |(identity_id, _)| identity_id),
+            ) && data
+                .groups
+                .iter()
+                .find(|group| group.group_id == reference.group_id)
+                .and_then(|group| group.events.get(reference.sequence as usize))
+                .and_then(|event| event.digest().ok())
+                .as_deref()
+                == Some(reference.event_sha256.as_str())
+        });
         if item.envelope.is_empty()
             || item.envelope.len() > 256 * 1024
-            || !data.messages.iter().any(|message| {
-                message.outgoing
-                    && message.conversation == item.conversation
-                    && message.id == item.message_id
-            })
+            || !(direct_message_exists || group_message_exists || group_event_exists)
             || !outbox_ids.insert((item.conversation.as_str(), item.message_id.as_str()))
         {
             return Err(AkratError::InvalidVault);
@@ -852,6 +1539,186 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn signed_group_membership_uses_chain_epoch_and_member_authorization() {
+        let alice = Identity::generate("Alice".into()).expect("Alice identity");
+        let bob = Identity::generate("Bob".into()).expect("Bob identity");
+        let creation = GroupEvent::signed(
+            &alice,
+            "group-1".into(),
+            0,
+            0,
+            None,
+            GroupChange::Create {
+                name: "Expédition".into(),
+                creator_name: "Alice".into(),
+            },
+        )
+        .expect("signed creation");
+        let mut state = GroupState::from_creation(&creation).expect("create state");
+        let bob_member = GroupMember {
+            fingerprint: bob.fingerprint(),
+            public_key: bob.public_key().to_vec(),
+            display_name: "Bob".into(),
+            role: GroupRole::Member,
+            accepted: false,
+        };
+        let invite = GroupEvent::signed(
+            &alice,
+            "group-1".into(),
+            1,
+            0,
+            Some(state.last_event_sha256.clone()),
+            GroupChange::Invite { member: bob_member },
+        )
+        .expect("signed invitation");
+        state.apply(&invite).expect("apply invitation");
+        let acceptance = GroupEvent::signed(
+            &bob,
+            "group-1".into(),
+            2,
+            1,
+            Some(state.last_event_sha256.clone()),
+            GroupChange::Accept,
+        )
+        .expect("signed acceptance");
+        state.apply(&acceptance).expect("apply acceptance");
+        assert_eq!(state.epoch, 1);
+        assert!(
+            state
+                .members
+                .iter()
+                .find(|member| member.fingerprint == bob.fingerprint())
+                .unwrap()
+                .accepted
+        );
+        state.validate().expect("replay signed chain");
+        let forbidden = GroupEvent::signed(
+            &bob,
+            "group-1".into(),
+            3,
+            1,
+            Some(state.last_event_sha256.clone()),
+            GroupChange::Rename {
+                name: "Falsification".into(),
+            },
+        )
+        .expect("signed member event");
+        assert!(matches!(
+            state.apply(&forbidden),
+            Err(AkratError::InvalidVault)
+        ));
+        let removal = GroupEvent::signed(
+            &alice,
+            "group-1".into(),
+            3,
+            2,
+            Some(state.last_event_sha256.clone()),
+            GroupChange::Remove {
+                fingerprint: bob.fingerprint(),
+            },
+        )
+        .expect("signed removal");
+        state.apply(&removal).expect("apply removal");
+        assert_eq!(state.epoch, 2);
+        assert!(
+            !state
+                .members
+                .iter()
+                .any(|member| member.fingerprint == bob.fingerprint())
+        );
+        state.validate().expect("replay after removal");
+    }
+
+    #[test]
+    fn group_state_is_persisted_with_its_own_local_storage_key() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let alice = Identity::generate("Alice".into()).expect("Alice identity");
+        let creation = GroupEvent::signed(
+            &alice,
+            "group-persist".into(),
+            0,
+            0,
+            None,
+            GroupChange::Create {
+                name: "Expédition".into(),
+                creator_name: "Alice".into(),
+            },
+        )
+        .expect("creation event");
+        let group = GroupState::from_creation(&creation).expect("group state");
+        let mut data = VaultData {
+            identities: vec![alice],
+            groups: vec![group],
+            ..VaultData::default()
+        };
+        save_vault(&path, &mut data, "local group passphrase").expect("save");
+        assert!(
+            data.conversation_keys
+                .iter()
+                .any(|key| key.conversation == "group:group-persist")
+        );
+        let loaded = load_vault(&path, "local group passphrase").expect("load");
+        assert_eq!(loaded.groups, data.groups);
+        assert_eq!(loaded.groups[0].events.len(), 1);
+    }
+
+    #[test]
+    fn attachment_manifest_and_content_key_are_encrypted_by_its_conversation_key() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let mut image = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            8,
+            8,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut image, image::ImageFormat::Png)
+        .expect("encode sample image");
+        let (manifest, _) = attachments::encrypt_image(
+            &image.into_inner(),
+            "00112233445566778899aabbccddeeff".into(),
+            "image-message".into(),
+            "dm:alice:bob".into(),
+            "private-photo.png",
+        )
+        .expect("encrypted image");
+        let mut data = VaultData {
+            messages: vec![StoredMessage {
+                conversation: "dm:alice:bob".into(),
+                id: "image-message".into(),
+                outgoing: true,
+                text: "caption".into(),
+                delivery: DeliveryState::Queued,
+                timestamp: 1,
+                delivery_events: Vec::new(),
+                received_ciphertext_sha256: None,
+            }],
+            attachments: vec![StoredAttachment {
+                conversation: "dm:alice:bob".into(),
+                message_id: "image-message".into(),
+                manifest: manifest.clone(),
+            }],
+            ..VaultData::default()
+        };
+        save_vault(&path, &mut data, "attachment vault phrase").expect("save vault");
+        let encoded = fs::read(&path).expect("read encrypted vault");
+        let encoded_text = String::from_utf8_lossy(&encoded);
+        assert!(!encoded_text.contains("private-photo.png"));
+        assert!(!encoded_text.contains(&manifest.attachment_id));
+        assert!(!encoded_text.contains(&hex::encode(&manifest.content_key)));
+        let loaded = load_vault(&path, "attachment vault phrase").expect("load vault");
+        assert_eq!(loaded.attachments.len(), 1);
+        assert_eq!(loaded.attachments[0].manifest, manifest);
+        assert!(
+            loaded
+                .conversation_keys
+                .iter()
+                .any(|key| key.conversation == "dm:alice:bob")
+        );
+    }
+
+    #[test]
     fn encrypted_vault_round_trips_identity_contact_and_history() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
@@ -900,6 +1767,9 @@ mod tests {
                     received_ciphertext_sha256: None,
                 },
             ],
+            groups: Vec::new(),
+            group_deliveries: Vec::new(),
+            attachments: Vec::new(),
             conversation_keys: Vec::new(),
             async_protocol_states: Vec::new(),
             mailbox_inboxes: Vec::new(),
