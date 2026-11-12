@@ -1459,6 +1459,7 @@ mod tests {
                 sender_public_key: alice.public_key().to_vec(),
                 timestamp: now(),
                 text: "**Group delivery**\n\n| Peer | State |\n|---|---|\n| Bob | offline |".into(),
+                has_attachment: false,
             },
         )
         .await
