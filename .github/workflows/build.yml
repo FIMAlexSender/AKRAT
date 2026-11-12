@@ -109,7 +109,10 @@ jobs:
           if (-not $vsPath) { throw 'Visual Studio C++ Build Tools are required on the AKRAT runner.' }
           $devCmd = Join-Path $vsPath 'Common7\Tools\VsDevCmd.bat'
           if (-not (Test-Path $devCmd)) { throw "MSVC setup script not found: $devCmd" }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set RUSTUP_TOOLCHAIN=stable && rustup run stable cargo build --locked --release -p akrat-desktop --features desktop && rustup run stable cargo build --locked --release -p akrat && rustup run stable cargo build --locked --release -p akrat-mailbox'
+          $stableRustc = (& rustup which --toolchain stable rustc).Trim()
+          $stableCargo = (& rustup which --toolchain stable cargo).Trim()
+          if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The stable Rust toolchain is incomplete on the AKRAT runner.' }
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox'
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
