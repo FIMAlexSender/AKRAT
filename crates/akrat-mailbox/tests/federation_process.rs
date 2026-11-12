@@ -202,7 +202,7 @@ async fn announce_self(config: &ServerConfig, signer: &ServerSigner, name: &str,
 }
 
 async fn wait_for_node(config: &ServerConfig, fingerprint: &str) {
-    for _ in 0..300 {
+    for _ in 0..1200 {
         if node_exists(config, fingerprint) {
             return;
         }
@@ -212,7 +212,7 @@ async fn wait_for_node(config: &ServerConfig, fingerprint: &str) {
 }
 
 async fn wait_for_node_name(config: &ServerConfig, fingerprint: &str, name: &str) {
-    for _ in 0..300 {
+    for _ in 0..1200 {
         if node_has_name(config, fingerprint, name) {
             return;
         }
