@@ -11,6 +11,7 @@ argon2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+fs2.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 iroh.workspace = true
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
@@ -26,3 +27,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

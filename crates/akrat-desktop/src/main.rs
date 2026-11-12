@@ -9,7 +9,7 @@ use akrat_core::{
     Contact, DeliveryActor, DeliveryEvent, DeliveryEventKind, DeliveryState, GroupChange,
     GroupEvent, GroupMember, GroupMessage, GroupMessageDelivery, GroupRecipientDelivery,
     GroupRecipientStatus, GroupRole, GroupState, Identity, Invitation, MailboxInbox, MailboxRoute,
-    StoredMessage, VaultData, load_vault,
+    StoredMessage, VaultData, VaultFileLock, load_vault,
     markdown::TableAlignment,
     markdown::{MarkdownNode, MarkdownNodeKind, parse_markdown},
     save_vault,
@@ -1211,6 +1211,11 @@ fn import_vault_bytes(
             .checked_add(1)
             .ok_or("Impossible de générer un nom libre pour le coffre importé.")?;
     };
+    let _destination_lock = VaultFileLock::acquire(&destination)
+        .map_err(|error| format!("Verrouillage de l’emplacement importé impossible : {error}"))?;
+    if destination.exists() {
+        return Err("Un fichier existe déjà à l’emplacement choisi pour l’importation.".into());
+    }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
@@ -1259,21 +1264,52 @@ fn rename_vault_file(
     if destination.exists() {
         return Err("Un fichier existe déjà avec ce nom.".into());
     }
+    let mut lock_paths = [source, destination.as_path()];
+    lock_paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    let _vault_locks = lock_paths
+        .into_iter()
+        .map(VaultFileLock::acquire)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Verrouillage du coffre impossible : {error}"))?;
+    if !source.is_file() || destination.exists() {
+        return Err("Le coffre a changé pendant sa préparation au renommage.".into());
+    }
     let source_sidecar = akrat_core::attachments::attachment_sidecar_path(source);
     let destination_sidecar = akrat_core::attachments::attachment_sidecar_path(&destination);
+    let source_backup = vault_backup_path(source);
+    let destination_backup = vault_backup_path(&destination);
     if destination_sidecar.exists() {
         return Err("Un dossier de pièces jointes existe déjà avec ce nom.".into());
     }
-    if source_sidecar.exists() {
-        std::fs::rename(&source_sidecar, &destination_sidecar)
-            .map_err(|error| format!("Déplacement des pièces jointes impossible : {error}"))?;
+    if destination_backup.exists() {
+        return Err("Une sauvegarde existe déjà avec ce nom.".into());
     }
-    std::fs::rename(source, &destination).map_err(|error| {
+    let backup_moved = if source_backup.exists() {
+        std::fs::rename(&source_backup, &destination_backup)
+            .map_err(|error| format!("Déplacement de la sauvegarde impossible : {error}"))?;
+        true
+    } else {
+        false
+    };
+    if source_sidecar.exists()
+        && let Err(error) = std::fs::rename(&source_sidecar, &destination_sidecar)
+    {
+        if backup_moved {
+            let _ = std::fs::rename(&destination_backup, &source_backup);
+        }
+        return Err(format!(
+            "Déplacement des pièces jointes impossible : {error}"
+        ));
+    }
+    if let Err(error) = std::fs::rename(source, &destination) {
         if source_sidecar.exists() || destination_sidecar.exists() {
             let _ = std::fs::rename(&destination_sidecar, &source_sidecar);
         }
-        format!("Renommage impossible : {error}")
-    })?;
+        if backup_moved {
+            let _ = std::fs::rename(&destination_backup, &source_backup);
+        }
+        return Err(format!("Renommage impossible : {error}"));
+    }
     let paths = match vault_catalog::replace_and_save(default_path, source, destination.clone()) {
         Ok(paths) => paths,
         Err(error) => {
@@ -1283,11 +1319,19 @@ fn rename_vault_file(
             } else {
                 Ok(())
             };
+            let backup_rollback = if backup_moved && destination_backup.exists() {
+                std::fs::rename(&destination_backup, &source_backup)
+            } else {
+                Ok(())
+            };
             return Err(match rollback {
-                Ok(()) if sidecar_rollback.is_ok() => error,
+                Ok(()) if sidecar_rollback.is_ok() && backup_rollback.is_ok() => error,
                 Ok(()) => format!(
-                    "{error}. Retour des pièces jointes impossible : {}",
-                    sidecar_rollback.unwrap_err()
+                    "{error}. Retour auxiliaire impossible : {}",
+                    sidecar_rollback
+                        .err()
+                        .or_else(|| backup_rollback.err())
+                        .unwrap()
                 ),
                 Err(rollback_error) => format!(
                     "Catalogue non enregistré ({error}) et retour arrière impossible ({rollback_error})."
@@ -1305,6 +1349,10 @@ fn delete_vault_file(
     passphrase: &str,
 ) -> Result<Vec<PathBuf>, String> {
     load_vault(source, passphrase).map_err(|error| format!("Suppression refusée : {error}"))?;
+    let _vault_lock = VaultFileLock::acquire(source)
+        .map_err(|error| format!("Verrouillage du coffre impossible : {error}"))?;
+    load_vault(source, passphrase)
+        .map_err(|error| format!("Suppression refusée après vérification : {error}"))?;
     let mut paths = existing_paths.to_vec();
     vault_catalog::remove(&mut paths, source);
     vault_catalog::save(default_path, &paths)
@@ -1323,6 +1371,7 @@ fn delete_vault_file(
 
 fn move_vault_to_trash(path: &Path) -> Result<(), String> {
     let sidecar = akrat_core::attachments::attachment_sidecar_path(path);
+    let backup = vault_backup_path(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1332,6 +1381,7 @@ fn move_vault_to_trash(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Préparation de la suppression impossible : {error}"))?;
     let staged_vault = bundle.join("vault.akrat");
     let staged_sidecar = bundle.join("vault.akrat.attachments");
+    let staged_backup = bundle.join("vault.akrat.bak");
     std::fs::rename(path, &staged_vault).map_err(|error| {
         let _ = std::fs::remove_dir(&bundle);
         format!("Déplacement du coffre impossible : {error}")
@@ -1347,6 +1397,26 @@ fn move_vault_to_trash(path: &Path) -> Result<(), String> {
                 "Déplacement des pièces jointes impossible : {error}; restauration du coffre impossible : {rollback}"
             ),
         });
+    }
+    if backup.exists()
+        && let Err(error) = std::fs::rename(&backup, &staged_backup)
+    {
+        let sidecar_rollback = if staged_sidecar.exists() {
+            std::fs::rename(&staged_sidecar, &sidecar)
+        } else {
+            Ok(())
+        };
+        let vault_rollback = std::fs::rename(&staged_vault, path);
+        let _ = std::fs::remove_dir(&bundle);
+        return Err(format!(
+            "Déplacement de la sauvegarde impossible : {error}; restauration du coffre : {}; pièces jointes : {}",
+            vault_rollback
+                .err()
+                .map_or_else(|| "réussie".into(), |error| error.to_string()),
+            sidecar_rollback
+                .err()
+                .map_or_else(|| "réussie".into(), |error| error.to_string())
+        ));
     }
     #[cfg(all(
         feature = "desktop",
@@ -1372,26 +1442,38 @@ fn move_vault_to_trash(path: &Path) -> Result<(), String> {
         } else {
             Ok(())
         };
+        let backup_rollback = if staged_backup.exists() {
+            std::fs::rename(&staged_backup, &backup)
+        } else {
+            Ok(())
+        };
         let vault_rollback = if staged_vault.exists() {
             std::fs::rename(&staged_vault, path)
         } else {
             Ok(())
         };
         let _ = std::fs::remove_dir(&bundle);
-        return Err(match (vault_rollback, sidecar_rollback) {
-            (Ok(()), Ok(())) => error,
-            (vault_result, sidecar_result) => format!(
-                "{error}. Restauration du coffre : {}; pièces jointes : {}",
+        return Err(match (vault_rollback, sidecar_rollback, backup_rollback) {
+            (Ok(()), Ok(()), Ok(())) => error,
+            (vault_result, sidecar_result, backup_result) => format!(
+                "{error}. Restauration du coffre : {}; pièces jointes : {}; sauvegarde : {}",
                 vault_result
                     .err()
                     .map_or_else(|| "réussie".into(), |value| value.to_string()),
                 sidecar_result
+                    .err()
+                    .map_or_else(|| "réussie".into(), |value| value.to_string()),
+                backup_result
                     .err()
                     .map_or_else(|| "réussie".into(), |value| value.to_string())
             ),
         });
     }
     Ok(())
+}
+
+fn vault_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("akrat.bak")
 }
 
 fn apply_created_vault(
@@ -2485,9 +2567,13 @@ fn MarkdownNodeView(node: MarkdownNode) -> Element {
         MarkdownNodeKind::Strong => {
             rsx! { strong { for child in children { MarkdownNodeView { node: child } } } }
         }
+        MarkdownNodeKind::Underline => {
+            rsx! { u { for child in children { MarkdownNodeView { node: child } } } }
+        }
         MarkdownNodeKind::Strike => {
             rsx! { del { for child in children { MarkdownNodeView { node: child } } } }
         }
+        MarkdownNodeKind::Spoiler => rsx! { MarkdownSpoiler { nodes: children } },
         MarkdownNodeKind::Link(Some(url)) => {
             rsx! { a { href: "{url}", target: "_blank", rel: "noopener noreferrer", for child in children { MarkdownNodeView { node: child } } } }
         }
@@ -2502,6 +2588,24 @@ fn MarkdownNodeView(node: MarkdownNode) -> Element {
         MarkdownNodeKind::Rule => rsx! { hr {} },
         MarkdownNodeKind::Task(checked) => {
             rsx! { input { r#type: "checkbox", checked, disabled: true } }
+        }
+    }
+}
+
+#[component]
+fn MarkdownSpoiler(nodes: Vec<MarkdownNode>) -> Element {
+    let mut revealed = use_signal(|| false);
+    rsx! {
+        button {
+            class: if revealed() { "markdown-spoiler revealed" } else { "markdown-spoiler" },
+            r#type: "button",
+            aria_label: if revealed() { "Masquer le spoiler" } else { "Révéler le spoiler" },
+            onclick: move |_| revealed.toggle(),
+            if revealed() {
+                for child in nodes { MarkdownNodeView { node: child } }
+            } else {
+                "Spoiler · révéler"
+            }
         }
     }
 }
@@ -3252,8 +3356,8 @@ fn sync_group_on_ready(
             let outgoing = GroupMessage {
                 version: 1,
                 group_id: group.group_id.clone(),
-                epoch: group.epoch,
-                sequence: group.sequence,
+                epoch: delivery.epoch,
+                sequence: delivery.sequence,
                 message_id: message.id.clone(),
                 sender_public_key: identity.public_key().to_vec(),
                 timestamp: message.timestamp,
@@ -3681,7 +3785,10 @@ mod vault_manager_tests {
         let original_sidecar = akrat_core::attachments::attachment_sidecar_path(&original);
         std::fs::create_dir_all(&original_sidecar).unwrap();
         std::fs::write(original_sidecar.join("encrypted.chunk"), b"ciphertext").unwrap();
+        let mut refreshed = load_vault(&original, phrase).unwrap();
+        save_vault(&original, &mut refreshed, phrase).unwrap();
         let bytes_before = std::fs::read(&original).unwrap();
+        let mut stale_session = load_vault(&original, phrase).unwrap();
         let id_before = vault_catalog::id_for_path(&default, &original).unwrap();
 
         let (renamed, paths) = rename_vault_file(&default, &paths, &original, "Personnel").unwrap();
@@ -3695,6 +3802,12 @@ mod vault_manager_tests {
             b"ciphertext"
         );
         assert!(!original_sidecar.exists());
+        let renamed_backup = vault_backup_path(&renamed);
+        assert!(renamed_backup.exists());
+        assert!(!vault_backup_path(&original).exists());
+        assert!(load_vault(&renamed_backup, phrase).is_ok());
+        assert!(save_vault(&original, &mut stale_session, phrase).is_err());
+        assert!(!original.exists());
         let id_after = vault_catalog::id_for_path(&default, &renamed).unwrap();
         assert_eq!(id_before, id_after);
 
@@ -3704,6 +3817,7 @@ mod vault_manager_tests {
         assert!(remaining.is_empty());
         assert!(!renamed.exists());
         assert!(!renamed_sidecar.exists());
+        assert!(!renamed_backup.exists());
     }
 
     #[test]

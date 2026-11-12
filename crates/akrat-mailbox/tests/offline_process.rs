@@ -152,6 +152,7 @@ async fn offline_pqxdh_delivery_survives_independent_client_and_server_processes
     bob_data.contacts.push(alice_contact);
     save_vault(&bob_vault, &mut bob_data, PASSPHRASE).expect("persist verified sender");
     let mut alice_data = VaultData {
+        revision: 0,
         identities: vec![alice.detached_copy()],
         contacts: vec![bob_contact],
         ..VaultData::default()
@@ -305,6 +306,7 @@ async fn run_client_role(role: &str) -> Result<(), Box<dyn std::error::Error>> {
             let bob = Identity::generate("Bob".into())?;
             let (bundle, state) = akrat_core::async_crypto::publish_bundle(&bob, &[]).await?;
             let mut data = VaultData {
+                revision: 0,
                 identities: vec![bob.detached_copy()],
                 async_protocol_states: vec![AsyncProtocolState {
                     identity_id: bob.id.clone(),

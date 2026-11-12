@@ -1106,6 +1106,7 @@ mod tests {
 
     const PHRASE: &str = "desktop-mailbox-flow-test-phrase";
     const MESSAGE_ID: &str = "d35a4b0c0ffee123";
+    const SECOND_MESSAGE_ID: &str = "d35a4b0c0ffee127";
     const EXPIRED_MESSAGE_ID: &str = "d35a4b0c0ffee124";
     const PARTIAL_RETRY_MESSAGE_ID: &str = "d35a4b0c0ffee125";
     const GROUP_MESSAGE_ID: &str = "d35a4b0c0ffee126";
@@ -1238,6 +1239,7 @@ mod tests {
             mailbox_replicas: Vec::new(),
         };
         let mut bob_data = VaultData {
+            revision: 0,
             identities: vec![bob.detached_copy()],
             contacts: vec![alice_contact],
             mailbox_inboxes: vec![
@@ -1272,6 +1274,7 @@ mod tests {
         let conversation = format!("{}:{}", alice.id, bob.fingerprint());
         let message = "Message déposé pendant que Bob est hors ligne.";
         let mut alice_data = VaultData {
+            revision: 0,
             identities: vec![alice.detached_copy()],
             contacts: vec![Contact {
                 mailbox_route: Some(MailboxRoute {
@@ -1296,16 +1299,28 @@ mod tests {
                 }],
                 ..bob_contact
             }],
-            messages: vec![StoredMessage {
-                conversation: conversation.clone(),
-                id: MESSAGE_ID.into(),
-                outgoing: true,
-                text: message.into(),
-                delivery: DeliveryState::Pending,
-                timestamp: now(),
-                delivery_events: Vec::new(),
-                received_ciphertext_sha256: None,
-            }],
+            messages: vec![
+                StoredMessage {
+                    conversation: conversation.clone(),
+                    id: MESSAGE_ID.into(),
+                    outgoing: true,
+                    text: message.into(),
+                    delivery: DeliveryState::Pending,
+                    timestamp: now(),
+                    delivery_events: Vec::new(),
+                    received_ciphertext_sha256: None,
+                },
+                StoredMessage {
+                    conversation: conversation.clone(),
+                    id: SECOND_MESSAGE_ID.into(),
+                    outgoing: true,
+                    text: "Deuxième message concurrent.".into(),
+                    delivery: DeliveryState::Pending,
+                    timestamp: now(),
+                    delivery_events: Vec::new(),
+                    received_ciphertext_sha256: None,
+                },
+            ],
             ..VaultData::default()
         };
         save_vault(&alice_vault, &mut alice_data, PHRASE).expect("save Alice vault");
@@ -1393,14 +1408,43 @@ mod tests {
             load_vault(&bob_vault, PHRASE).expect("reload Bob after bundle publication");
         bob_stored.groups.push(group.clone());
         save_vault(&bob_vault, &mut bob_stored, PHRASE).expect("persist Bob group state");
+        let (first_send, second_send) = tokio::join!(
+            send(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                MESSAGE_ID.into(),
+            ),
+            send(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                SECOND_MESSAGE_ID.into(),
+            ),
+        );
+        assert_eq!(
+            usize::from(first_send.is_ok()) + usize::from(second_send.is_ok()),
+            1
+        );
+        let failed_message = if first_send.is_err() {
+            MESSAGE_ID
+        } else {
+            SECOND_MESSAGE_ID
+        };
+        let stale_send = if first_send.is_err() {
+            first_send.expect_err("first concurrent send conflict")
+        } else {
+            second_send.expect_err("second concurrent send conflict")
+        };
+        assert!(stale_send.contains("revision conflict"));
         send(
             alice_vault.clone(),
             PHRASE.into(),
             conversation.clone(),
-            MESSAGE_ID.into(),
+            failed_message.into(),
         )
         .await
-        .expect("deposit asynchronous message");
+        .expect("retry the stale send using the current ratchet state");
         load_vault(&alice_vault, PHRASE).expect("reload Alice vault before group deposit");
         send_group_message(
             alice_vault.clone(),
@@ -1435,7 +1479,7 @@ mod tests {
                 && event.verified
                 && event.receipt_bytes.is_some()
         }));
-        assert_eq!(alice_data.async_outbox.len(), 2);
+        assert_eq!(alice_data.async_outbox.len(), 3);
         assert_eq!(
             alice_data.group_deliveries[0].recipients[0].status,
             GroupRecipientStatus::Deposited
@@ -1449,6 +1493,35 @@ mod tests {
             2
         );
 
+        let (primary_poll, replica_poll) = tokio::join!(
+            poll_inbox(
+                bob_vault.clone(),
+                PHRASE.into(),
+                bob_data.mailbox_inboxes[0].clone(),
+            ),
+            poll_inbox(
+                bob_vault.clone(),
+                PHRASE.into(),
+                bob_data.mailbox_inboxes[1].clone(),
+            ),
+        );
+        assert_eq!(
+            usize::from(primary_poll.is_ok()) + usize::from(replica_poll.is_ok()),
+            1
+        );
+        let received = primary_poll
+            .as_ref()
+            .ok()
+            .or_else(|| replica_poll.as_ref().ok())
+            .expect("one concurrent poll commits");
+        assert_eq!(*received, 3);
+        let conflict = primary_poll
+            .as_ref()
+            .err()
+            .or_else(|| replica_poll.as_ref().err())
+            .expect("stale mailbox poll is rejected");
+        assert!(conflict.contains("revision conflict"));
+
         server1.stop();
         let received = poll_inbox(
             bob_vault.clone(),
@@ -1456,8 +1529,8 @@ mod tests {
             bob_data.mailbox_inboxes[1].clone(),
         )
         .await
-        .expect("receive from the surviving replica after the primary is stopped");
-        assert_eq!(received, 2);
+        .expect("deduplicate and acknowledge the surviving replica");
+        assert_eq!(received, 0);
         assert!(matches!(
             poll_delivery_receipt(
                 alice_vault.clone(),
@@ -1467,6 +1540,17 @@ mod tests {
             )
             .await
             .expect("verify Bob's receipt from the surviving replica"),
+            DeliveryPoll::Delivered
+        ));
+        assert!(matches!(
+            poll_delivery_receipt(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                SECOND_MESSAGE_ID.into(),
+            )
+            .await
+            .expect("verify concurrent message receipt"),
             DeliveryPoll::Delivered
         ));
         assert!(matches!(
@@ -1504,7 +1588,7 @@ mod tests {
         assert_eq!(duplicate, 0);
         let bob_data = load_vault(&bob_vault, PHRASE).expect("reload Bob vault");
         assert_eq!(bob_data.mailbox_inboxes[0].server_key_generation, 2);
-        assert_eq!(bob_data.messages.len(), 2);
+        assert_eq!(bob_data.messages.len(), 3);
         assert_eq!(bob_data.messages[0].text, message);
         assert!(
             bob_data

@@ -1,3 +1,4 @@
+use akrat_core::VaultFileLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +82,8 @@ pub fn load(default_path: &Path) -> CatalogLoad {
 
 pub fn save(default_path: &Path, paths: &[PathBuf]) -> Result<(), String> {
     let path = catalog_path(default_path);
+    let _catalog_lock = VaultFileLock::acquire(&path)
+        .map_err(|error| format!("Impossible de verrouiller le catalogue des coffres : {error}"))?;
     let previous = load(default_path).paths;
     let mut entries = Vec::new();
     for (index, entry_path) in deduplicated(paths.to_vec()).into_iter().enumerate() {
@@ -109,6 +112,8 @@ pub fn replace_and_save(
     new: PathBuf,
 ) -> Result<Vec<PathBuf>, String> {
     let path = catalog_path(default_path);
+    let _catalog_lock = VaultFileLock::acquire(&path)
+        .map_err(|error| format!("Impossible de verrouiller le catalogue des coffres : {error}"))?;
     let mut document = read_document(&path).unwrap_or_else(|| {
         let paths = load(default_path).paths;
         CatalogDocument {
@@ -241,6 +246,14 @@ fn write_document(path: &Path, document: &CatalogDocument) -> Result<(), String>
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_with_interruption(path, bytes, false)
+}
+
+fn atomic_write_with_interruption(
+    path: &Path,
+    bytes: &[u8],
+    interrupt_before_replace: bool,
+) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(".vaults-{}-{sequence}.tmp", std::process::id()));
@@ -253,16 +266,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        let verification = std::fs::read(&temporary)?;
+        if verification != bytes {
+            return Err(std::io::Error::other(
+                "temporary catalogue verification failed",
+            ));
+        }
         if path.exists() {
             if is_readable_catalog(path) || !backup.exists() {
                 std::fs::copy(path, &backup)?;
+                let backup_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&backup)?;
+                backup_file.sync_all()?;
             }
             #[cfg(not(windows))]
             std::fs::File::open(parent)?.sync_all()?;
-            #[cfg(windows)]
-            std::fs::remove_file(path)?;
         }
-        std::fs::rename(&temporary, path)?;
+        if interrupt_before_replace {
+            return Err(std::io::Error::other(
+                "injected interruption before replace",
+            ));
+        }
+        replace_file(&temporary, path)?;
         #[cfg(not(windows))]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
@@ -272,6 +299,41 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     write_result
         .map_err(|error| format!("Impossible d’enregistrer le catalogue des coffres : {error}"))
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn is_readable_catalog(path: &Path) -> bool {
@@ -417,6 +479,35 @@ mod tests {
         assert_eq!(loaded.paths, vec![PathBuf::from("portable.akrat")]);
         assert!(loaded.warning.is_some());
         assert_eq!(std::fs::read(catalog_path(&default)).unwrap(), b"{broken");
+    }
+
+    #[test]
+    fn interruption_before_catalogue_replacement_keeps_main_file_and_recovery_copy() {
+        let directory = tempdir().unwrap();
+        let default = default_path(directory.path());
+        let selected = directory.path().join("selected.akrat");
+        save(&default, std::slice::from_ref(&selected)).unwrap();
+        let path = catalog_path(&default);
+        let previous = std::fs::read(&path).unwrap();
+        assert!(atomic_write_with_interruption(&path, b"replacement", true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), previous);
+        assert_eq!(load(&default).paths, vec![selected]);
+    }
+
+    #[test]
+    fn two_damaged_catalogue_copies_are_preserved_without_inventing_or_deleting_vaults() {
+        let directory = tempdir().unwrap();
+        let default = default_path(directory.path());
+        let path = catalog_path(&default);
+        let backup = backup_path(&path);
+        std::fs::write(&path, b"damaged main").unwrap();
+        std::fs::write(&backup, b"damaged recovery copy").unwrap();
+        let loaded = load(&default);
+        assert!(loaded.paths.is_empty());
+        assert!(loaded.warning.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), b"damaged main");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"damaged recovery copy");
     }
 
     #[test]

@@ -1313,6 +1313,7 @@ mod tests {
             .expect("Bob pre-key bundle");
         let bob_vault = directory.path().join("bob-vault.akrat");
         let mut bob_data = VaultData {
+            revision: 0,
             identities: vec![bob.detached_copy()],
             async_protocol_states: vec![AsyncProtocolState {
                 identity_id: bob.id.clone(),
