@@ -118,6 +118,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package the Windows installer
+        if: hashFiles('packaging/windows/akrat-installer.nsi') != ''
         shell: powershell
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^" ]+)"' | Select-Object -First 1).Matches.Groups[1].Value
