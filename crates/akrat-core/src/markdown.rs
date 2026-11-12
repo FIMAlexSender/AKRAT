@@ -26,7 +26,9 @@ pub enum MarkdownNodeKind {
     TableCell,
     Emphasis,
     Strong,
+    Underline,
     Strike,
+    Spoiler,
     Link(Option<String>),
     Text(String),
     InlineCode(String),
@@ -78,7 +80,8 @@ pub fn parse_markdown(source: &str) -> Result<MarkdownNode, MarkdownError> {
     };
     let mut stack: Vec<MarkdownNode> = Vec::new();
     let mut events = 0usize;
-    for event in Parser::new_ext(source, options) {
+    let prepared = protect_custom_markers(source);
+    for event in Parser::new_ext(&prepared, options) {
         events = events.saturating_add(1);
         if events > MAX_MARKDOWN_EVENTS {
             return Err(MarkdownError::TooComplex);
@@ -138,7 +141,251 @@ pub fn parse_markdown(source: &str) -> Result<MarkdownNode, MarkdownError> {
     if !stack.is_empty() {
         return Err(MarkdownError::TooComplex);
     }
+    apply_custom_markers(&mut root.children, 0, &mut events)?;
     Ok(root)
+}
+
+fn protect_custom_markers(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut fence: Option<(u8, usize)> = None;
+    for line in source.split_inclusive('\n') {
+        if let Some((marker, length)) = fence {
+            output.push_str(line);
+            if fence_marker(line).is_some_and(|(candidate, count, closing)| {
+                closing && candidate == marker && count >= length
+            }) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((marker, length, closing)) = fence_marker(line) {
+            output.push_str(line);
+            if !closing {
+                fence = Some((marker, length));
+            }
+            continue;
+        }
+        output.push_str(&protect_inline_markers(line));
+    }
+    output
+}
+
+fn fence_marker(line: &str) -> Option<(u8, usize, bool)> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index] == b' ' && index < 4 {
+        index += 1;
+    }
+    if index > 3 || index >= bytes.len() || !matches!(bytes[index], b'`' | b'~') {
+        return None;
+    }
+    let marker = bytes[index];
+    let start = index;
+    while index < bytes.len() && bytes[index] == marker {
+        index += 1;
+    }
+    let length = index - start;
+    if length < 3 {
+        return None;
+    }
+    let closing = bytes[index..].iter().all(|byte| byte.is_ascii_whitespace());
+    Some((marker, length, closing))
+}
+
+fn protect_inline_markers(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            let ticks = index - start;
+            if let Some(end) = find_backtick_close(bytes, index, ticks) {
+                output.push_str(&line[start..end]);
+                index = end;
+            } else {
+                output.push_str(&line[start..index]);
+            }
+            continue;
+        }
+        let delimiter = if bytes[index..].starts_with(b"__")
+            && (index == 0 || bytes[index - 1] != b'_')
+            && (index + 2 == bytes.len() || bytes[index + 2] != b'_')
+        {
+            Some((b"__".as_slice(), '\u{e000}', '\u{e001}'))
+        } else if bytes[index..].starts_with(b"||") {
+            Some((b"||".as_slice(), '\u{e002}', '\u{e003}'))
+        } else {
+            None
+        };
+        if let Some((delimiter, opening, closing)) = delimiter
+            && let Some(end) = find_unescaped_delimiter(bytes, index + delimiter.len(), delimiter)
+        {
+            output.push(opening);
+            output.push_str(&line[index + delimiter.len()..end]);
+            output.push(closing);
+            index = end + delimiter.len();
+        } else {
+            let character = line[index..]
+                .chars()
+                .next()
+                .expect("valid character boundary");
+            output.push(character);
+            index += character.len_utf8();
+        }
+    }
+    output
+}
+
+fn find_backtick_close(bytes: &[u8], mut index: usize, ticks: usize) -> Option<usize> {
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        if index - start == ticks {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn find_unescaped_delimiter(bytes: &[u8], mut index: usize, delimiter: &[u8]) -> Option<usize> {
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            if let Some(end) = find_backtick_close(bytes, index, index - start) {
+                index = end;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(delimiter) {
+            let preceding_slashes = bytes[..index]
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\\')
+                .count();
+            if preceding_slashes % 2 == 0 {
+                return Some(index);
+            }
+            index += delimiter.len();
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn apply_custom_markers(
+    nodes: &mut Vec<MarkdownNode>,
+    depth: usize,
+    events: &mut usize,
+) -> Result<(), MarkdownError> {
+    if depth > MAX_MARKDOWN_DEPTH {
+        return Err(MarkdownError::TooComplex);
+    }
+    for node in nodes.iter_mut() {
+        if !matches!(
+            node.kind,
+            MarkdownNodeKind::InlineCode(_) | MarkdownNodeKind::CodeBlock(_)
+        ) {
+            apply_custom_markers(&mut node.children, depth + 1, events)?;
+        }
+    }
+    let mut output = Vec::new();
+    let mut groups: Vec<(MarkdownNodeKind, Vec<MarkdownNode>, char)> = Vec::new();
+    for node in std::mem::take(nodes) {
+        if let MarkdownNodeKind::Text(text) = &node.kind {
+            let mut plain = String::new();
+            for character in text.chars() {
+                let token = match character {
+                    '\u{e000}' => Some((true, MarkdownNodeKind::Underline, '\u{e001}')),
+                    '\u{e001}' => Some((false, MarkdownNodeKind::Underline, character)),
+                    '\u{e002}' => Some((true, MarkdownNodeKind::Spoiler, '\u{e003}')),
+                    '\u{e003}' => Some((false, MarkdownNodeKind::Spoiler, character)),
+                    _ => None,
+                };
+                if let Some((opening, kind, closing)) = token {
+                    *events = events.saturating_add(1);
+                    if *events > MAX_MARKDOWN_EVENTS {
+                        return Err(MarkdownError::TooComplex);
+                    }
+                    if !plain.is_empty() {
+                        append_markdown_node(
+                            &mut output,
+                            &mut groups,
+                            text_node(std::mem::take(&mut plain)),
+                        );
+                    }
+                    if opening {
+                        if depth + groups.len() >= MAX_MARKDOWN_DEPTH {
+                            return Err(MarkdownError::TooComplex);
+                        }
+                        groups.push((kind, Vec::new(), closing));
+                    } else if groups.last().is_some_and(|group| group.0 == kind) {
+                        let (kind, children, _) = groups.pop().expect("matching marker group");
+                        append_markdown_node(
+                            &mut output,
+                            &mut groups,
+                            MarkdownNode { kind, children },
+                        );
+                    } else {
+                        append_markdown_node(&mut output, &mut groups, text_node("||".into()));
+                    }
+                } else {
+                    plain.push(character);
+                }
+            }
+            if !plain.is_empty() {
+                append_markdown_node(&mut output, &mut groups, text_node(plain));
+            }
+        } else {
+            append_markdown_node(&mut output, &mut groups, node);
+        }
+    }
+    while let Some((kind, mut children, _)) = groups.pop() {
+        let marker = if kind == MarkdownNodeKind::Underline {
+            "__"
+        } else {
+            "||"
+        };
+        let mut flattened = vec![text_node(marker.into())];
+        flattened.append(&mut children);
+        for node in flattened {
+            append_markdown_node(&mut output, &mut groups, node);
+        }
+    }
+    *nodes = output;
+    Ok(())
+}
+
+fn append_markdown_node(
+    output: &mut Vec<MarkdownNode>,
+    groups: &mut [(MarkdownNodeKind, Vec<MarkdownNode>, char)],
+    node: MarkdownNode,
+) {
+    if let Some((_, children, _)) = groups.last_mut() {
+        children.push(node);
+    } else {
+        output.push(node);
+    }
+}
+
+fn text_node(text: String) -> MarkdownNode {
+    MarkdownNode {
+        kind: MarkdownNodeKind::Text(text),
+        children: Vec::new(),
+    }
 }
 
 fn append_leaf(root: &mut MarkdownNode, stack: &mut [MarkdownNode], kind: MarkdownNodeKind) {
@@ -296,6 +543,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_underline_spoilers_and_mixed_formatting_without_touching_code() {
+        let parsed = parse_markdown(
+            "__souligné__ **gras** ||secret|| `__code__ ||code||`\n\n```text\n__bloc__ ||bloc||\n```",
+        )
+        .unwrap();
+        assert!(contains_kind(&parsed, |kind| matches!(
+            kind,
+            MarkdownNodeKind::Underline
+        )));
+        assert!(contains_kind(&parsed, |kind| matches!(
+            kind,
+            MarkdownNodeKind::Spoiler
+        )));
+        assert!(contains_kind(&parsed, |kind| matches!(
+            kind,
+            MarkdownNodeKind::Strong
+        )));
+        assert!(contains_kind(&parsed, |kind| matches!(
+            kind,
+            MarkdownNodeKind::InlineCode(text) if text.contains("__code__") && text.contains("||code||")
+        )));
+        assert!(contains_kind(&parsed, |kind| matches!(
+            kind,
+            MarkdownNodeKind::Text(text) if text.contains("__bloc__ ||bloc||")
+        )));
+    }
+
+    #[test]
     fn input_and_parse_complexity_are_bounded() {
         assert_eq!(
             parse_markdown(&"x".repeat(MAX_MARKDOWN_BYTES + 1)),
@@ -303,6 +578,11 @@ mod tests {
         );
         let dense = "**x** ".repeat(MAX_MARKDOWN_EVENTS / 2 + 1);
         assert_eq!(parse_markdown(&dense), Err(MarkdownError::TooComplex));
+        let custom_dense = "||x||".repeat(MAX_MARKDOWN_EVENTS / 2 + 1);
+        assert_eq!(
+            parse_markdown(&custom_dense),
+            Err(MarkdownError::TooComplex)
+        );
     }
 
     fn contains_kind(

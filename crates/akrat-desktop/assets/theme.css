@@ -202,6 +202,8 @@ textarea { min-height: 74px; resize: vertical; font: 11px var(--mono); line-heig
 .message-markdown th { color: var(--accent-soft); background: #ffffff08; }
 .message-markdown a { color: var(--accent-soft); text-decoration: underline; text-underline-offset: 2px; }
 .markdown-link-blocked { text-decoration: underline dotted; }
+.markdown-spoiler { padding: 0 5px; border: 0; border-radius: 4px; background: #ffffff18; color: var(--muted); font: inherit; cursor: pointer; }
+.markdown-spoiler.revealed { background: #ff98581a; color: var(--text); }
 .message-markdown hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 .message-markdown input[type="checkbox"] { accent-color: var(--accent); margin: 0 6px 0 0; }
 .message-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
