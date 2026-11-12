@@ -66,6 +66,8 @@ jobs:
     name: Desktop Windows · PC AKRAT
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, Windows, X64, akrat-local]
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
 
@@ -80,8 +82,6 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
           "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$root\bin\protoc.exe" --version
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -142,6 +142,8 @@ jobs:
     name: Desktop Windows · PC AKRAT (pull requests)
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64, akrat-local]
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
 
@@ -156,8 +158,6 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
           "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$root\bin\protoc.exe" --version
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
