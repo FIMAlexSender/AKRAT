@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: akrat-build-${{ github.ref }}
-  cancel-in-progress: true
+  group: akrat-build-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   desktop:
