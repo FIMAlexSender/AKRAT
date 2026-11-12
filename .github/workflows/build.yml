@@ -38,6 +38,8 @@ jobs:
           protoc --version
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
