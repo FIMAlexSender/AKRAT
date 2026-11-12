@@ -26,7 +26,7 @@ def copy_asset(source: Path, output: Path, name: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--version", default="0.1.9")
+    parser.add_argument("--version", default="0.1.10")
     args = parser.parse_args()
 
     root = args.root.resolve()

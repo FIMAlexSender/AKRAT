@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/akrat-core", "crates/akrat-cli", "crates/akrat-desktop", "crates/akrat-mailbox"]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.93.1"

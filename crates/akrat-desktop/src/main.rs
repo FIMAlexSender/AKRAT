@@ -70,18 +70,55 @@ enum VaultGateTab {
     Create,
 }
 
+#[derive(Clone, Copy)]
+struct VaultCreationSignals {
+    path: Signal<PathBuf>,
+    paths: Signal<Vec<PathBuf>>,
+    path_input: Signal<String>,
+    session_phrase: Signal<String>,
+    vault: Signal<Option<VaultData>>,
+    create_phrase: Signal<String>,
+    confirm_phrase: Signal<String>,
+    notice: Signal<String>,
+}
+
 #[component]
 fn App() -> Element {
-    let path = use_signal(default_vault_path);
-    let vault_paths = use_signal(|| vault_catalog::load(&default_vault_path()));
-    let vault_path_input = use_signal(|| default_vault_path().display().to_string());
+    let catalog_state = use_hook(|| {
+        let default = default_vault_path();
+        let mut state = vault_catalog::load(&default);
+        if let Some(selected) = vault_catalog::preferred_existing_path(&state.paths)
+            && let Some(index) = state
+                .paths
+                .iter()
+                .position(|candidate| candidate == &selected)
+            && index > 0
+        {
+            let selected = state.paths.remove(index);
+            state.paths.insert(0, selected);
+            if let Err(error) = vault_catalog::save(&default, &state.paths) {
+                state.warning = Some(match state.warning.take() {
+                    Some(warning) => format!("{warning} {error}"),
+                    None => format!(
+                        "Sélection restaurée pour cette ouverture, mais impossible de la mémoriser : {error}"
+                    ),
+                });
+            }
+        }
+        state
+    });
+    let startup_path = vault_catalog::preferred_existing_path(&catalog_state.paths)
+        .unwrap_or_else(default_vault_path);
+    let path = use_signal(|| startup_path.clone());
+    let vault_paths = use_signal(|| catalog_state.paths.clone());
+    let vault_path_input = use_signal(|| startup_path.display().to_string());
     let mut vault = use_signal(|| None::<VaultData>);
     let mut passphrase = use_signal(String::new);
     let identity_name = use_signal(String::new);
     let import_uri = use_signal(String::new);
     let contact_name = use_signal(String::new);
     let invitation_result = use_signal(String::new);
-    let mut notice = use_signal(String::new);
+    let mut notice = use_signal(|| catalog_state.warning.clone().unwrap_or_default());
     let mut last_activity = use_signal(Instant::now);
     let mut update_status = use_signal(|| updater::UpdateStatus::Checking);
     let mut page = use_signal(|| Page::Messages);
@@ -607,11 +644,24 @@ fn VaultGate(
     mut notice: Signal<String>,
 ) -> Element {
     let selected_path = path.read().clone();
-    let selected_exists = selected_path.is_file();
+    let selected_exists = vault_paths
+        .read()
+        .iter()
+        .any(|registered| registered == &selected_path)
+        && selected_path.is_file();
     let selected_open_path = selected_path.clone();
+    let selected_for_enter = selected_open_path.clone();
+    let selected_for_button = selected_open_path.clone();
+    let selected_name = selected_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Coffre AKRAT")
+        .to_string();
     let default_path = default_vault_path();
     let default_for_browse = default_path.clone();
     let default_for_create = default_path.clone();
+    let default_for_create_enter = default_path.clone();
+    let default_for_select = default_path.clone();
     let mut tab = use_signal(|| VaultGateTab::Existing);
     let mut new_vault_name = use_signal(|| {
         default_vault_path()
@@ -620,12 +670,33 @@ fn VaultGate(
             .unwrap_or("vault")
             .to_string()
     });
+    let mut open_passphrase = use_signal(String::new);
+    let mut create_passphrase = use_signal(String::new);
+    let mut create_directory = use_signal(|| {
+        default_vault_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    });
+    let mut show_open_passphrase = use_signal(|| false);
+    let mut show_create_passphrase = use_signal(|| false);
     let mut confirm_passphrase = use_signal(String::new);
     let mut manage_path = use_signal(|| None::<PathBuf>);
     let mut manage_passphrase = use_signal(String::new);
     let mut rename_name = use_signal(String::new);
     let mut manage_verified = use_signal(|| false);
     let mut confirm_delete = use_signal(|| false);
+    let creation_signals = VaultCreationSignals {
+        path,
+        paths: vault_paths,
+        path_input: vault_path_input,
+        session_phrase: passphrase,
+        vault,
+        create_phrase: create_passphrase,
+        confirm_phrase: confirm_passphrase,
+        notice,
+    };
 
     rsx! {
         section { class: "gate vault-gate",
@@ -634,15 +705,7 @@ fn VaultGate(
             p { class: "intro", "Ouvrez un coffre chiffré existant ou créez-en un nouveau. Chaque coffre garde ses propres identités, contacts et conversations." }
             div { class: "vault-tabs",
                 button { class: if *tab.read() == VaultGateTab::Existing { "vault-tab active" } else { "vault-tab" }, onclick: move |_| { tab.set(VaultGateTab::Existing); notice.set(String::new()); }, "Ouvrir un coffre" }
-                button { class: if *tab.read() == VaultGateTab::Create { "vault-tab active" } else { "vault-tab" }, onclick: move |_| {
-                    tab.set(VaultGateTab::Create);
-                    passphrase.set(String::new());
-                    confirm_passphrase.set(String::new());
-                    let current_path = path.read().clone();
-                    vault_path_input.set(current_path.display().to_string());
-                    if let Some(stem) = current_path.file_stem().and_then(|name| name.to_str()) { new_vault_name.set(stem.to_string()); }
-                    notice.set(String::new());
-                }, "Créer un coffre" }
+                button { class: if *tab.read() == VaultGateTab::Create { "vault-tab active" } else { "vault-tab" }, onclick: move |_| { tab.set(VaultGateTab::Create); notice.set(String::new()); }, "Créer un coffre" }
             }
             if *tab.read() == VaultGateTab::Existing {
                 section { class: "vault-manager panel",
@@ -652,11 +715,17 @@ fn VaultGate(
                         {
                             let entry_path = entry.clone();
                             let entry_for_manage = entry.clone();
+                            let entry_for_localize = entry.clone();
+                            let entry_for_folder = entry.clone();
+                            let entry_for_unlink = entry.clone();
                             let entry_for_verify = entry.clone();
                             let entry_for_rename = entry.clone();
                             let entry_for_delete = entry.clone();
                             let default_for_rename = default_path.clone();
+                            let default_for_localize = default_path.clone();
+                            let default_for_unlink = default_path.clone();
                             let default_for_delete = default_path.clone();
+                            let default_for_entry_select = default_for_select.clone();
                             let is_selected = entry == &selected_path;
                             let exists = entry.is_file();
                             let label = entry.file_stem().and_then(|name| name.to_str()).unwrap_or("Coffre AKRAT").to_string();
@@ -665,13 +734,18 @@ fn VaultGate(
                             rsx! {
                                 div { class: if is_selected { "vault-entry selected" } else { "vault-entry" },
                                     button { class: "vault-entry-select", onclick: move |_| {
-                                        path.set(entry_path.clone());
-                                        vault_path_input.set(entry_path.display().to_string());
-                                        passphrase.set(String::new());
-                                        notice.set(String::new());
+                                        let mut paths = vault_paths.read().clone();
+                                        vault_catalog::select(&mut paths, &entry_path);
+                                        match vault_catalog::save(&default_for_entry_select, &paths) {
+                                            Ok(()) => { path.set(entry_path.clone()); vault_path_input.set(entry_path.display().to_string()); open_passphrase.set(String::new()); vault_paths.set(paths); notice.set(String::new()); },
+                                            Err(error) => notice.set(error),
+                                        }
                                     },
-                                        span { class: "vault-entry-title", strong { "{label}" } span { class: "vault-entry-status", if exists { "Présent" } else { "Introuvable" } } }
-                                        span { class: "vault-entry-path", "{detail}" }
+                                        span { class: "vault-entry-icon", aria_hidden: "true", svg { view_box: "0 0 24 24", width: "19", height: "19", fill: "none", stroke: "currentColor", stroke_width: "1.7", stroke_linecap: "round", stroke_linejoin: "round", path { d: "M4 7.5 12 3l8 4.5v12a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19.5Z" } path { d: "M9 21v-7h6v7M4 8l8 4 8-4" } } }
+                                        span { class: "vault-entry-copy",
+                                            span { class: "vault-entry-title", strong { "{label}" } span { class: if exists { "vault-entry-status" } else { "vault-entry-status missing" }, if exists { "Présent" } else { "Introuvable" } } }
+                                            span { class: "vault-entry-path", "{detail}" }
+                                        }
                                     }
                                     button { class: "secondary compact vault-manage-button", onclick: move |_| {
                                         let name = entry_for_manage.file_stem().and_then(|value| value.to_str()).unwrap_or("vault").to_string();
@@ -686,6 +760,39 @@ fn VaultGate(
                                 if is_managing {
                                     section { class: "vault-management panel",
                                         div { class: "panel-title", "Gérer · {label}" }
+                                        p { class: "vault-entry-path", "{detail}" }
+                                        if !exists {
+                                            p { class: "quiet", "Ce fichier est introuvable. Il peut être sur un disque externe temporairement déconnecté." }
+                                            if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
+                                                button { class: "secondary", onclick: move |_| {
+                                                    if let Some(found) = choose_existing_vault() {
+                                                        let mut paths = vault_paths.read().clone();
+                                                        if vault_catalog::replace(&mut paths, &entry_for_localize, found.clone()) {
+                                                            match vault_catalog::save(&default_for_localize, &paths) {
+                                                                Ok(()) => { if *path.read() == entry_for_localize { path.set(found.clone()); vault_path_input.set(found.display().to_string()); } vault_paths.set(paths); manage_path.set(None); notice.set("Emplacement du coffre mis à jour. Son fichier n’a pas été déplacé.".into()); },
+                                                                Err(error) => notice.set(error),
+                                                            }
+                                                        }
+                                                    }
+                                                }, "Localiser le coffre…" }
+                                            }
+                                        } else {
+                                            button { class: "secondary compact", onclick: move |_| open_vault_folder(&entry_for_folder), "Ouvrir le dossier" }
+                                        }
+                                        button { class: "secondary compact", onclick: move |_| {
+                                            let mut paths = vault_paths.read().clone();
+                                            vault_catalog::remove(&mut paths, &entry_for_unlink);
+                                            match vault_catalog::save(&default_for_unlink, &paths) {
+                                                Ok(()) => {
+                                                    if *path.read() == entry_for_unlink {
+                                                        let next = paths.iter().find(|candidate| candidate.is_file()).cloned().unwrap_or_else(default_vault_path);
+                                                        path.set(next.clone()); vault_path_input.set(next.display().to_string()); open_passphrase.set(String::new());
+                                                    }
+                                                    vault_paths.set(paths); manage_path.set(None); manage_passphrase.set(String::new()); notice.set("Coffre dissocié. Son fichier et son contenu sont conservés.".into());
+                                                },
+                                                Err(error) => notice.set(error),
+                                            }
+                                        }, "Dissocier sans supprimer" }
                                         p { class: "quiet", "La phrase secrète confirme que ce coffre vous appartient." }
                                         label { "Phrase secrète de ce coffre" input { r#type: "password", value: "{manage_passphrase}", placeholder: "Phrase secrète actuelle", oninput: move |event| { manage_passphrase.set(event.value()); manage_verified.set(false); confirm_delete.set(false); } } }
                                         if !*manage_verified.read() {
@@ -702,21 +809,8 @@ fn VaultGate(
                                             button { class: "secondary", onclick: move |_| {
                                                 let phrase = manage_passphrase.read().clone();
                                                 if let Err(error) = load_vault(&entry_for_rename, &phrase) { manage_verified.set(false); notice.set(format!("Vérification refusée : {error}")); return; }
-                                                let renamed = match vault_path_with_name(&entry_for_rename, &rename_name.read()) { Ok(path) => path, Err(error) => { notice.set(error); return; } };
-                                                if renamed == entry_for_rename { notice.set("Ce coffre porte déjà ce nom.".into()); return; }
-                                                if renamed.exists() { notice.set("Un fichier existe déjà avec ce nom.".into()); return; }
-                                                if let Err(error) = std::fs::rename(&entry_for_rename, &renamed) { notice.set(format!("Renommage impossible : {error}")); return; }
-                                                let mut paths = vault_paths.read().clone();
-                                                if !vault_catalog::replace(&mut paths, &entry_for_rename, renamed.clone()) {
-                                                    let _ = std::fs::rename(&renamed, &entry_for_rename);
-                                                    notice.set("Ce coffre n’est plus dans la liste. Réessayez.".into());
-                                                    return;
-                                                }
-                                                if let Err(error) = vault_catalog::save(&default_for_rename, &paths) {
-                                                    let rollback = std::fs::rename(&renamed, &entry_for_rename);
-                                                    notice.set(match rollback { Ok(()) => format!("Liste des coffres non enregistrée : {error}"), Err(rollback_error) => format!("Liste non enregistrée ({error}) et retour arrière impossible ({rollback_error}).") });
-                                                    return;
-                                                }
+                                                let existing = vault_paths.read().clone();
+                                                let (renamed, paths) = match rename_vault_file(&default_for_rename, &existing, &entry_for_rename, &rename_name.read()) { Ok(result) => result, Err(error) => { notice.set(error); return; } };
                                                 if *path.read() == entry_for_rename { path.set(renamed.clone()); vault_path_input.set(renamed.display().to_string()); }
                                                 vault_paths.set(paths);
                                                 manage_path.set(None);
@@ -725,7 +819,11 @@ fn VaultGate(
                                             }, "Renommer le coffre" }
                                             div { class: "vault-danger-zone",
                                                 strong { "Supprimer le fichier du coffre" }
-                                                p { "Cette action efface ce coffre et tout son historique de cet appareil." }
+                                                if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
+                                                    p { "AKRAT essaie de placer le coffre dans la Corbeille. Cette action ne garantit pas l’effacement physique des données sur SSD." }
+                                                } else {
+                                                    p { "Le fichier privé sera supprimé de cet appareil. Cela ne garantit pas l’effacement physique des données sur mémoire flash." }
+                                                }
                                                 if !*confirm_delete.read() {
                                                     button { class: "danger-button", onclick: move |_| confirm_delete.set(true), "Supprimer…" }
                                                 } else {
@@ -734,18 +832,9 @@ fn VaultGate(
                                                         button { class: "secondary", onclick: move |_| confirm_delete.set(false), "Annuler" }
                                                         button { class: "danger-button", onclick: move |_| {
                                                             let phrase = manage_passphrase.read().clone();
-                                                            if let Err(error) = load_vault(&entry_for_delete, &phrase) { manage_verified.set(false); confirm_delete.set(false); notice.set(format!("Suppression refusée : {error}")); return; }
-                                                            let mut paths = vault_paths.read().clone();
-                                                            vault_catalog::remove(&mut paths, &entry_for_delete);
-                                                            if paths.is_empty() { paths.push(default_for_delete.clone()); }
-                                                            if let Err(error) = vault_catalog::save(&default_for_delete, &paths) { notice.set(format!("Liste des coffres impossible à mettre à jour : {error}")); return; }
-                                                            if let Err(error) = std::fs::remove_file(&entry_for_delete) {
-                                                                let _ = vault_catalog::add(&mut paths, entry_for_delete.clone());
-                                                                let _ = vault_catalog::save(&default_for_delete, &paths);
-                                                                notice.set(format!("Suppression impossible : {error}"));
-                                                                return;
-                                                            }
-                                                            let fallback = paths.first().cloned().unwrap_or_else(|| default_for_delete.clone());
+                                                            let existing = vault_paths.read().clone();
+                                                            let paths = match delete_vault_file(&default_for_delete, &existing, &entry_for_delete, &phrase) { Ok(paths) => paths, Err(error) => { manage_verified.set(false); confirm_delete.set(false); notice.set(error); return; } };
+                                                            let fallback = paths.iter().find(|candidate| candidate.is_file()).cloned().unwrap_or_else(|| default_for_delete.clone());
                                                             if *path.read() == entry_for_delete { path.set(fallback.clone()); vault_path_input.set(fallback.display().to_string()); }
                                                             vault_paths.set(paths);
                                                             manage_path.set(None);
@@ -764,12 +853,17 @@ fn VaultGate(
                         }
                     }
                 }
-                label { "Phrase secrète" input { r#type: "password", value: "{passphrase}", placeholder: "Phrase secrète du coffre sélectionné", oninput: move |event| passphrase.set(event.value()) } }
+                if selected_exists { p { class: "vault-selected-name", "Ouverture de · {selected_name}" } }
+                label { "Phrase secrète" input { r#type: if *show_open_passphrase.read() { "text" } else { "password" }, value: "{open_passphrase}", placeholder: "Phrase secrète du coffre sélectionné", oninput: move |event| open_passphrase.set(event.value()), onkeydown: move |event| if event.key() == Key::Enter && selected_exists {
+                    let phrase = open_passphrase.read().clone();
+                    match load_vault(&selected_for_enter, &phrase) { Ok(data) => { passphrase.set(phrase); vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }, Err(error) => notice.set(format!("Impossible de déverrouiller ce coffre : {error}")) }
+                } } }
+                button { class: "secondary compact", onclick: move |_| { let next = !*show_open_passphrase.read(); show_open_passphrase.set(next); }, if *show_open_passphrase.read() { "Masquer" } else { "Afficher" } }
                 if selected_exists {
                     button { class: "primary gate-primary-action", onclick: move |_| {
-                        let phrase = passphrase.read().clone();
-                        match load_vault(&selected_open_path, &phrase) {
-                            Ok(data) => { vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }
+                        let phrase = open_passphrase.read().clone();
+                        match load_vault(&selected_for_button, &phrase) {
+                            Ok(data) => { passphrase.set(phrase); vault.set(Some(data)); notice.set("Coffre déverrouillé.".into()); }
                             Err(error) => notice.set(format!("Impossible de déverrouiller ce coffre : {error}")),
                         }
                     }, "Déverrouiller le coffre sélectionné" }
@@ -781,58 +875,276 @@ fn VaultGate(
                         if let Some(chosen) = choose_existing_vault() {
                             let mut paths = vault_paths.read().clone();
                             vault_catalog::add(&mut paths, chosen.clone());
+                            vault_catalog::select(&mut paths, &chosen);
                             match vault_catalog::save(&default_for_browse, &paths) {
-                                Ok(()) => { vault_paths.set(paths); path.set(chosen); passphrase.set(String::new()); notice.set("Coffre ajouté à la liste.".into()); },
+                                Ok(()) => { vault_paths.set(paths); vault_path_input.set(chosen.display().to_string()); path.set(chosen); open_passphrase.set(String::new()); notice.set("Coffre ajouté à la liste.".into()); },
                                 Err(error) => notice.set(error),
                             }
                         }
                     }, "Parcourir les fichiers pour trouver un coffre…" }
+                }
+                if cfg!(target_os = "android") {
+                    label { class: "mobile-vault-import",
+                        span { "Importer un coffre depuis le téléphone…" }
+                        input { r#type: "file", accept: ".akrat,application/octet-stream", onchange: move |event| {
+                            let Some(file) = event.files().into_iter().next() else { return; };
+                            if file.size() > 16 * 1024 * 1024 { notice.set("Ce fichier dépasse la taille maximale de 16 Mio.".into()); return; }
+                            let file_name = file.name();
+                            let existing = vault_paths.read().clone();
+                            let default_for_import = default_path.clone();
+                            spawn(async move {
+                                match file.read_bytes().await {
+                                    Ok(bytes) => match import_vault_bytes(&default_for_import, &existing, &file_name, &bytes) {
+                                        Ok((imported, paths)) => { vault_paths.set(paths); path.set(imported.clone()); vault_path_input.set(imported.display().to_string()); open_passphrase.set(String::new()); notice.set("Copie privée importée et sélectionnée. Saisissez sa phrase secrète.".into()); },
+                                        Err(error) => notice.set(error),
+                                    },
+                                    Err(error) => notice.set(format!("Impossible de lire le fichier choisi : {error}")),
+                                }
+                            });
+                        } }
+                    }
                 }
             } else {
                 section { class: "panel vault-create-panel",
                     div { class: "panel-title", "Nouveau coffre chiffré" }
                     p { class: "quiet", "Choisissez un nom, un emplacement et une phrase secrète. La confirmation évite les erreurs de saisie." }
                     label { "Nom du coffre" input { value: "{new_vault_name}", placeholder: "Ex. Personnel", oninput: move |event| new_vault_name.set(event.value()) } }
-                    label { "Fichier de destination" input { r#type: "text", value: "{vault_path_input}", placeholder: "Chemin du fichier .akrat", oninput: move |event| vault_path_input.set(event.value()) } }
+                    label { "Dossier de destination" input { r#type: "text", value: "{create_directory}", placeholder: "Dossier où enregistrer le coffre", oninput: move |event| create_directory.set(event.value()) } }
                     if cfg!(all(feature = "desktop", not(target_os = "android"), not(target_os = "ios"))) {
                         button { class: "secondary browse-vault-button", onclick: move |_| {
-                            if let Some(chosen) = choose_new_vault_path() {
-                                vault_path_input.set(chosen.display().to_string());
-                                new_vault_name.set(chosen.file_stem().and_then(|name| name.to_str()).unwrap_or("vault").to_string());
-                            }
+                            if let Some(chosen) = choose_new_vault_directory() { create_directory.set(chosen.display().to_string()); }
                         }, "Choisir un emplacement…" }
                     }
-                    label { "Phrase secrète · 12 caractères minimum" input { r#type: "password", value: "{passphrase}", placeholder: "Créer une phrase secrète", oninput: move |event| passphrase.set(event.value()) } }
-                    label { "Confirmer la phrase secrète" input { r#type: "password", value: "{confirm_passphrase}", placeholder: "Saisir la même phrase secrète", oninput: move |event| confirm_passphrase.set(event.value()) } }
-                    button { class: "primary gate-primary-action", onclick: move |_| {
-                        let phrase = passphrase.read().clone();
+                    label { "Phrase secrète · 12 caractères minimum" input { r#type: if *show_create_passphrase.read() { "text" } else { "password" }, value: "{create_passphrase}", placeholder: "Créer une phrase secrète", oninput: move |event| create_passphrase.set(event.value()) } }
+                    label { "Confirmer la phrase secrète" input { r#type: if *show_create_passphrase.read() { "text" } else { "password" }, value: "{confirm_passphrase}", placeholder: "Saisir la même phrase secrète", oninput: move |event| confirm_passphrase.set(event.value()), onkeydown: move |event| if event.key() == Key::Enter {
+                        let phrase = create_passphrase.read().clone();
                         let confirmation = confirm_passphrase.read().clone();
-                        if phrase.len() < 12 { notice.set("La phrase secrète doit contenir au moins 12 caractères.".into()); return; }
-                        if phrase != confirmation { notice.set("Les deux phrases secrètes ne correspondent pas.".into()); return; }
-                        let base = PathBuf::from(vault_path_input.read().trim());
-                        let destination = match vault_path_with_name(&base, &new_vault_name.read()) { Ok(path) => path, Err(error) => { notice.set(error); return; } };
-                        if destination.exists() { notice.set("Un fichier existe déjà à cet emplacement. Choisissez un autre nom ou dossier.".into()); return; }
-                        let mut data = VaultData::default();
-                        if let Err(error) = save_vault(&destination, &mut data, &phrase) { notice.set(format!("Création impossible : {error}")); return; }
-                        let mut paths = vault_paths.read().clone();
-                        vault_catalog::add(&mut paths, destination.clone());
-                        if let Err(error) = vault_catalog::save(&default_for_create, &paths) {
-                            let _ = std::fs::remove_file(&destination);
-                            notice.set(format!("Impossible d’enregistrer le coffre dans la liste : {error}"));
-                            return;
-                        }
-                        path.set(destination.clone());
-                        vault_path_input.set(destination.display().to_string());
-                        vault_paths.set(paths);
-                        vault.set(Some(data));
-                        confirm_passphrase.set(String::new());
-                        notice.set("Coffre créé et chiffré. Le réseau démarre automatiquement.".into());
+                        let folder = create_directory.read().clone();
+                        let name = new_vault_name.read().clone();
+                        let existing = vault_paths.read().clone();
+                        let result = create_vault_file(&default_for_create_enter, &existing, &folder, &name, &phrase, &confirmation);
+                        apply_created_vault(result, phrase, creation_signals);
+                    } } }
+                    button { class: "secondary compact", onclick: move |_| { let next = !*show_create_passphrase.read(); show_create_passphrase.set(next); }, if *show_create_passphrase.read() { "Masquer les phrases" } else { "Afficher la phrase" } }
+                    button { class: "primary gate-primary-action", onclick: move |_| {
+                        let phrase = create_passphrase.read().clone();
+                        let confirmation = confirm_passphrase.read().clone();
+                        let folder = create_directory.read().clone();
+                        let name = new_vault_name.read().clone();
+                        let existing = vault_paths.read().clone();
+                        let result = create_vault_file(&default_for_create, &existing, &folder, &name, &phrase, &confirmation);
+                        apply_created_vault(result, phrase, creation_signals);
                     }, "Créer et chiffrer le coffre" }
                 }
             }
             p { class: "notice", "{notice}" }
             if *tab.read() == VaultGateTab::Existing { div { class: "path-note", "COFFRE SÉLECTIONNÉ · {selected_path.display()}" } }
         }
+    }
+}
+
+fn create_vault_file(
+    catalog_path: &Path,
+    existing_paths: &[PathBuf],
+    folder: &str,
+    name: &str,
+    passphrase: &str,
+    confirmation: &str,
+) -> Result<(PathBuf, Vec<PathBuf>, VaultData), String> {
+    if passphrase.len() < 12 {
+        return Err("La phrase secrète doit contenir au moins 12 caractères.".into());
+    }
+    if passphrase != confirmation {
+        return Err("Les deux phrases secrètes ne correspondent pas.".into());
+    }
+    let folder = PathBuf::from(folder.trim());
+    if !folder.is_dir() {
+        return Err("Le dossier de destination n’existe pas ou n’est pas accessible.".into());
+    }
+    let destination = vault_path_with_name(&folder, name)?;
+    if destination.exists() {
+        return Err(
+            "Un fichier existe déjà à cet emplacement. Choisissez un autre nom ou dossier.".into(),
+        );
+    }
+    let mut data = VaultData::default();
+    save_vault(&destination, &mut data, passphrase)
+        .map_err(|error| format!("Création impossible : {error}"))?;
+    let mut paths = existing_paths.to_vec();
+    vault_catalog::add(&mut paths, destination.clone());
+    if let Err(error) = vault_catalog::save(catalog_path, &paths) {
+        return Err(format!(
+            "Le coffre a été créé à {} mais son catalogue n’a pas pu être enregistré : {error}",
+            destination.display()
+        ));
+    }
+    Ok((destination, paths, data))
+}
+
+fn import_vault_bytes(
+    default_path: &Path,
+    existing_paths: &[PathBuf],
+    source_name: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    const MAX_PORTABLE_VAULT_SIZE: usize = 16 * 1024 * 1024;
+    if bytes.is_empty() || bytes.len() > MAX_PORTABLE_VAULT_SIZE {
+        return Err(
+            "Le fichier ne correspond pas à un coffre AKRAT valide ou dépasse 16 Mio.".into(),
+        );
+    }
+    let directory = default_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("Dossier privé du coffre inaccessible : {error}"))?;
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("Nom de fichier de coffre invalide.")?;
+    let mut suffix = 1u32;
+    let destination = loop {
+        let name = if suffix == 1 {
+            stem.to_string()
+        } else {
+            format!("{stem} ({suffix})")
+        };
+        let candidate = vault_path_with_name(directory, &name)?;
+        if !candidate.exists() && !existing_paths.iter().any(|path| path == &candidate) {
+            break candidate;
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or("Impossible de générer un nom libre pour le coffre importé.")?;
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = directory.join(format!(".akrat-import-{}-{nonce}.tmp", std::process::id()));
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &destination)
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("Copie du coffre impossible : {error}"));
+    }
+    let mut paths = existing_paths.to_vec();
+    vault_catalog::add(&mut paths, destination.clone());
+    if let Err(error) = vault_catalog::save(default_path, &paths) {
+        return Err(format!(
+            "Le coffre a été copié dans {} mais son catalogue n’a pas pu être enregistré : {error}",
+            destination.display()
+        ));
+    }
+    Ok((destination, paths))
+}
+
+fn rename_vault_file(
+    default_path: &Path,
+    existing_paths: &[PathBuf],
+    source: &Path,
+    new_name: &str,
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    if !source.is_file() {
+        return Err("Le fichier du coffre est introuvable.".into());
+    }
+    if !existing_paths.iter().any(|path| path == source) {
+        return Err("Ce coffre n’est plus enregistré dans le catalogue.".into());
+    }
+    let destination = vault_path_with_name(source, new_name)?;
+    if destination == source {
+        return Err("Ce coffre porte déjà ce nom.".into());
+    }
+    if destination.exists() {
+        return Err("Un fichier existe déjà avec ce nom.".into());
+    }
+    std::fs::rename(source, &destination)
+        .map_err(|error| format!("Renommage impossible : {error}"))?;
+    let paths = match vault_catalog::replace_and_save(default_path, source, destination.clone()) {
+        Ok(paths) => paths,
+        Err(error) => {
+            let rollback = std::fs::rename(&destination, source);
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => format!(
+                    "Catalogue non enregistré ({error}) et retour arrière impossible ({rollback_error})."
+                ),
+            });
+        }
+    };
+    Ok((destination, paths))
+}
+
+fn delete_vault_file(
+    default_path: &Path,
+    existing_paths: &[PathBuf],
+    source: &Path,
+    passphrase: &str,
+) -> Result<Vec<PathBuf>, String> {
+    load_vault(source, passphrase).map_err(|error| format!("Suppression refusée : {error}"))?;
+    let mut paths = existing_paths.to_vec();
+    vault_catalog::remove(&mut paths, source);
+    vault_catalog::save(default_path, &paths)
+        .map_err(|error| format!("Liste des coffres impossible à mettre à jour : {error}"))?;
+    if let Err(error) = move_vault_to_trash(source) {
+        vault_catalog::add(&mut paths, source.to_path_buf());
+        return match vault_catalog::save(default_path, &paths) {
+            Ok(()) => Err(error),
+            Err(catalog_error) => Err(format!(
+                "{error}. Restauration du catalogue impossible : {catalog_error}"
+            )),
+        };
+    }
+    Ok(paths)
+}
+
+fn move_vault_to_trash(path: &Path) -> Result<(), String> {
+    #[cfg(all(
+        feature = "desktop",
+        not(test),
+        not(target_os = "android"),
+        not(target_os = "ios")
+    ))]
+    {
+        trash::delete(path)
+            .map_err(|error| format!("Impossible de placer le coffre dans la Corbeille : {error}"))
+    }
+    #[cfg(any(
+        test,
+        not(feature = "desktop"),
+        target_os = "android",
+        target_os = "ios"
+    ))]
+    {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("Suppression du fichier impossible : {error}"))
+    }
+}
+
+fn apply_created_vault(
+    result: Result<(PathBuf, Vec<PathBuf>, VaultData), String>,
+    phrase: String,
+    mut signals: VaultCreationSignals,
+) {
+    match result {
+        Ok((destination, paths, data)) => {
+            signals.path.set(destination.clone());
+            signals.path_input.set(destination.display().to_string());
+            signals.paths.set(paths);
+            signals.session_phrase.set(phrase);
+            signals.vault.set(Some(data));
+            signals.create_phrase.set(String::new());
+            signals.confirm_phrase.set(String::new());
+            signals
+                .notice
+                .set("Coffre créé et chiffré. Le réseau démarre automatiquement.".into());
+        }
+        Err(error) => signals.notice.set(error),
     }
 }
 
@@ -879,11 +1191,8 @@ fn choose_existing_vault() -> Option<PathBuf> {
     not(target_os = "android"),
     not(target_os = "ios")
 ))]
-fn choose_new_vault_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Coffre AKRAT", &["akrat"])
-        .set_file_name("vault.akrat")
-        .save_file()
+fn choose_new_vault_directory() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
 }
 
 #[cfg(any(not(feature = "desktop"), target_os = "android", target_os = "ios"))]
@@ -892,8 +1201,22 @@ fn choose_existing_vault() -> Option<PathBuf> {
 }
 
 #[cfg(any(not(feature = "desktop"), target_os = "android", target_os = "ios"))]
-fn choose_new_vault_path() -> Option<PathBuf> {
+fn choose_new_vault_directory() -> Option<PathBuf> {
     None
+}
+
+fn open_vault_folder(vault_path: &Path) {
+    let Some(folder) = vault_path.parent() else {
+        return;
+    };
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(folder).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(folder).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    let _ = folder;
 }
 
 #[component]
@@ -1941,3 +2264,123 @@ fn default_vault_path() -> PathBuf {
 }
 
 const CSS: &str = include_str!("../assets/theme.css");
+
+#[cfg(test)]
+mod vault_manager_tests {
+    use super::*;
+
+    #[test]
+    fn generated_name_has_one_extension_and_rejects_invalid_names() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            vault_path_with_name(directory.path(), "Personnel").unwrap(),
+            directory.path().join("Personnel.akrat")
+        );
+        assert_eq!(
+            vault_path_with_name(directory.path(), "Personnel.akrat").unwrap(),
+            directory.path().join("Personnel.akrat")
+        );
+        assert!(vault_path_with_name(directory.path(), "../private").is_err());
+    }
+
+    #[test]
+    fn creation_requires_matching_phrase_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("vaults");
+        std::fs::create_dir(&destination).unwrap();
+        let default = directory.path().join("default.akrat");
+        let mismatch = create_vault_file(
+            &default,
+            &[],
+            destination.to_str().unwrap(),
+            "Personnel",
+            "this is a sufficiently long phrase",
+            "a different phrase completely",
+        );
+        assert!(mismatch.is_err());
+        assert!(!destination.join("Personnel.akrat").exists());
+
+        let (created_path, paths, data) = create_vault_file(
+            &default,
+            &[],
+            destination.to_str().unwrap(),
+            "Personnel.akrat",
+            "this is a sufficiently long phrase",
+            "this is a sufficiently long phrase",
+        )
+        .unwrap();
+        assert_eq!(created_path, destination.join("Personnel.akrat"));
+        assert_eq!(paths, vec![created_path.clone()]);
+        assert!(data.identities.is_empty());
+        assert!(load_vault(&created_path, "this is a sufficiently long phrase").is_ok());
+
+        let collision = create_vault_file(
+            &default,
+            &paths,
+            destination.to_str().unwrap(),
+            "Personnel",
+            "this is a sufficiently long phrase",
+            "this is a sufficiently long phrase",
+        );
+        assert!(collision.is_err());
+        assert!(load_vault(&created_path, "this is a sufficiently long phrase").is_ok());
+    }
+
+    #[test]
+    fn rename_preserves_encrypted_file_and_delete_requires_the_passphrase() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_directory = directory.path().join("vaults");
+        std::fs::create_dir(&vault_directory).unwrap();
+        let default = directory.path().join("default.akrat");
+        let phrase = "this is a sufficiently long phrase";
+        let (original, paths, _) = create_vault_file(
+            &default,
+            &[],
+            vault_directory.to_str().unwrap(),
+            "Original",
+            phrase,
+            phrase,
+        )
+        .unwrap();
+        let bytes_before = std::fs::read(&original).unwrap();
+        let id_before = vault_catalog::id_for_path(&default, &original).unwrap();
+
+        let (renamed, paths) = rename_vault_file(&default, &paths, &original, "Personnel").unwrap();
+        assert_eq!(renamed, vault_directory.join("Personnel.akrat"));
+        assert!(!original.exists());
+        assert_eq!(std::fs::read(&renamed).unwrap(), bytes_before);
+        assert!(load_vault(&renamed, phrase).is_ok());
+        let id_after = vault_catalog::id_for_path(&default, &renamed).unwrap();
+        assert_eq!(id_before, id_after);
+
+        assert!(delete_vault_file(&default, &paths, &renamed, "incorrect phrase").is_err());
+        assert!(renamed.is_file());
+        let remaining = delete_vault_file(&default, &paths, &renamed, phrase).unwrap();
+        assert!(remaining.is_empty());
+        assert!(!renamed.exists());
+    }
+
+    #[test]
+    fn portable_import_copies_ciphertext_and_avoids_name_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_folder = directory.path().join("source");
+        std::fs::create_dir(&source_folder).unwrap();
+        let source = source_folder.join("Personnel.akrat");
+        let phrase = "this is a sufficiently long phrase";
+        let mut data = VaultData::default();
+        save_vault(&source, &mut data, phrase).unwrap();
+        let bytes = std::fs::read(&source).unwrap();
+        let default = directory.path().join("app-private-default.akrat");
+
+        let (first, paths) = import_vault_bytes(&default, &[], "Personnel.akrat", &bytes).unwrap();
+        assert_eq!(first.file_name().unwrap(), "Personnel.akrat");
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        assert!(load_vault(&first, phrase).is_ok());
+
+        let (second, paths) =
+            import_vault_bytes(&default, &paths, "Personnel.akrat", &bytes).unwrap();
+        assert_eq!(second.file_name().unwrap(), "Personnel (2).akrat");
+        assert_ne!(first, second);
+        assert_eq!(paths.len(), 2);
+    }
+}

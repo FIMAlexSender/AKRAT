@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "akrat"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "akrat-core",
  "clap",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-desktop"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "akrat-core",
  "akrat-mailbox",
@@ -166,13 +166,14 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "trash",
  "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "akrat-mailbox"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "akrat-core",
  "base64 0.22.1",
@@ -7695,6 +7696,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "trash"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e13ed7a76ae8b9053f33493745ebb4cd2e5ee1cccd9823bb96ec97b78ec4844"
+dependencies = [
+ "chrono",
+ "libc",
+ "log",
+ "objc2",
+ "objc2-foundation",
+ "once_cell",
+ "percent-encoding",
+ "scopeguard",
+ "urlencoding",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "tray-icon"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7808,6 +7828,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf-8"

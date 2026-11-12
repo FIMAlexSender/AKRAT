@@ -2,7 +2,7 @@ name: Build AKRAT
 
 on:
   push:
-    branches: [main, v0.1.9-mailbox-federation]
+    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -225,7 +225,7 @@ jobs:
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
-          AKRAT v0.1.9 apporte la livraison asynchrone chiffrée, la fédération de serveurs, la rotation authentifiée des clés de reçus et des limites anti-abus configurables.
+          AKRAT v0.1.10 ajoute un gestionnaire de coffres avec sélection restaurée, importation portable, renommage sans rechiffrement et catalogue récupérable. Les capacités de livraison différée et de fédération v0.1.9 sont conservées.
 
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
