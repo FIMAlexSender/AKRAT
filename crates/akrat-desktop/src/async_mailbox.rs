@@ -883,6 +883,7 @@ mod tests {
 
     const PHRASE: &str = "desktop-mailbox-flow-test-phrase";
     const MESSAGE_ID: &str = "d35a4b0c0ffee123";
+    const SECOND_MESSAGE_ID: &str = "d35a4b0c0ffee126";
     const EXPIRED_MESSAGE_ID: &str = "d35a4b0c0ffee124";
     const PARTIAL_RETRY_MESSAGE_ID: &str = "d35a4b0c0ffee125";
 
@@ -1014,6 +1015,7 @@ mod tests {
             mailbox_replicas: Vec::new(),
         };
         let mut bob_data = VaultData {
+            revision: 0,
             identities: vec![bob.detached_copy()],
             contacts: vec![alice_contact],
             mailbox_inboxes: vec![
@@ -1048,6 +1050,7 @@ mod tests {
         let conversation = format!("{}:{}", alice.id, bob.fingerprint());
         let message = "Message déposé pendant que Bob est hors ligne.";
         let mut alice_data = VaultData {
+            revision: 0,
             identities: vec![alice.detached_copy()],
             contacts: vec![Contact {
                 mailbox_route: Some(MailboxRoute {
@@ -1072,16 +1075,28 @@ mod tests {
                 }],
                 ..bob_contact
             }],
-            messages: vec![StoredMessage {
-                conversation: conversation.clone(),
-                id: MESSAGE_ID.into(),
-                outgoing: true,
-                text: message.into(),
-                delivery: DeliveryState::Pending,
-                timestamp: now(),
-                delivery_events: Vec::new(),
-                received_ciphertext_sha256: None,
-            }],
+            messages: vec![
+                StoredMessage {
+                    conversation: conversation.clone(),
+                    id: MESSAGE_ID.into(),
+                    outgoing: true,
+                    text: message.into(),
+                    delivery: DeliveryState::Pending,
+                    timestamp: now(),
+                    delivery_events: Vec::new(),
+                    received_ciphertext_sha256: None,
+                },
+                StoredMessage {
+                    conversation: conversation.clone(),
+                    id: SECOND_MESSAGE_ID.into(),
+                    outgoing: true,
+                    text: "Deuxième message simultané.".into(),
+                    delivery: DeliveryState::Pending,
+                    timestamp: now(),
+                    delivery_events: Vec::new(),
+                    received_ciphertext_sha256: None,
+                },
+            ],
             ..VaultData::default()
         };
         save_vault(&alice_vault, &mut alice_data, PHRASE).expect("save Alice vault");
@@ -1100,40 +1115,93 @@ mod tests {
         )
         .await
         .expect("publish Bob pre-keys to the replica Mailbox");
+        let (first_send, second_send) = tokio::join!(
+            send(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                MESSAGE_ID.into(),
+            ),
+            send(
+                alice_vault.clone(),
+                PHRASE.into(),
+                conversation.clone(),
+                SECOND_MESSAGE_ID.into(),
+            ),
+        );
+        assert_eq!(
+            usize::from(first_send.is_ok()) + usize::from(second_send.is_ok()),
+            1
+        );
+        let failed_message = if first_send.is_err() {
+            MESSAGE_ID
+        } else {
+            SECOND_MESSAGE_ID
+        };
+        let stale_send = if first_send.is_err() {
+            first_send.expect_err("first send conflict")
+        } else {
+            second_send.expect_err("second send conflict")
+        };
+        assert!(stale_send.contains("revision conflict"));
         send(
             alice_vault.clone(),
             PHRASE.into(),
             conversation.clone(),
-            MESSAGE_ID.into(),
+            failed_message.into(),
         )
         .await
-        .expect("deposit asynchronous message");
+        .expect("retry stale send using the latest ratchet state");
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload Alice vault");
-        assert_eq!(
-            alice_data.messages[0].delivery,
-            DeliveryState::MailboxStored
-        );
-        assert!(
-            alice_data.messages[0]
-                .delivery_events
-                .iter()
-                .any(|event| event.kind == DeliveryEventKind::Encrypted && event.verified)
-        );
-        assert!(alice_data.messages[0].delivery_events.iter().any(|event| {
-            event.kind == DeliveryEventKind::Deposited
-                && event.verified
-                && event.receipt_bytes.is_some()
+        assert!(alice_data.messages.iter().all(|message| {
+            message.delivery == DeliveryState::MailboxStored
+                && message
+                    .delivery_events
+                    .iter()
+                    .any(|event| event.kind == DeliveryEventKind::Encrypted && event.verified)
         }));
-        assert_eq!(alice_data.async_outbox.len(), 1);
-        assert_eq!(
-            alice_data.messages[0]
+        assert!(alice_data.messages.iter().all(|message| {
+            message
                 .delivery_events
                 .iter()
                 .filter(|event| event.kind == DeliveryEventKind::Deposited)
-                .count(),
-            2
-        );
+                .count()
+                == 2
+                && message.delivery_events.iter().all(|event| {
+                    event.kind != DeliveryEventKind::Deposited
+                        || (event.verified && event.receipt_bytes.is_some())
+                })
+        }));
+        assert_eq!(alice_data.async_outbox.len(), 2);
 
+        let (primary_poll, replica_poll) = tokio::join!(
+            poll_inbox(
+                bob_vault.clone(),
+                PHRASE.into(),
+                bob_data.mailbox_inboxes[0].clone(),
+            ),
+            poll_inbox(
+                bob_vault.clone(),
+                PHRASE.into(),
+                bob_data.mailbox_inboxes[1].clone(),
+            ),
+        );
+        assert_eq!(
+            usize::from(primary_poll.is_ok()) + usize::from(replica_poll.is_ok()),
+            1
+        );
+        let winner = primary_poll
+            .as_ref()
+            .ok()
+            .or_else(|| replica_poll.as_ref().ok())
+            .expect("one concurrent mailbox poll commits");
+        assert_eq!(*winner, 2);
+        let conflict = primary_poll
+            .as_ref()
+            .err()
+            .or_else(|| replica_poll.as_ref().err())
+            .expect("stale mailbox poll is rejected");
+        assert!(conflict.contains("revision conflict"));
         server1.stop();
         let received = poll_inbox(
             bob_vault.clone(),
@@ -1141,19 +1209,21 @@ mod tests {
             bob_data.mailbox_inboxes[1].clone(),
         )
         .await
-        .expect("receive from the surviving replica after the primary is stopped");
-        assert_eq!(received, 1);
-        assert!(matches!(
-            poll_delivery_receipt(
-                alice_vault.clone(),
-                PHRASE.into(),
-                conversation.clone(),
-                MESSAGE_ID.into(),
-            )
-            .await
-            .expect("verify Bob's receipt from the surviving replica"),
-            DeliveryPoll::Delivered
-        ));
+        .expect("deduplicate and acknowledge the replica after concurrent receipt");
+        assert_eq!(received, 0);
+        for message_id in [MESSAGE_ID, SECOND_MESSAGE_ID] {
+            assert!(matches!(
+                poll_delivery_receipt(
+                    alice_vault.clone(),
+                    PHRASE.into(),
+                    conversation.clone(),
+                    message_id.into(),
+                )
+                .await
+                .expect("verify Bob's receipt from the surviving replica"),
+                DeliveryPoll::Delivered
+            ));
+        }
 
         let mut rotated_config = ServerConfig::load(&config_path).expect("load primary config");
         let old_receipt_key = rotated_config
@@ -1178,46 +1248,56 @@ mod tests {
         assert_eq!(duplicate, 0);
         let bob_data = load_vault(&bob_vault, PHRASE).expect("reload Bob vault");
         assert_eq!(bob_data.mailbox_inboxes[0].server_key_generation, 2);
-        assert_eq!(bob_data.messages.len(), 1);
-        assert_eq!(bob_data.messages[0].text, message);
-        assert!(
-            bob_data.messages[0]
-                .delivery_events
+        assert_eq!(bob_data.messages.len(), 2);
+        for (message_id, text) in [
+            (MESSAGE_ID, message),
+            (SECOND_MESSAGE_ID, "Deuxième message simultané."),
+        ] {
+            let received_message = bob_data
+                .messages
                 .iter()
-                .any(|event| event.kind == DeliveryEventKind::Retrieved)
-        );
-        assert!(
-            bob_data.messages[0]
-                .delivery_events
-                .iter()
-                .any(
-                    |event| event.kind == DeliveryEventKind::AuthenticatedAndSaved
-                        && event.verified
-                )
-        );
-        assert!(bob_data.messages[0].delivery_events.iter().any(|event| {
-            event.kind == DeliveryEventKind::RecipientConfirmed
-                && event.verified
-                && event.receipt_bytes.is_some()
-        }));
+                .find(|message| message.id == message_id)
+                .expect("stored incoming message");
+            assert_eq!(received_message.text, text);
+            assert!(
+                received_message
+                    .delivery_events
+                    .iter()
+                    .any(|event| event.kind == DeliveryEventKind::Retrieved)
+            );
+            assert!(received_message.delivery_events.iter().any(|event| {
+                event.kind == DeliveryEventKind::AuthenticatedAndSaved && event.verified
+            }));
+            assert!(received_message.delivery_events.iter().any(|event| {
+                event.kind == DeliveryEventKind::RecipientConfirmed
+                    && event.verified
+                    && event.receipt_bytes.is_some()
+            }));
+            assert_eq!(
+                received_message
+                    .delivery_events
+                    .iter()
+                    .filter(|event| event.kind == DeliveryEventKind::RecipientConfirmed)
+                    .count(),
+                2
+            );
+        }
         assert!(bob_data.pending_recipient_receipts.is_empty());
-        assert_eq!(
-            bob_data.messages[0]
-                .delivery_events
-                .iter()
-                .filter(|event| event.kind == DeliveryEventKind::RecipientConfirmed)
-                .count(),
-            2
-        );
         assert_eq!(mailbox_message_count(address, &alice, &config).await, 0);
         assert_eq!(mailbox_message_count(address2, &alice, &config2).await, 0);
         let alice_data = load_vault(&alice_vault, PHRASE).expect("reload delivered Alice vault");
-        assert_eq!(alice_data.messages[0].delivery, DeliveryState::Acknowledged);
-        assert!(alice_data.messages[0].delivery_events.iter().any(|event| {
-            event.kind == DeliveryEventKind::RecipientConfirmed
-                && event.verified
-                && event.receipt_bytes.is_some()
-        }));
+        assert!(
+            alice_data
+                .messages
+                .iter()
+                .take(2)
+                .all(|message| message.delivery == DeliveryState::Acknowledged
+                    && message.delivery_events.iter().any(|event| {
+                        event.kind == DeliveryEventKind::RecipientConfirmed
+                            && event.verified
+                            && event.receipt_bytes.is_some()
+                    }))
+        );
         assert!(alice_data.async_outbox.is_empty());
 
         let mut alice_data = load_vault(&alice_vault, PHRASE).expect("reload Alice vault");

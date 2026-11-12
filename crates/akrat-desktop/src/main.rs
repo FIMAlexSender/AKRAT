@@ -7,7 +7,7 @@ mod vault_catalog;
 
 use akrat_core::{
     Contact, DeliveryActor, DeliveryEventKind, DeliveryState, Identity, Invitation, MailboxInbox,
-    MailboxRoute, StoredMessage, VaultData, load_vault, save_vault,
+    MailboxRoute, StoredMessage, VaultData, VaultFileLock, load_vault, save_vault,
 };
 use dioxus::prelude::*;
 #[cfg(not(target_os = "android"))]
@@ -1015,6 +1015,11 @@ fn import_vault_bytes(
             .checked_add(1)
             .ok_or("Impossible de générer un nom libre pour le coffre importé.")?;
     };
+    let _destination_lock = VaultFileLock::acquire(&destination)
+        .map_err(|error| format!("Verrouillage de l’emplacement importé impossible : {error}"))?;
+    if destination.exists() {
+        return Err("Un fichier existe déjà à l’emplacement choisi pour l’importation.".into());
+    }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
@@ -1063,6 +1068,16 @@ fn rename_vault_file(
     if destination.exists() {
         return Err("Un fichier existe déjà avec ce nom.".into());
     }
+    let mut lock_paths = [source, destination.as_path()];
+    lock_paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    let _vault_locks = lock_paths
+        .into_iter()
+        .map(VaultFileLock::acquire)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Verrouillage du coffre impossible : {error}"))?;
+    if !source.is_file() || destination.exists() {
+        return Err("Le coffre a changé pendant sa préparation au renommage.".into());
+    }
     std::fs::rename(source, &destination)
         .map_err(|error| format!("Renommage impossible : {error}"))?;
     let paths = match vault_catalog::replace_and_save(default_path, source, destination.clone()) {
@@ -1087,6 +1102,10 @@ fn delete_vault_file(
     passphrase: &str,
 ) -> Result<Vec<PathBuf>, String> {
     load_vault(source, passphrase).map_err(|error| format!("Suppression refusée : {error}"))?;
+    let _vault_lock = VaultFileLock::acquire(source)
+        .map_err(|error| format!("Verrouillage du coffre impossible : {error}"))?;
+    load_vault(source, passphrase)
+        .map_err(|error| format!("Suppression refusée après vérification : {error}"))?;
     let mut paths = existing_paths.to_vec();
     vault_catalog::remove(&mut paths, source);
     vault_catalog::save(default_path, &paths)
@@ -2343,6 +2362,7 @@ mod vault_manager_tests {
         )
         .unwrap();
         let bytes_before = std::fs::read(&original).unwrap();
+        let mut stale_session = load_vault(&original, phrase).unwrap();
         let id_before = vault_catalog::id_for_path(&default, &original).unwrap();
 
         let (renamed, paths) = rename_vault_file(&default, &paths, &original, "Personnel").unwrap();
@@ -2350,6 +2370,8 @@ mod vault_manager_tests {
         assert!(!original.exists());
         assert_eq!(std::fs::read(&renamed).unwrap(), bytes_before);
         assert!(load_vault(&renamed, phrase).is_ok());
+        assert!(save_vault(&original, &mut stale_session, phrase).is_err());
+        assert!(!original.exists());
         let id_after = vault_catalog::id_for_path(&default, &renamed).unwrap();
         assert_eq!(id_before, id_after);
 

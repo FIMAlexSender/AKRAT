@@ -725,6 +725,7 @@ mod tests {
     #[test]
     fn acknowledgements_only_change_the_matching_outgoing_message() {
         let mut data = VaultData {
+            revision: 0,
             identities: Vec::new(),
             contacts: Vec::new(),
             messages: vec![StoredMessage {

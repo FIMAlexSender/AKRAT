@@ -305,6 +305,7 @@ async fn run_client_role(role: &str) -> Result<(), Box<dyn std::error::Error>> {
             let bob = Identity::generate("Bob".into())?;
             let (bundle, state) = akrat_core::async_crypto::publish_bundle(&bob, &[]).await?;
             let mut data = VaultData {
+                revision: 0,
                 identities: vec![bob.detached_copy()],
                 async_protocol_states: vec![AsyncProtocolState {
                     identity_id: bob.id.clone(),

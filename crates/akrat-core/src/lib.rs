@@ -15,7 +15,7 @@ use std::path::Path;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 const LEGACY_FORMAT_VERSION: u8 = 1;
 const MAX_VAULT_SIZE: usize = 16 * 1024 * 1024;
 const NOISE_PROTOCOL: &str = "Noise_XX_25519_AESGCM_SHA256";
@@ -36,6 +36,8 @@ pub enum AkratError {
     InvalidIdentity,
     #[error("I/O operation failed")]
     Io(#[from] std::io::Error),
+    #[error("vault revision conflict: expected {expected}, found {actual}")]
+    RevisionConflict { expected: u64, actual: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -342,6 +344,7 @@ impl StoredMessage {
 
 #[derive(Default)]
 pub struct VaultData {
+    pub revision: u64,
     pub identities: Vec<Identity>,
     pub contacts: Vec<Contact>,
     pub messages: Vec<StoredMessage>,
@@ -422,6 +425,23 @@ struct VaultStorageV3 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VaultStorageV4 {
+    revision: u64,
+    identities: Vec<Identity>,
+    contacts: Vec<Contact>,
+    conversation_keys: Vec<StoredConversationKey>,
+    messages: Vec<StoredMessageCiphertext>,
+    async_protocol_states: Vec<AsyncProtocolState>,
+    #[serde(default)]
+    mailbox_inboxes: Vec<MailboxInbox>,
+    #[serde(default)]
+    async_outbox: Vec<AsyncOutboxItem>,
+    #[serde(default)]
+    pending_recipient_receipts: Vec<PendingRecipientReceipt>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VaultEnvelope {
     version: u8,
     salt: Vec<u8>,
@@ -439,6 +459,92 @@ pub fn fingerprint(public_key: &[u8]) -> String {
 }
 
 pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result<(), AkratError> {
+    let _lock = VaultFileLock::acquire(path)?;
+    save_vault_locked(path, data, passphrase)
+}
+
+pub fn mutate_vault<T>(
+    path: &Path,
+    passphrase: &str,
+    mutation: impl FnOnce(&mut VaultData) -> Result<T, AkratError>,
+) -> Result<T, AkratError> {
+    let _lock = VaultFileLock::acquire(path)?;
+    let mut data = if path.exists() {
+        load_vault_inner(path, passphrase, false)?
+    } else {
+        VaultData::default()
+    };
+    let current_revision = data.revision;
+    let result = mutation(&mut data)?;
+    persist_vault_locked(path, &mut data, passphrase, current_revision)?;
+    Ok(result)
+}
+
+pub struct VaultFileLock {
+    file: File,
+}
+
+impl VaultFileLock {
+    pub fn acquire(path: &Path) -> Result<Self, AkratError> {
+        use fs2::FileExt;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let canonical_parent = parent.canonicalize()?;
+        let file_name = path.file_name().ok_or(AkratError::InvalidVault)?;
+        let lock_target = if path.exists() {
+            path.canonicalize()?
+        } else {
+            canonical_parent.join(file_name)
+        };
+        let lock_path = lock_target.with_extension("akrat.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for VaultFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn save_vault_locked(
+    path: &Path,
+    data: &mut VaultData,
+    passphrase: &str,
+) -> Result<(), AkratError> {
+    let actual_revision = if path.exists() {
+        load_vault_inner(path, passphrase, false)?.revision
+    } else {
+        0
+    };
+    if data.revision != actual_revision {
+        return Err(AkratError::RevisionConflict {
+            expected: data.revision,
+            actual: actual_revision,
+        });
+    }
+    persist_vault_locked(path, data, passphrase, actual_revision)
+}
+
+fn persist_vault_locked(
+    path: &Path,
+    data: &mut VaultData,
+    passphrase: &str,
+    current_revision: u64,
+) -> Result<(), AkratError> {
+    let next_revision = current_revision
+        .checked_add(1)
+        .ok_or(AkratError::InvalidVault)?;
     ensure_conversation_keys(data)?;
     validate_vault(data)?;
     let mut salt = [0u8; 16];
@@ -481,7 +587,8 @@ pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result
             ciphertext,
         });
     }
-    let storage = VaultStorageV3 {
+    let storage = VaultStorageV4 {
+        revision: next_revision,
         identities: data
             .identities
             .iter()
@@ -519,10 +626,16 @@ pub fn save_vault(path: &Path, data: &mut VaultData, passphrase: &str) -> Result
         ciphertext,
     };
     let encoded = serde_json::to_vec(&envelope).map_err(|_| AkratError::Serialization)?;
-    write_atomically(path, &encoded)
+    write_atomically(path, &encoded)?;
+    data.revision = next_revision;
+    Ok(())
 }
 
 pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError> {
+    load_vault_inner(path, passphrase, true)
+}
+
+fn load_vault_inner(path: &Path, passphrase: &str, migrate: bool) -> Result<VaultData, AkratError> {
     let file = File::open(path)?;
     if file.metadata()?.len() > MAX_VAULT_SIZE as u64 {
         return Err(AkratError::InvalidVault);
@@ -557,6 +670,7 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
             serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
         plaintext.zeroize();
         let mut result = VaultData {
+            revision: 0,
             identities: legacy.identities,
             contacts: legacy.contacts,
             messages: legacy.messages,
@@ -569,24 +683,54 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
         ensure_conversation_keys(&mut result)?;
         validate_vault(&result)?;
         // Upgrade in place atomically so the first unlock migrates old histories.
-        save_vault(path, &mut result, passphrase)?;
+        if migrate {
+            match save_vault(path, &mut result, passphrase) {
+                Ok(()) => {}
+                Err(AkratError::RevisionConflict { .. }) => {
+                    return load_vault_inner(path, passphrase, false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         return Ok(result);
     }
-    let stored: VaultStorageV3 = if envelope.version == 2 {
+    let (stored, revision): (VaultStorageV3, u64) = if envelope.version == 2 {
         let old: VaultStorageV2 =
             serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
-        VaultStorageV3 {
-            identities: old.identities,
-            contacts: old.contacts,
-            conversation_keys: old.conversation_keys,
-            messages: old.messages,
-            async_protocol_states: Vec::new(),
-            mailbox_inboxes: Vec::new(),
-            async_outbox: Vec::new(),
-            pending_recipient_receipts: Vec::new(),
-        }
+        (
+            VaultStorageV3 {
+                identities: old.identities,
+                contacts: old.contacts,
+                conversation_keys: old.conversation_keys,
+                messages: old.messages,
+                async_protocol_states: Vec::new(),
+                mailbox_inboxes: Vec::new(),
+                async_outbox: Vec::new(),
+                pending_recipient_receipts: Vec::new(),
+            },
+            0,
+        )
+    } else if envelope.version == 3 {
+        (
+            serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?,
+            0,
+        )
     } else {
-        serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?
+        let current: VaultStorageV4 =
+            serde_json::from_slice(&plaintext).map_err(|_| AkratError::InvalidVault)?;
+        (
+            VaultStorageV3 {
+                identities: current.identities,
+                contacts: current.contacts,
+                conversation_keys: current.conversation_keys,
+                messages: current.messages,
+                async_protocol_states: current.async_protocol_states,
+                mailbox_inboxes: current.mailbox_inboxes,
+                async_outbox: current.async_outbox,
+                pending_recipient_receipts: current.pending_recipient_receipts,
+            },
+            current.revision,
+        )
     };
     plaintext.zeroize();
     let mut conversation_keys = Vec::with_capacity(stored.conversation_keys.len());
@@ -633,6 +777,7 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
         messages.push(message);
     }
     let result = VaultData {
+        revision,
         identities: stored.identities,
         contacts: stored.contacts,
         messages,
@@ -643,7 +788,7 @@ pub fn load_vault(path: &Path, passphrase: &str) -> Result<VaultData, AkratError
         pending_recipient_receipts: stored.pending_recipient_receipts,
     };
     validate_vault(&result)?;
-    if envelope.version != FORMAT_VERSION {
+    if envelope.version != FORMAT_VERSION && migrate {
         let mut migrated = result;
         save_vault(path, &mut migrated, passphrase)?;
         return Ok(migrated);
@@ -804,13 +949,40 @@ fn valid_mailbox_route(route: &MailboxRoute) -> bool {
 }
 
 fn write_atomically(path: &Path, data: &[u8]) -> Result<(), AkratError> {
-    write_atomically_with_interrupt(path, data, false)
+    write_atomically_with_fault(path, data, WriteFault::None)
 }
 
+#[cfg(test)]
 fn write_atomically_with_interrupt(
     path: &Path,
     data: &[u8],
     interrupt_after_sync: bool,
+) -> Result<(), AkratError> {
+    write_atomically_with_fault(
+        path,
+        data,
+        if interrupt_after_sync {
+            WriteFault::AfterSync
+        } else {
+            WriteFault::None
+        },
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WriteFault {
+    None,
+    BeforeWrite,
+    DuringWrite,
+    AfterSync,
+    BeforeReplace,
+    AfterReplace,
+}
+
+fn write_atomically_with_fault(
+    path: &Path,
+    data: &[u8],
+    fault: WriteFault,
 ) -> Result<(), AkratError> {
     if let Some(parent) = path
         .parent()
@@ -826,20 +998,119 @@ fn write_atomically_with_interrupt(
         .create_new(true)
         .open(&temporary)?;
     let result = (|| {
+        if fault == WriteFault::BeforeWrite {
+            return Err(std::io::Error::other("injected interruption before write"));
+        }
+        if fault == WriteFault::DuringWrite {
+            file.write_all(&data[..data.len() / 2])?;
+            return Err(std::io::Error::other("injected interruption during write"));
+        }
         file.write_all(data)?;
         file.sync_all()?;
-        if interrupt_after_sync {
+        if fault == WriteFault::AfterSync {
             drop(file);
             return Err(std::io::Error::other("injected process interruption"));
         }
+        let mut verification = Vec::with_capacity(data.len());
+        File::open(&temporary)?.read_to_end(&mut verification)?;
+        if verification != data {
+            return Err(std::io::Error::other("temporary file verification failed"));
+        }
         drop(file);
-        fs::rename(&temporary, path)?;
+        if fault == WriteFault::BeforeReplace {
+            return Err(std::io::Error::other(
+                "injected interruption before replace",
+            ));
+        }
+        if path.exists() {
+            write_recovery_copy(path, &fs::read(path)?)?;
+        }
+        replace_file(&temporary, path)?;
+        if fault == WriteFault::AfterReplace {
+            return Err(std::io::Error::other("injected interruption after replace"));
+        }
+        #[cfg(not(windows))]
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
         Ok::<(), std::io::Error>(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
     result.map_err(AkratError::Io)
+}
+
+fn write_recovery_copy(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let backup = path.with_extension("akrat.bak");
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|_| std::io::Error::other("random source failed"))?;
+    let temporary = backup.with_extension(format!("{}.tmp", hex::encode(random)));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        let mut verification = Vec::with_capacity(data.len());
+        File::open(&temporary)?.read_to_end(&mut verification)?;
+        if verification != data {
+            return Err(std::io::Error::other("recovery copy verification failed"));
+        }
+        drop(file);
+        replace_file(&temporary, &backup)?;
+        #[cfg(not(windows))]
+        if let Some(parent) = backup
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn noise_params() -> Result<NoiseParams, AkratError> {
@@ -858,6 +1129,7 @@ mod tests {
         let identity = Identity::generate("Alice".to_string()).expect("identity");
         let bob = Identity::generate("Bob".to_string()).expect("Bob");
         let mut data = VaultData {
+            revision: 0,
             identities: vec![identity],
             contacts: vec![Contact {
                 fingerprint: bob.fingerprint(),
@@ -943,6 +1215,7 @@ mod tests {
             .await
             .expect("publish bundle");
         let mut vault = VaultData {
+            revision: 0,
             async_protocol_states: vec![AsyncProtocolState {
                 identity_id: identity.id.clone(),
                 state: state.clone(),
@@ -956,7 +1229,7 @@ mod tests {
             serde_json::from_slice::<VaultEnvelope>(&encoded)
                 .expect("envelope")
                 .version,
-            3
+            FORMAT_VERSION
         );
         assert!(!encoded.windows(state.len()).any(|window| window == state));
         let loaded = load_vault(&path, "test phrase").expect("load vault");
@@ -972,6 +1245,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
         let mut data = VaultData {
+            revision: 0,
             messages: vec![
                 StoredMessage {
                     conversation: "alice:bob".into(),
@@ -1021,7 +1295,8 @@ mod tests {
         let inner = vault_cipher
             .decrypt(&vault_nonce, envelope.ciphertext.as_slice())
             .expect("decrypt outer vault");
-        let stored: VaultStorageV3 = serde_json::from_slice(&inner).expect("stored vault");
+        let stored: VaultStorageV4 = serde_json::from_slice(&inner).expect("stored vault");
+        assert_eq!(stored.revision, data.revision);
         assert_eq!(stored.messages.len(), 2);
         for message in &stored.messages {
             let encoded = serde_json::to_vec(message).expect("encode record");
@@ -1093,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn version_two_vault_migrates_to_version_three_without_losing_identity() {
+    fn version_two_vault_migrates_to_current_version_without_losing_identity() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
         let identity = Identity::generate("Version two identity".into()).expect("identity");
@@ -1132,7 +1407,7 @@ mod tests {
         let rewritten: VaultEnvelope =
             serde_json::from_slice(&fs::read(path).expect("read migrated vault"))
                 .expect("parse migrated envelope");
-        assert_eq!(rewritten.version, 3);
+        assert_eq!(rewritten.version, FORMAT_VERSION);
     }
 
     #[test]
@@ -1166,6 +1441,151 @@ mod tests {
     }
 
     #[test]
+    fn stale_vault_write_is_rejected_and_transaction_retry_preserves_both_updates() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let mut initial = VaultData::default();
+        save_vault(&path, &mut initial, "transaction phrase").expect("initial save");
+        let mut first = load_vault(&path, "transaction phrase").expect("first snapshot");
+        let mut stale = load_vault(&path, "transaction phrase").expect("stale snapshot");
+        first
+            .identities
+            .push(Identity::generate("First".into()).expect("first identity"));
+        stale
+            .identities
+            .push(Identity::generate("Stale".into()).expect("stale identity"));
+        save_vault(&path, &mut first, "transaction phrase").expect("first commit");
+        assert!(matches!(
+            save_vault(&path, &mut stale, "transaction phrase"),
+            Err(AkratError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        mutate_vault(&path, "transaction phrase", |data| {
+            data.identities.extend(stale.identities);
+            Ok(())
+        })
+        .expect("retry against current revision");
+        let loaded = load_vault(&path, "transaction phrase").expect("reopen");
+        assert_eq!(loaded.identities.len(), 2);
+        assert_eq!(loaded.revision, 3);
+    }
+
+    #[test]
+    fn one_hundred_concurrent_vault_transactions_preserve_every_message() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = std::sync::Arc::new(directory.path().join("vault.akrat"));
+        let mut initial = VaultData::default();
+        initial.conversation_keys.push(ConversationKey {
+            conversation: "concurrent-conversation".into(),
+            key: Zeroizing::new([7; 32]),
+        });
+        save_vault(&path, &mut initial, "concurrent phrase").expect("initial save");
+        let workers = (0..100)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    mutate_vault(&path, "concurrent phrase", |data| {
+                        data.messages.push(StoredMessage {
+                            conversation: "concurrent-conversation".into(),
+                            id: format!("message-{index}"),
+                            outgoing: true,
+                            text: format!("message body {index}"),
+                            delivery: DeliveryState::Queued,
+                            timestamp: index,
+                            delivery_events: Vec::new(),
+                            received_ciphertext_sha256: None,
+                        });
+                        Ok(())
+                    })
+                    .expect("transaction");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        let loaded = load_vault(&path, "concurrent phrase").expect("reload");
+        assert_eq!(loaded.messages.len(), 100);
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            100
+        );
+    }
+
+    #[test]
+    fn concurrent_process_child() {
+        let Ok(path) = std::env::var("AKRAT_PROCESS_VAULT") else {
+            return;
+        };
+        let coordination = std::path::PathBuf::from(
+            std::env::var("AKRAT_PROCESS_COORDINATION").expect("coordination directory"),
+        );
+        let name = std::env::var("AKRAT_PROCESS_IDENTITY").expect("identity name");
+        std::fs::write(coordination.join(format!("ready-{name}")), b"ready")
+            .expect("write readiness marker");
+        for _ in 0..1000 {
+            if coordination.join("start").exists() {
+                mutate_vault(std::path::Path::new(&path), "process phrase", |data| {
+                    data.identities
+                        .push(Identity::generate(name.clone()).map_err(|_| AkratError::Identity)?);
+                    Ok(())
+                })
+                .expect("cross-process transaction");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("parent did not release the child process");
+    }
+
+    #[test]
+    fn simultaneous_processes_serialize_updates_for_one_vault() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        let mut initial = VaultData::default();
+        save_vault(&path, &mut initial, "process phrase").expect("initial save");
+        let executable = std::env::current_exe().expect("test executable");
+        let mut children = ["Process Alice", "Process Bob"]
+            .into_iter()
+            .map(|name| {
+                std::process::Command::new(&executable)
+                    .arg("--exact")
+                    .arg("tests::concurrent_process_child")
+                    .arg("--nocapture")
+                    .env("AKRAT_PROCESS_VAULT", &path)
+                    .env("AKRAT_PROCESS_COORDINATION", directory.path())
+                    .env("AKRAT_PROCESS_IDENTITY", name)
+                    .spawn()
+                    .expect("spawn child process")
+            })
+            .collect::<Vec<_>>();
+        for name in ["Process Alice", "Process Bob"] {
+            let marker = directory.path().join(format!("ready-{name}"));
+            for _ in 0..1000 {
+                if marker.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "child process did not become ready");
+        }
+        std::fs::write(directory.path().join("start"), b"go").expect("release children");
+        for child in &mut children {
+            assert!(child.wait().expect("wait child").success());
+        }
+        let loaded = load_vault(&path, "process phrase").expect("reload after children");
+        assert_eq!(loaded.identities.len(), 2);
+        assert_eq!(loaded.revision, 3);
+    }
+
+    #[test]
     fn interruption_after_temporary_file_sync_keeps_previous_vault() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("vault.akrat");
@@ -1175,6 +1595,56 @@ mod tests {
         assert!(write_atomically_with_interrupt(&path, b"incomplete replacement", true).is_err());
         assert_eq!(fs::read(&path).expect("preserved bytes"), previous);
         assert!(load_vault(&path, "secret").is_ok());
+    }
+
+    #[test]
+    fn atomic_vault_replacement_has_a_complete_old_or_new_file_at_every_failure_point() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("state.bin");
+        let original = b"previous complete state";
+        let replacement = b"next complete state";
+        fs::write(&path, original).expect("write original");
+        for fault in [
+            WriteFault::BeforeWrite,
+            WriteFault::DuringWrite,
+            WriteFault::AfterSync,
+            WriteFault::BeforeReplace,
+        ] {
+            assert!(write_atomically_with_fault(&path, replacement, fault).is_err());
+            assert_eq!(fs::read(&path).expect("read after interruption"), original);
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .expect("read directory")
+                    .filter_map(Result::ok)
+                    .count(),
+                1
+            );
+        }
+        assert!(write_atomically_with_fault(&path, replacement, WriteFault::AfterReplace).is_err());
+        assert_eq!(fs::read(&path).expect("read replaced file"), replacement);
+        assert_eq!(
+            fs::read(path.with_extension("akrat.bak")).expect("read recovery backup"),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("read directory")
+                .filter_map(Result::ok)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_corrupt_vault_is_never_treated_as_permission_to_overwrite_or_delete_it() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("vault.akrat");
+        fs::write(&path, b"corrupt primary").expect("write corrupt vault");
+        let preserved = fs::read(&path).expect("read corrupt vault");
+        assert!(load_vault(&path, "secret").is_err());
+        let mut replacement = VaultData::default();
+        assert!(save_vault(&path, &mut replacement, "secret").is_err());
+        assert_eq!(fs::read(&path).expect("preserved corrupt vault"), preserved);
     }
 
     #[test]
