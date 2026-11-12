@@ -76,7 +76,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install pinned protobuf compiler
-        shell: pwsh
+        shell: powershell
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
           $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
@@ -90,19 +90,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify Rust toolchain on the AKRAT PC
-        shell: pwsh
+        shell: powershell
         run: |
           cargo --version
           rustc --version
 
       - name: Test workspace and formatting
-        shell: pwsh
+        shell: powershell
         run: |
           cargo fmt --all -- --check
           cargo test --locked --workspace
 
       - name: Build desktop app and CLI with MSVC
-        shell: pwsh
+        shell: powershell
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $vsPath = & $vswhere -latest -products '*' -property installationPath
@@ -114,7 +114,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package the Windows installer
-        shell: pwsh
+        shell: powershell
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^" ]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if (-not $version) { throw 'Could not read the workspace version from Cargo.toml.' }
@@ -152,7 +152,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install pinned protobuf compiler
-        shell: pwsh
+        shell: powershell
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
           $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
