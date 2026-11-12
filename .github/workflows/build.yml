@@ -2,7 +2,7 @@ name: Build AKRAT
 
 on:
   push:
-    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager]
+    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager, v0.1.11-groups-media-markdown, akr-at-v0.1-foundation, akrat-cli-core, akrat-desktop-ui]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
