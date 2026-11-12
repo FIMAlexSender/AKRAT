@@ -54,7 +54,7 @@ jobs:
         run: |
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
-          cargo build --locked --release -p akrat-mailbox
+          if [ -f crates/akrat-mailbox/Cargo.toml ]; then cargo build --locked --release -p akrat-mailbox; fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,7 +112,8 @@ jobs:
           $stableRustc = (& rustup which --toolchain stable rustc).Trim()
           $stableCargo = (& rustup which --toolchain stable cargo).Trim()
           if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The stable Rust toolchain is incomplete on the AKRAT runner.' }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox'
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat'
+          if (Test-Path 'crates\akrat-mailbox\Cargo.toml') { $commands += ' && "' + $stableCargo + '" build --locked --release -p akrat-mailbox' }
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -179,7 +180,7 @@ jobs:
         run: |
           cargo build --locked --release -p akrat-desktop --features desktop
           cargo build --locked --release -p akrat
-          cargo build --locked --release -p akrat-mailbox
+          if [ -f crates/akrat-mailbox/Cargo.toml ]; then cargo build --locked --release -p akrat-mailbox; fi
 
       - uses: actions/upload-artifact@v4
         with:
