@@ -103,6 +103,21 @@ impl SessionHandle {
     }
 }
 
+pub(crate) fn gossip_relay_evidence(
+    sessions: &HashMap<String, SessionHandle>,
+    source_conversation: &str,
+    evidence: akrat_trust::RelayEquivocationEvidence,
+) -> usize {
+    if !validate_shared_relay_evidence(&evidence) {
+        return 0;
+    }
+    sessions
+        .iter()
+        .filter(|(conversation, _)| conversation.as_str() != source_conversation)
+        .filter(|(_, session)| session.send_relay_evidence(evidence.clone()).is_ok())
+        .count()
+}
+
 enum SessionCommand {
     Text {
         id: String,
@@ -969,14 +984,15 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionHandle, UiEvent, WireMessage, next_retry_delay, start_session,
-        validate_shared_relay_evidence,
+        SessionCommand, SessionHandle, UiEvent, WireMessage, gossip_relay_evidence,
+        next_retry_delay, start_session, validate_shared_relay_evidence,
     };
     use akrat_core::attachments::{AttachmentChunk, AttachmentManifest};
     use akrat_core::network;
     use akrat_core::{
         GroupChange, GroupEvent, GroupMember, GroupMessage, GroupRole, GroupState, Identity,
     };
+    use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1033,6 +1049,92 @@ mod tests {
         let mut oversized = evidence;
         oversized.first.software_version = "x".repeat(33 * 1024);
         assert!(!validate_shared_relay_evidence(&oversized));
+    }
+
+    #[test]
+    fn verified_relay_evidence_gossips_only_to_other_active_sessions() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let relay_url = "https://relay.example.org";
+        let challenge = [9; 32];
+        let distribution = akrat_trust::RelayDistributionClaim {
+            artifact_name: "relay".into(),
+            artifact_sha256: "ab".repeat(32),
+            source_commit: "c".repeat(40),
+            protocol_version: 1,
+        };
+        let make_proof = |software_version: &str| {
+            let payload = akrat_trust::relay_identity_v2_payload(
+                relay_url,
+                &challenge,
+                software_version,
+                &distribution,
+            )
+            .expect("relay identity payload");
+            akrat_trust::RelayIdentityProofV2 {
+                relay_url: relay_url.into(),
+                challenge_hex: hex::encode(challenge),
+                public_key_hex: hex::encode(public_key),
+                fingerprint: akrat_trust::relay_identity_fingerprint(&public_key),
+                software_version: software_version.into(),
+                distribution: distribution.clone(),
+                signature_hex: hex::encode(key.sign(&payload).to_bytes()),
+            }
+        };
+        let first = make_proof("1.0");
+        let second = make_proof("2.0");
+        let evidence = akrat_trust::RelayEquivocationEvidence {
+            version: 1,
+            relay_url: relay_url.into(),
+            observed_at_unix_seconds: 1,
+            first,
+            second,
+        };
+        let (source_sender, mut source_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (first_sender, mut first_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (second_sender, mut second_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = HashMap::from([
+            (
+                "identity:source".to_string(),
+                SessionHandle {
+                    commands: source_sender,
+                },
+            ),
+            (
+                "identity:first".to_string(),
+                SessionHandle {
+                    commands: first_sender,
+                },
+            ),
+            (
+                "identity:second".to_string(),
+                SessionHandle {
+                    commands: second_sender,
+                },
+            ),
+        ]);
+
+        let sent = gossip_relay_evidence(&sessions, "identity:source", evidence.clone());
+
+        assert_eq!(sent, 2);
+        assert!(source_receiver.try_recv().is_err());
+        assert!(
+            matches!(first_receiver.try_recv(), Ok(SessionCommand::RelayEvidence(shared)) if shared == evidence)
+        );
+        assert!(
+            matches!(second_receiver.try_recv(), Ok(SessionCommand::RelayEvidence(shared)) if shared == evidence)
+        );
+
+        let mut forged = evidence;
+        forged.second.signature_hex = "00".repeat(64);
+        assert_eq!(
+            gossip_relay_evidence(&sessions, "identity:source", forged),
+            0
+        );
+        assert!(first_receiver.try_recv().is_err());
+        assert!(second_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1113,6 +1215,7 @@ mod tests {
         let bob_channel = bob_pending
             .verify_peer(alice.public_key())
             .expect("verify Alice");
+        let bob_for_charlie = bob.detached_copy();
 
         let (alice_events, mut alice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (bob_events, mut bob_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1212,6 +1315,65 @@ mod tests {
         .expect("shared evidence timeout");
         assert!(
             matches!(shared_evidence, UiEvent::IncomingRelayEvidence { evidence: ref received, .. } if received == &evidence)
+        );
+
+        let charlie = Identity::generate("Charlie gossip test".into()).expect("Charlie identity");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let charlie_copy = charlie.detached_copy();
+        let charlie_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            network::respond(stream, &charlie_copy)
+                .await
+                .expect("Charlie handshake")
+        });
+        let stream = TcpStream::connect(address).await.expect("connect");
+        let bob_pending = network::initiate(stream, &bob_for_charlie)
+            .await
+            .expect("Bob handshake");
+        let bob_charlie_channel = bob_pending
+            .verify_peer(charlie.public_key())
+            .expect("verify Charlie");
+        let charlie_pending = charlie_server.await.expect("Charlie server task");
+        let charlie_channel = charlie_pending
+            .verify_peer(bob_for_charlie.public_key())
+            .expect("verify Bob");
+        let (bob_charlie_events, mut bob_charlie_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (charlie_events, mut charlie_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(start_session(
+            bob_charlie_channel,
+            "bob:charlie".into(),
+            "Charlie".into(),
+            bob_charlie_events,
+        ));
+        tokio::spawn(start_session(
+            charlie_channel,
+            "charlie:bob".into(),
+            "Bob".into(),
+            charlie_events,
+        ));
+        let bob_charlie = take_ready(&mut bob_charlie_rx).await;
+        let _charlie_session = take_ready(&mut charlie_rx).await;
+        let sessions = std::collections::HashMap::from([
+            ("bob:alice".into(), bob.clone()),
+            ("bob:charlie".into(), bob_charlie),
+        ]);
+        assert_eq!(
+            gossip_relay_evidence(&sessions, "bob:alice", evidence.clone()),
+            1
+        );
+        let gossiped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = charlie_rx.recv().await.expect("Charlie event");
+                if matches!(event, UiEvent::IncomingRelayEvidence { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("gossip evidence timeout");
+        assert!(
+            matches!(gossiped, UiEvent::IncomingRelayEvidence { evidence: ref received, .. } if received == &evidence)
         );
         alice
             .send_group_event(creation)

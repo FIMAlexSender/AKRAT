@@ -735,13 +735,18 @@ fn App() -> Element {
                                 );
                                 continue;
                             }
-                            data.relay_settings.verified_evidence.push(evidence);
+                            data.relay_settings.verified_evidence.push(evidence.clone());
                             if save_vault(&vault_path, &mut data, &phrase).is_ok() {
                                 vault.set(Some(data));
+                                let forwarded = runtime::gossip_relay_evidence(
+                                    &sessions.read(),
+                                    &conversation,
+                                    evidence,
+                                );
                                 push_trace(
                                     &mut trace,
                                     format!(
-                                        "Preuve de relais vérifiée et enregistrée depuis {conversation} · décision locale inchangée"
+                                        "Preuve de relais vérifiée et enregistrée depuis {conversation} · propagée à {forwarded} autre(s) session(s) chiffrée(s) · décision locale inchangée"
                                     ),
                                 );
                             } else {
