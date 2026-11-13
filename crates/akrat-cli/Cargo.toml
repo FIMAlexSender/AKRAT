@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-trust = { version = "=0.1.13", path = "../akrat-trust", features = ["client"] }
-akrat-core = { version = "=0.1.13", path = "../akrat-core" }
+akrat-trust = { version = "=0.1.14", path = "../akrat-trust", features = ["client"] }
+akrat-core = { version = "=0.1.14", path = "../akrat-core" }
 clap.workspace = true
 directories.workspace = true
 getrandom.workspace = true
@@ -17,4 +17,4 @@ iroh.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }

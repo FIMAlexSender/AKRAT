@@ -10,7 +10,7 @@ name = "akrat-node-updater"
 path = "src/main.rs"
 
 [dependencies]
-akrat-trust = { version = "=0.1.13", path = "../akrat-trust" }
+akrat-trust = { version = "=0.1.14", path = "../akrat-trust" }
 chrono.workspace = true
 clap.workspace = true
 fs2.workspace = true
@@ -21,7 +21,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

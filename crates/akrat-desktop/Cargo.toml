@@ -6,9 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-trust = { version = "=0.1.13", path = "../akrat-trust", features = ["client"] }
-akrat-core = { version = "=0.1.13", path = "../akrat-core" }
-akrat-mailbox = { version = "=0.1.13", path = "../akrat-mailbox" }
+akrat-trust = { version = "=0.1.14", path = "../akrat-trust", features = ["client"] }
+akrat-core = { version = "=0.1.14", path = "../akrat-core" }
+akrat-mailbox = { version = "=0.1.14", path = "../akrat-mailbox" }
 base64.workspace = true
 dioxus = { workspace = true }
 dioxus-desktop = { workspace = true, optional = true }
@@ -23,7 +23,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 zeroize.workspace = true
 zip = { workspace = true, optional = true }
 self-replace = { version = "1.5.1", optional = true }

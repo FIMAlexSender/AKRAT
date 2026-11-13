@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-trust = { version = "=0.1.13", path = "../akrat-trust" }
+akrat-trust = { version = "=0.1.14", path = "../akrat-trust" }
 axum.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
@@ -15,9 +15,9 @@ hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
-akrat-trust = { version = "=0.1.13", path = "../akrat-trust", features = ["client"] }
+akrat-trust = { version = "=0.1.14", path = "../akrat-trust", features = ["client"] }
 serde_json.workspace = true
 tempfile = "3"

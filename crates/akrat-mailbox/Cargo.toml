@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-core = { version = "=0.1.13", path = "../akrat-core", default-features = false }
+akrat-core = { version = "=0.1.14", path = "../akrat-core", default-features = false }
 base64.workspace = true
 clap.workspace = true
 directories.workspace = true
@@ -19,7 +19,7 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
