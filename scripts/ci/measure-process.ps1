@@ -7,7 +7,23 @@ param(
 $ErrorActionPreference = 'Stop'
 $metricsDirectory = Join-Path (Get-Location) 'target\ci-metrics'
 New-Item -ItemType Directory -Force -Path $metricsDirectory | Out-Null
-$buildProcess = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', $Command) -PassThru -NoNewWindow
+$runnerTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$batchPath = Join-Path $runnerTemp ("akrat-measured-{0}.cmd" -f [guid]::NewGuid().ToString('N'))
+try {
+    # Passing a long command containing nested quotes through Start-Process and
+    # cmd /c loses its quoting. Put it in a batch file so && and quoted paths
+    # reach cmd unchanged, and propagate the real command exit code.
+    $batchContents = "@echo off`r`n$Command`r`nexit /b %errorlevel%`r`n"
+    [IO.File]::WriteAllText($batchPath, $batchContents, [Text.Encoding]::ASCII)
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $env:ComSpec
+    $startInfo.Arguments = '/d /c call "' + $batchPath + '"'
+    $startInfo.UseShellExecute = $false
+    $buildProcess = [Diagnostics.Process]::Start($startInfo)
+} catch {
+    Remove-Item -LiteralPath $batchPath -Force -ErrorAction SilentlyContinue
+    throw
+}
 $rootProcessId = [int]$buildProcess.Id
 $started = [Diagnostics.Stopwatch]::StartNew()
 $peakTreeWorkingSet = [int64]0
@@ -73,4 +89,5 @@ $metrics = [ordered]@{
 $output = Join-Path $metricsDirectory "$Name.json"
 $metrics | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $output -Encoding utf8
 $metrics | ConvertTo-Json -Depth 4 | Write-Output
+Remove-Item -LiteralPath $batchPath -Force -ErrorAction SilentlyContinue
 if ($exitCode -ne 0) { throw "Measured build command failed with exit code $exitCode." }
