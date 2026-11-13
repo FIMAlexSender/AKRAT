@@ -1161,6 +1161,58 @@ mod tests {
         .await
         .expect("acknowledgement timeout");
         assert!(matches!(acknowledged, UiEvent::Acknowledged { ref id, .. } if id == "message-1"));
+        use ed25519_dalek::{Signer, SigningKey};
+        let evidence_key = SigningKey::from_bytes(&[11; 32]);
+        let evidence_public_key = evidence_key.verifying_key().to_bytes();
+        let evidence_url = "https://relay.example.org";
+        let evidence_challenge = [13; 32];
+        let evidence_distribution = akrat_trust::RelayDistributionClaim {
+            artifact_name: "relay".into(),
+            artifact_sha256: "cd".repeat(32),
+            source_commit: "d".repeat(40),
+            protocol_version: 1,
+        };
+        let make_evidence_proof = |version: &str| {
+            let payload = akrat_trust::relay_identity_v2_payload(
+                evidence_url,
+                &evidence_challenge,
+                version,
+                &evidence_distribution,
+            )
+            .expect("evidence proof payload");
+            akrat_trust::RelayIdentityProofV2 {
+                relay_url: evidence_url.into(),
+                challenge_hex: hex::encode(evidence_challenge),
+                public_key_hex: hex::encode(evidence_public_key),
+                fingerprint: akrat_trust::relay_identity_fingerprint(&evidence_public_key),
+                software_version: version.into(),
+                distribution: evidence_distribution.clone(),
+                signature_hex: hex::encode(evidence_key.sign(&payload).to_bytes()),
+            }
+        };
+        let evidence = akrat_trust::RelayEquivocationEvidence {
+            version: 1,
+            relay_url: evidence_url.into(),
+            observed_at_unix_seconds: 1,
+            first: make_evidence_proof("1.0"),
+            second: make_evidence_proof("2.0"),
+        };
+        alice
+            .send_relay_evidence(evidence.clone())
+            .expect("queue signed relay evidence");
+        let shared_evidence = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = bob_rx.recv().await.expect("shared evidence event");
+                if matches!(event, UiEvent::IncomingRelayEvidence { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("shared evidence timeout");
+        assert!(
+            matches!(shared_evidence, UiEvent::IncomingRelayEvidence { evidence: ref received, .. } if received == &evidence)
+        );
         alice
             .send_group_event(creation)
             .expect("send group creation");
