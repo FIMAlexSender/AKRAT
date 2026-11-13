@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
-pub const ATTACHMENT_CHUNK_BYTES: usize = 32 * 1024;
+pub const ATTACHMENT_CHUNK_BYTES: usize = 20 * 1024;
+const LEGACY_ATTACHMENT_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_ATTACHMENT_CHUNKS: usize = MAX_ATTACHMENT_BYTES.div_ceil(ATTACHMENT_CHUNK_BYTES);
 pub const MAX_IMAGE_DIMENSION: u32 = 8_192;
 #[cfg(feature = "media-image")]
@@ -48,8 +49,60 @@ pub struct AttachmentChunk {
     pub version: u8,
     pub attachment_id: String,
     pub index: u32,
+    #[serde(with = "base64_bytes")]
     pub nonce: Vec<u8>,
+    #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("base64 bytes or a legacy byte array")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                STANDARD.decode(value).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::new();
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(BytesVisitor)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,7 +241,7 @@ pub fn decrypt_image(
             || chunk.attachment_id != manifest.attachment_id
             || chunk.index >= manifest.chunk_count
             || chunk.nonce.len() != 12
-            || chunk.ciphertext.len() > ATTACHMENT_CHUNK_BYTES + 16
+            || chunk.ciphertext.len() > manifest.chunk_size as usize + 16
             || ordered[chunk.index as usize].replace(chunk).is_some()
         {
             return Err(AttachmentError::InvalidTransfer);
@@ -236,6 +289,54 @@ pub fn decrypt_image(
     Ok(plaintext.to_vec())
 }
 
+pub fn validate_encrypted_chunk(
+    manifest: &AttachmentManifest,
+    chunk: &AttachmentChunk,
+) -> Result<(), AttachmentError> {
+    validate_manifest(manifest)?;
+    if chunk.version != 1
+        || chunk.attachment_id != manifest.attachment_id
+        || chunk.index >= manifest.chunk_count
+        || chunk.nonce.len() != 12
+        || chunk.ciphertext.len() > manifest.chunk_size as usize + 16
+    {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    let expected = if chunk.index + 1 == manifest.chunk_count {
+        manifest.plaintext_size as usize - chunk.index as usize * manifest.chunk_size as usize
+    } else {
+        manifest.chunk_size as usize
+    };
+    if chunk.ciphertext.len() != expected + 16 {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    let key: [u8; 32] = manifest
+        .content_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| AttachmentError::InvalidTransfer)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| AttachmentError::Authentication)?;
+    let nonce =
+        Nonce::try_from(chunk.nonce.as_slice()).map_err(|_| AttachmentError::InvalidTransfer)?;
+    let mut plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &chunk.ciphertext,
+                    aad: &chunk_aad(manifest, chunk.index),
+                },
+            )
+            .map_err(|_| AttachmentError::Authentication)?,
+    );
+    if plaintext.len() != expected {
+        plaintext.zeroize();
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    plaintext.zeroize();
+    Ok(())
+}
+
 pub fn attachment_sidecar_path(vault_path: &Path) -> PathBuf {
     let mut name = vault_path.file_name().unwrap_or_default().to_os_string();
     name.push(".attachments");
@@ -255,7 +356,7 @@ pub fn store_encrypted_chunks(
     fs::create_dir_all(&directory)?;
     for chunk in chunks {
         if chunk.attachment_id != *attachment_id
-            || chunk.ciphertext.len() > ATTACHMENT_CHUNK_BYTES + 16
+            || chunk.ciphertext.len() > LEGACY_ATTACHMENT_CHUNK_BYTES + 16
             || chunk.nonce.len() != 12
         {
             return Err(AttachmentError::InvalidTransfer);
@@ -283,9 +384,9 @@ pub fn load_encrypted_chunks(
         let path = directory.join(format!("{index:08}.chunk"));
         let file = File::open(path)?;
         let mut bytes = Vec::new();
-        file.take((ATTACHMENT_CHUNK_BYTES * 4 + 4096) as u64)
+        file.take((LEGACY_ATTACHMENT_CHUNK_BYTES * 4 + 4096) as u64)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > ATTACHMENT_CHUNK_BYTES * 4 + 4096 {
+        if bytes.len() > LEGACY_ATTACHMENT_CHUNK_BYTES * 4 + 4096 {
             return Err(AttachmentError::TooLarge);
         }
         let chunk: AttachmentChunk =
@@ -308,6 +409,85 @@ pub fn remove_stored_attachment(
     Ok(())
 }
 
+pub fn store_mailbox_envelope(
+    sidecar: &Path,
+    attachment_id: &str,
+    conversation: &str,
+    frame_id: &str,
+    envelope: &[u8],
+) -> Result<(), AttachmentError> {
+    validate_id(attachment_id)?;
+    validate_conversation(conversation)?;
+    validate_frame_id(frame_id)?;
+    if envelope.is_empty() || envelope.len() > 40 * 1024 {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    let directory = sidecar
+        .join(attachment_id)
+        .join("mailbox-outbox")
+        .join(hex::encode(Sha256::digest(conversation.as_bytes())));
+    fs::create_dir_all(&directory)?;
+    let destination = directory.join(format!("{frame_id}.envelope"));
+    let temporary = directory.join(format!("{frame_id}.envelope.tmp"));
+    if destination.exists() {
+        let existing = load_mailbox_envelope(sidecar, attachment_id, conversation, frame_id)?;
+        if existing == envelope {
+            return Ok(());
+        }
+        fs::remove_file(&destination)?;
+    }
+    let mut file = File::create(&temporary)?;
+    file.write_all(envelope)?;
+    file.sync_all()?;
+    fs::rename(temporary, destination)?;
+    Ok(())
+}
+
+pub fn load_mailbox_envelope(
+    sidecar: &Path,
+    attachment_id: &str,
+    conversation: &str,
+    frame_id: &str,
+) -> Result<Vec<u8>, AttachmentError> {
+    validate_id(attachment_id)?;
+    validate_conversation(conversation)?;
+    validate_frame_id(frame_id)?;
+    let path = sidecar
+        .join(attachment_id)
+        .join("mailbox-outbox")
+        .join(hex::encode(Sha256::digest(conversation.as_bytes())))
+        .join(format!("{frame_id}.envelope"));
+    let file = File::open(path)?;
+    let mut envelope = Vec::new();
+    file.take((40 * 1024 + 1) as u64)
+        .read_to_end(&mut envelope)?;
+    if envelope.is_empty() || envelope.len() > 40 * 1024 {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    Ok(envelope)
+}
+
+pub fn remove_mailbox_envelope(
+    sidecar: &Path,
+    attachment_id: &str,
+    conversation: &str,
+    frame_id: &str,
+) -> Result<(), AttachmentError> {
+    validate_id(attachment_id)?;
+    validate_conversation(conversation)?;
+    validate_frame_id(frame_id)?;
+    let path = sidecar
+        .join(attachment_id)
+        .join("mailbox-outbox")
+        .join(hex::encode(Sha256::digest(conversation.as_bytes())))
+        .join(format!("{frame_id}.envelope"));
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn validate_manifest(manifest: &AttachmentManifest) -> Result<(), AttachmentError> {
     if manifest.version != 1
         || validate_id(&manifest.attachment_id).is_err()
@@ -321,7 +501,10 @@ pub fn validate_manifest(manifest: &AttachmentManifest) -> Result<(), Attachment
         || manifest.media_type != "image/png"
         || manifest.plaintext_size == 0
         || manifest.plaintext_size > MAX_ATTACHMENT_BYTES as u64
-        || manifest.chunk_size as usize != ATTACHMENT_CHUNK_BYTES
+        || !matches!(
+            manifest.chunk_size as usize,
+            ATTACHMENT_CHUNK_BYTES | LEGACY_ATTACHMENT_CHUNK_BYTES
+        )
         || manifest.chunk_count == 0
         || manifest.chunk_count as usize > MAX_ATTACHMENT_CHUNKS
         || manifest.chunk_count as usize
@@ -350,6 +533,20 @@ fn chunk_aad(manifest: &AttachmentManifest, index: u32) -> Vec<u8> {
 
 fn validate_id(id: &str) -> Result<(), AttachmentError> {
     if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    Ok(())
+}
+
+fn validate_frame_id(id: &str) -> Result<(), AttachmentError> {
+    if !(16..=128).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AttachmentError::InvalidTransfer);
+    }
+    Ok(())
+}
+
+fn validate_conversation(conversation: &str) -> Result<(), AttachmentError> {
+    if conversation.is_empty() || conversation.len() > 256 {
         return Err(AttachmentError::InvalidTransfer);
     }
     Ok(())
@@ -476,6 +673,58 @@ mod tests {
         store_encrypted_chunks(&sidecar, std::slice::from_ref(&chunk)).expect("save full chunk");
         let restored = load_encrypted_chunks(&sidecar, &manifest).expect("load full chunk");
         assert_eq!(restored, [chunk]);
+    }
+
+    #[test]
+    fn attachment_chunks_read_legacy_byte_arrays_and_mailbox_frames_are_isolated_by_peer() {
+        let legacy = serde_json::json!({
+            "version": 1,
+            "attachment_id": "00112233445566778899aabbccddeeff",
+            "index": 0,
+            "nonce": [1, 2, 3],
+            "ciphertext": [4, 5, 6]
+        });
+        let decoded: AttachmentChunk =
+            serde_json::from_value(legacy).expect("read legacy byte-array chunk");
+        assert_eq!(decoded.nonce, [1, 2, 3]);
+        assert_eq!(decoded.ciphertext, [4, 5, 6]);
+
+        let directory = tempfile::tempdir().expect("temporary attachment sidecar");
+        let sidecar = directory.path().join("vault.akrat.attachments");
+        let attachment_id = "00112233445566778899aabbccddeeff";
+        let frame_id = "d35a4b0c0ffee12600000000";
+        let alice_frame = b"Alice's end-to-end ciphertext";
+        let bob_frame = b"Bob's different end-to-end ciphertext";
+        store_mailbox_envelope(
+            &sidecar,
+            attachment_id,
+            "identity:alice",
+            frame_id,
+            alice_frame,
+        )
+        .expect("save Alice frame");
+        store_mailbox_envelope(&sidecar, attachment_id, "identity:bob", frame_id, bob_frame)
+            .expect("save Bob frame independently");
+        assert_eq!(
+            load_mailbox_envelope(&sidecar, attachment_id, "identity:alice", frame_id)
+                .expect("reload Alice frame"),
+            alice_frame
+        );
+        assert_eq!(
+            load_mailbox_envelope(&sidecar, attachment_id, "identity:bob", frame_id)
+                .expect("reload Bob frame"),
+            bob_frame
+        );
+        remove_mailbox_envelope(&sidecar, attachment_id, "identity:alice", frame_id)
+            .expect("remove delivered Alice frame");
+        assert!(
+            load_mailbox_envelope(&sidecar, attachment_id, "identity:alice", frame_id).is_err()
+        );
+        assert_eq!(
+            load_mailbox_envelope(&sidecar, attachment_id, "identity:bob", frame_id)
+                .expect("Bob's frame remains"),
+            bob_frame
+        );
     }
 
     #[test]

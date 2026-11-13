@@ -345,11 +345,24 @@ fn App() -> Element {
                             member.accepted && member.fingerprint == recipient.fingerprint
                         }) && (recipient.status == GroupRecipientStatus::Pending
                             || (recipient.status == GroupRecipientStatus::Sent && retry_elapsed))
-                            && !data.attachments.iter().any(|attachment| {
-                                attachment.conversation == format!("group:{}", group.group_id)
-                                    && attachment.message_id == message.id
-                            })
                         {
+                            let attachment = data
+                                .attachments
+                                .iter()
+                                .find(|attachment| {
+                                    attachment.conversation == format!("group:{}", group.group_id)
+                                        && attachment.message_id == message.id
+                                })
+                                .and_then(|attachment| {
+                                    let sidecar =
+                                        attachments::attachment_sidecar_path(&path.read());
+                                    attachments::load_encrypted_chunks(
+                                        &sidecar,
+                                        &attachment.manifest,
+                                    )
+                                    .ok()
+                                    .map(|chunks| (attachment.manifest.clone(), chunks))
+                                });
                             queued_group_messages.push((
                                 direct_conversation,
                                 GroupMessage {
@@ -367,6 +380,7 @@ fn App() -> Element {
                                             && attachment.message_id == message.id
                                     }),
                                 },
+                                attachment,
                             ));
                         }
                     }
@@ -438,16 +452,28 @@ fn App() -> Element {
                     changed = true;
                 }
             }
-            for (conversation, message) in queued_group_messages {
-                if async_mailbox::send_group_message(
+            for (conversation, message, attachment) in queued_group_messages {
+                let mut result = async_mailbox::send_group_message(
                     path_value.clone(),
                     phrase.clone(),
-                    conversation,
-                    message,
+                    conversation.clone(),
+                    message.clone(),
                 )
-                .await
-                .is_ok()
+                .await;
+                if result.is_ok()
+                    && let Some((manifest, chunks)) = attachment
                 {
+                    result = async_mailbox::send_attachment_frames(
+                        path_value.clone(),
+                        phrase.clone(),
+                        conversation,
+                        message.message_id,
+                        manifest,
+                        chunks,
+                    )
+                    .await;
+                }
+                if result.is_ok() {
                     changed = true;
                 }
             }
@@ -3216,6 +3242,7 @@ fn store_incoming_attachment_chunk(
         conversation: stored_conversation,
         message_id: message_id.to_string(),
         manifest,
+        mailbox_frame_receipts: Vec::new(),
     });
     save_vault(path, &mut data, passphrase).map_err(|error| error.to_string())?;
     Ok(Some(data))
@@ -3325,6 +3352,7 @@ fn send_image_action(
         conversation: conversation.clone(),
         message_id: message_id.clone(),
         manifest: manifest.clone(),
+        mailbox_frame_receipts: Vec::new(),
     });
     if let Err(error) = save_vault(&path, &mut data, &phrase) {
         notice.set(format!("Coffre non modifié : {error}"));
@@ -3378,11 +3406,12 @@ fn send_group_image_action(
         sessions,
         notice,
         trace,
-        ..
+        event_sender,
     } = context;
     let mut vault = vault;
     let mut notice = notice;
     let mut trace = trace;
+    let event_sender = event_sender.read().clone();
     let group_id = conversation.trim_start_matches("group:");
     let phrase = passphrase.read().clone();
     let mut data = match load_vault(&path, &phrase) {
@@ -3424,19 +3453,16 @@ fn send_group_image_action(
         notice.set("Le groupe n’a aucun autre membre accepté.".into());
         return;
     }
-    let handles = sessions.read();
-    let mut peers = Vec::with_capacity(recipients.len());
-    for member in &recipients {
-        let key = format!("{}:{}", identity.id, member.fingerprint);
-        let Some(handle) = handles.get(&key).cloned() else {
-            notice.set(
-                "Connectez tous les membres acceptés pour envoyer une image de groupe.".into(),
-            );
-            return;
-        };
-        peers.push(handle);
-    }
-    drop(handles);
+    let peers = {
+        let handles = sessions.read();
+        recipients
+            .iter()
+            .map(|member| {
+                let key = format!("{}:{}", identity.id, member.fingerprint);
+                handles.get(&key).cloned()
+            })
+            .collect::<Vec<_>>()
+    };
     let message_id = match runtime::message_id() {
         Ok(id) => id,
         Err(error) => {
@@ -3471,6 +3497,7 @@ fn send_group_image_action(
         conversation: conversation.clone(),
         message_id: message_id.clone(),
         manifest: manifest.clone(),
+        mailbox_frame_receipts: Vec::new(),
     });
     data.group_deliveries.push(GroupMessageDelivery {
         group_id: group.group_id.clone(),
@@ -3502,19 +3529,61 @@ fn send_group_image_action(
         text: caption,
         has_attachment: true,
     };
-    for handle in &peers {
-        if let Err(error) = handle.send_group_message(payload.clone()) {
-            notice.set(format!("Envoi de groupe interrompu : {error}"));
-            return;
+    let mut direct_recipients = Vec::new();
+    let mut mailbox_recipients = Vec::new();
+    for (member, peer) in recipients.iter().zip(peers) {
+        let mut direct_ok = false;
+        if let Some(handle) = peer
+            && handle.send_group_message(payload.clone()).is_ok()
+        {
+            direct_ok = chunks.iter().cloned().all(|chunk| {
+                handle
+                    .send_attachment_chunk(message_id.clone(), manifest.clone(), chunk)
+                    .is_ok()
+            });
         }
-        for chunk in chunks.iter().cloned() {
-            if let Err(error) =
-                handle.send_attachment_chunk(message_id.clone(), manifest.clone(), chunk)
-            {
-                notice.set(format!("Transfert d’image interrompu : {error}"));
-                return;
+        if direct_ok {
+            direct_recipients.push(member.fingerprint.clone());
+            continue;
+        }
+        let route_key = format!("{}:{}", identity.id, member.fingerprint);
+        mailbox_recipients.push((route_key, member.fingerprint.clone()));
+    }
+    for (route_key, fingerprint) in mailbox_recipients {
+        let event_sender = event_sender.clone();
+        let path = path.clone();
+        let phrase = phrase.clone();
+        let message = payload.clone();
+        let manifest = manifest.clone();
+        let chunks = chunks.clone();
+        let message_id = message_id.clone();
+        spawn(async move {
+            let result = async {
+                async_mailbox::send_group_message(
+                    path.clone(),
+                    phrase.clone(),
+                    route_key.clone(),
+                    message,
+                )
+                .await?;
+                async_mailbox::send_attachment_frames(
+                    path,
+                    phrase,
+                    route_key.clone(),
+                    message_id.clone(),
+                    manifest,
+                    chunks,
+                )
+                .await
             }
-        }
+            .await;
+            let _ = event_sender.send(UiEvent::MailboxResult {
+                conversation: route_key,
+                id: message_id,
+                result,
+            });
+            let _ = fingerprint;
+        });
     }
     if let Ok(mut data) = load_vault(&path, &phrase) {
         if let Some(delivery) = data
@@ -3523,14 +3592,20 @@ fn send_group_image_action(
             .find(|delivery| delivery.group_id == group_id && delivery.message_id == message_id)
         {
             for recipient in &mut delivery.recipients {
-                recipient.status = GroupRecipientStatus::Sent;
+                if direct_recipients.contains(&recipient.fingerprint) {
+                    recipient.status = GroupRecipientStatus::Sent;
+                }
                 recipient.updated_at = now_seconds();
             }
         }
         if let Some(message) = data.messages.iter_mut().find(|message| {
             message.conversation == conversation && message.id == message_id && message.outgoing
         }) {
-            message.delivery = DeliveryState::Sent;
+            message.delivery = if direct_recipients.len() == recipients.len() {
+                DeliveryState::Sent
+            } else {
+                DeliveryState::Queued
+            };
         }
         if save_vault(&path, &mut data, &phrase).is_ok() {
             vault.set(Some(data));
@@ -3543,7 +3618,11 @@ fn send_group_image_action(
             &message_id[..8.min(message_id.len())]
         ),
     );
-    notice.set("Image envoyée aux membres actuellement connectés.".into());
+    notice.set(format!(
+        "Image chiffrée · {} membre(s) par P2P, {} en attente de Mailbox.",
+        direct_recipients.len(),
+        recipients.len().saturating_sub(direct_recipients.len())
+    ));
 }
 
 fn store_group_acknowledgement(

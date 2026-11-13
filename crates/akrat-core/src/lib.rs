@@ -188,6 +188,14 @@ pub struct AsyncOutboxItem {
     pub message_id: String,
     pub envelope: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_event: Option<GroupEventOutboxRef>,
 }
 
@@ -461,6 +469,15 @@ pub struct StoredAttachment {
     pub conversation: String,
     pub message_id: String,
     pub manifest: attachments::AttachmentManifest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailbox_frame_receipts: Vec<MailboxAttachmentFrameReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxAttachmentFrameReceipt {
+    pub frame_id: String,
+    pub ciphertext_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1593,8 +1610,17 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
     for attachment in &data.attachments {
         attachments::validate_manifest(&attachment.manifest)
             .map_err(|_| AkratError::InvalidVault)?;
+        let mut frame_ids = std::collections::HashSet::new();
         if attachment.message_id != attachment.manifest.message_id
             || !attachment_ids.insert(attachment.manifest.attachment_id.as_str())
+            || attachment.mailbox_frame_receipts.len() > attachment.manifest.chunk_count as usize
+            || attachment.mailbox_frame_receipts.iter().any(|receipt| {
+                receipt.frame_id.is_empty()
+                    || receipt.frame_id.len() > 128
+                    || receipt.ciphertext_sha256.len() != 64
+                    || hex::decode(&receipt.ciphertext_sha256).is_err()
+                    || !frame_ids.insert(receipt.frame_id.as_str())
+            })
             || !data.messages.iter().any(|message| {
                 message.conversation == attachment.conversation
                     && message.id == attachment.message_id
@@ -1729,9 +1755,45 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
                 .as_deref()
                 == Some(reference.event_sha256.as_str())
         });
-        if item.envelope.is_empty()
+        let attachment_parent_exists = item.parent_message_id.as_ref().is_some_and(|parent_id| {
+            item.attachment_index.is_some()
+                && item.message_id
+                    == format!(
+                        "{parent_id}{:08x}",
+                        item.attachment_index.unwrap_or_default()
+                    )
+                && data
+                    .messages
+                    .iter()
+                    .any(|message| message.outgoing && message.id == *parent_id)
+                && item.attachment_id.as_ref().is_some_and(|attachment_id| {
+                    data.attachments.iter().any(|attachment| {
+                        attachment.message_id == *parent_id
+                            && attachment.manifest.attachment_id == *attachment_id
+                    })
+                })
+                && item
+                    .envelope_sha256
+                    .as_ref()
+                    .is_some_and(|digest| digest.len() == 64 && hex::decode(digest).is_ok())
+                && item
+                    .conversation
+                    .split_once(':')
+                    .is_some_and(|(identity_id, fingerprint)| {
+                        identities.contains(identity_id)
+                            && data.contacts.iter().any(|contact| {
+                                contact.fingerprint == fingerprint && contact.manually_verified
+                            })
+                    })
+        });
+        if (item.envelope.is_empty() && item.attachment_id.is_none())
             || item.envelope.len() > 256 * 1024
-            || !(direct_message_exists || group_message_exists || group_event_exists)
+            || item.parent_message_id.is_some() != item.attachment_index.is_some()
+            || item.attachment_id.is_some() != item.envelope_sha256.is_some()
+            || !(direct_message_exists
+                || group_message_exists
+                || group_event_exists
+                || attachment_parent_exists)
             || !outbox_ids.insert((item.conversation.as_str(), item.message_id.as_str()))
         {
             return Err(AkratError::InvalidVault);
@@ -2202,6 +2264,7 @@ mod tests {
                 conversation: "dm:alice:bob".into(),
                 message_id: "image-message".into(),
                 manifest: manifest.clone(),
+                mailbox_frame_receipts: Vec::new(),
             }],
             ..VaultData::default()
         };
