@@ -553,7 +553,33 @@ fn install_transaction(
     database_backup: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut systemd = SystemdControl { config };
-    install_transaction_with(config, candidate, binaries, database_backup, &mut systemd)
+    match install_transaction_with(config, candidate, binaries, database_backup, &mut systemd) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if config.components.contains(&Component::Mailbox) && !service_active(&config.service)?
+            {
+                if let Err(restart_error) = systemd.command("restart") {
+                    return Err(format!(
+                        "Mise à jour refusée : {error}. Le service Mailbox n’a pas redémarré après l’échec de préparation : {restart_error}"
+                    )
+                    .into());
+                }
+                if !systemd.wait_ready(Duration::from_secs(30))? {
+                    return Err(format!(
+                        "Mise à jour refusée : {error}. Le service Mailbox est resté indisponible après l’échec de préparation."
+                    )
+                    .into());
+                }
+                if let Err(health_error) = systemd.health() {
+                    return Err(format!(
+                        "Mise à jour refusée : {error}. Le service Mailbox a redémarré mais son contrôle de santé échoue : {health_error}"
+                    )
+                    .into());
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 trait ServiceControl {
@@ -1464,11 +1490,18 @@ mod tests {
 
         fn signed_distribution(
             tag: &str,
-            asset_name: &str,
-            artifact: &[u8],
+            artifacts: &[(&str, &[u8])],
             signing_key: &SigningKey,
-        ) -> VerifiedDistribution {
+        ) -> (VerifiedDistribution, Vec<u8>, Vec<u8>) {
             let version = tag.trim_start_matches('v');
+            let mut assets = artifacts
+                .iter()
+                .map(|(name, artifact)| DistributionAsset {
+                    name: (*name).into(),
+                    sha256: hex::encode(Sha256::digest(artifact)),
+                })
+                .collect::<Vec<_>>();
+            assets.sort_by(|left, right| left.name.cmp(&right.name));
             let attestation = ReleaseAttestation {
                 schema: RELEASE_ATTESTATION_SCHEMA.into(),
                 repository: RELEASE_REPOSITORY.into(),
@@ -1480,10 +1513,7 @@ mod tests {
                 run_id: 1,
                 issued_unix_seconds: 1,
                 protocol_version: 1,
-                assets: vec![DistributionAsset {
-                    name: asset_name.into(),
-                    sha256: hex::encode(Sha256::digest(artifact)),
-                }],
+                assets,
             };
             let payload = release_attestation_payload(&attestation).expect("valid payload");
             let signature = hex::encode(signing_key.sign(&payload).to_bytes());
@@ -1507,13 +1537,19 @@ mod tests {
                 )
                 .is_err()
             );
-            verify_attested_artifact(
-                &distribution,
-                asset_name,
-                &hex::encode(Sha256::digest(artifact)),
+            for (asset_name, artifact) in artifacts {
+                verify_attested_artifact(
+                    &distribution,
+                    asset_name,
+                    &hex::encode(Sha256::digest(artifact)),
+                )
+                .expect("signed artifact hash verifies");
+            }
+            (
+                distribution,
+                serde_json::to_vec(&attestation).expect("serialize test attestation"),
+                signature.into_bytes(),
             )
-            .expect("signed artifact hash verifies");
-            distribution
         }
 
         fn command_ok(program: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
@@ -1527,6 +1563,35 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             output
+        }
+
+        fn local_http_get(address: std::net::SocketAddr, path: &str) -> (u16, String) {
+            use std::io::{Read, Write};
+            let mut stream =
+                std::net::TcpStream::connect(address).expect("connect local HTTP endpoint");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set local endpoint timeout");
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                address.ip()
+            )
+            .expect("send local HTTP request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read local HTTP response");
+            let (headers, body) = response
+                .split_once("\r\n\r\n")
+                .expect("HTTP response headers");
+            let status = headers
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|status| status.parse().ok())
+                .expect("parse HTTP status");
+            (status, body.to_owned())
         }
 
         let uid = Command::new("id")
@@ -1572,10 +1637,10 @@ mod tests {
             .expect("generate ephemeral test root");
         let signing_key = SigningKey::from_bytes(&seed);
         seed.fill(0);
-        let old_distribution =
-            signed_distribution("v0.1.12", old_asset_name, &old_bytes, &signing_key);
-        let new_distribution =
-            signed_distribution("v0.1.13", new_asset_name, &new_bytes, &signing_key);
+        let (old_distribution, _, _) =
+            signed_distribution("v0.1.12", &[(old_asset_name, &old_bytes)], &signing_key);
+        let (new_distribution, new_attestation_bytes, new_signature_bytes) =
+            signed_distribution("v0.1.13", &[(new_asset_name, &new_bytes)], &signing_key);
 
         let directory = tempfile::tempdir().expect("isolated systemd test directory");
         let root = directory.path();
@@ -1722,8 +1787,8 @@ mod tests {
             tag: "v0.1.13".into(),
             distribution: new_distribution.clone(),
             assets: BTreeMap::new(),
-            attestation_bytes: Vec::new(),
-            signature_bytes: Vec::new(),
+            attestation_bytes: new_attestation_bytes,
+            signature_bytes: new_signature_bytes,
         };
         install_transaction(
             &config,
@@ -1770,6 +1835,51 @@ mod tests {
         assert_eq!(messages_after, 1);
         drop(connection);
 
+        systemctl(&config, "stop").expect("stop Mailbox before staging failure scenario");
+        let staged_failure_backup = install_dir.join("akrat-mailbox.pre-staging-failure");
+        std::fs::rename(&installed_binary, &staged_failure_backup)
+            .expect("temporarily preserve installed Mailbox executable");
+        struct RestoreMailboxExecutable {
+            installed: PathBuf,
+            backup: PathBuf,
+        }
+        impl Drop for RestoreMailboxExecutable {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.installed);
+                let _ = std::fs::rename(&self.backup, &self.installed);
+            }
+        }
+        let restore_mailbox_executable = RestoreMailboxExecutable {
+            installed: installed_binary.clone(),
+            backup: staged_failure_backup.clone(),
+        };
+        std::os::unix::fs::symlink(&staged_failure_backup, &installed_binary)
+            .expect("replace executable with a staging-rejected symlink");
+        let staging_failure = install_transaction(
+            &config,
+            &candidate,
+            vec![(Component::Mailbox, new_bytes.clone())],
+            None,
+        );
+        assert!(
+            staging_failure.is_err(),
+            "updater must reject a symlink executable during staging"
+        );
+        assert!(
+            wait_for_service(&service_name, Duration::from_secs(15))
+                .expect("Mailbox restarted after staging failure"),
+            "staging failure must not leave Mailbox stopped"
+        );
+        command_ok(
+            installed_binary.to_str().unwrap(),
+            &[
+                std::ffi::OsStr::new("--config"),
+                config_path.as_os_str(),
+                std::ffi::OsStr::new("health"),
+            ],
+        );
+        drop(restore_mailbox_executable);
+
         systemctl(&config, "stop").expect("stop updated service before rollback scenario");
         let connection =
             rusqlite::Connection::open(&database).expect("open database before backup");
@@ -1788,12 +1898,15 @@ mod tests {
             .expect("write marker that rollback should remove");
         drop(connection);
         candidate.tag = "v0.1.14".into();
-        candidate.distribution = signed_distribution(
-            "v0.1.14",
-            "AKRAT-v0.1.14-mailbox-linux-x64",
-            b"#!/bin/sh\nexit 1\n",
-            &signing_key,
-        );
+        let (failed_distribution, failed_attestation_bytes, failed_signature_bytes) =
+            signed_distribution(
+                "v0.1.14",
+                &[("AKRAT-v0.1.14-mailbox-linux-x64", b"#!/bin/sh\nexit 1\n")],
+                &signing_key,
+            );
+        candidate.distribution = failed_distribution;
+        candidate.attestation_bytes = failed_attestation_bytes;
+        candidate.signature_bytes = failed_signature_bytes;
         let broken = b"#!/bin/sh\nexit 1\n".to_vec();
         let rollback = install_transaction(
             &config,
@@ -1840,5 +1953,211 @@ mod tests {
             old_distribution.version, "0.1.12",
             "the previous genuine release is independently signed"
         );
+
+        let old_relay_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_OLD_RELAY")
+                .expect("path to the real v0.1.12 akrat-relay binary"),
+        );
+        let old_iroh_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_OLD_IROH_RELAY")
+                .expect("path to the real v0.1.12 iroh-relay binary"),
+        );
+        let new_relay_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_NEW_RELAY")
+                .expect("path to the real v0.1.13 akrat-relay binary"),
+        );
+        let new_iroh_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_NEW_IROH_RELAY")
+                .expect("path to the real v0.1.13 iroh-relay binary"),
+        );
+        let old_relay_bytes = std::fs::read(&old_relay_path).expect("read old akrat-relay");
+        let old_iroh_bytes = std::fs::read(&old_iroh_path).expect("read old iroh-relay");
+        let new_relay_bytes = std::fs::read(&new_relay_path).expect("read new akrat-relay");
+        let new_iroh_bytes = std::fs::read(&new_iroh_path).expect("read new iroh-relay");
+        for bytes in [
+            &old_relay_bytes,
+            &old_iroh_bytes,
+            &new_relay_bytes,
+            &new_iroh_bytes,
+        ] {
+            assert!(bytes.starts_with(b"\x7fELF"));
+        }
+        let old_relay_asset = "AKRAT-v0.1.12-relay-linux-x64";
+        let old_iroh_asset = "AKRAT-v0.1.12-iroh-relay-linux-x64";
+        let new_relay_asset = "AKRAT-v0.1.13-relay-linux-x64";
+        let new_iroh_asset = "AKRAT-v0.1.13-iroh-relay-linux-x64";
+        let (old_relay_distribution, old_relay_manifest, old_relay_signature) = signed_distribution(
+            "v0.1.12",
+            &[
+                (old_relay_asset, &old_relay_bytes),
+                (old_iroh_asset, &old_iroh_bytes),
+            ],
+            &signing_key,
+        );
+        let (new_relay_distribution, new_relay_manifest, new_relay_signature) = signed_distribution(
+            "v0.1.13",
+            &[
+                (new_relay_asset, &new_relay_bytes),
+                (new_iroh_asset, &new_iroh_bytes),
+            ],
+            &signing_key,
+        );
+        assert_eq!(old_relay_distribution.version, "0.1.12");
+
+        let relay_root = root.join("opt/akrat-relay");
+        std::fs::create_dir_all(&relay_root).expect("create relay install directory");
+        let relay_binary = relay_root.join(Component::Relay.file_name());
+        let iroh_binary = relay_root.join(Component::IrohRelay.file_name());
+        std::fs::write(&relay_binary, &old_relay_bytes).expect("install previous AKRAT relay");
+        std::fs::write(&iroh_binary, &old_iroh_bytes).expect("install previous Iroh relay");
+        std::fs::set_permissions(&relay_binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make AKRAT relay executable");
+        std::fs::set_permissions(&iroh_binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make Iroh relay executable");
+        std::fs::write(
+            relay_root.join("AKRAT-v0.1.12-release-attestation.json"),
+            &old_relay_manifest,
+        )
+        .expect("install old relay test attestation");
+        std::fs::write(
+            relay_root.join("AKRAT-v0.1.12-release-attestation.sig"),
+            &old_relay_signature,
+        )
+        .expect("install old relay test signature");
+        std::fs::write(
+            relay_root.join("iroh-relay-local-dev"),
+            "#!/bin/sh\nexec \"$(dirname \"$0\")/iroh-relay\" --dev \"$@\"\n",
+        )
+        .expect("write local Iroh dev-mode launcher");
+        std::fs::set_permissions(
+            relay_root.join("iroh-relay-local-dev"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("make local Iroh launcher executable");
+        let relay_config_path = root.join("etc/iroh-relay.toml");
+        std::fs::write(&relay_config_path, "enable_relay = true\n")
+            .expect("write isolated relay configuration");
+        let relay_identity_key = root.join("var/lib/relay/identity.key");
+        let relay_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve relay identity port");
+        let relay_identity_address = relay_listener.local_addr().expect("relay identity address");
+        drop(relay_listener);
+        let relay_service_name = format!("akrat-relay-test-{}.service", std::process::id());
+        let relay_service_unit = PathBuf::from("/run/systemd/system").join(&relay_service_name);
+        std::fs::write(
+            &relay_service_unit,
+            format!(
+                "[Unit]\nDescription=Temporary AKRAT relay updater integration test\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} --config-path {} --advertise-url https://relay.test.invalid --identity-key {} --identity-bind {} --relay-binary {}\nRestart=no\n",
+                root.display(),
+                relay_binary.display(),
+                relay_config_path.display(),
+                relay_identity_key.display(),
+                relay_identity_address,
+                relay_root.join("iroh-relay-local-dev").display()
+            ),
+        )
+        .expect("write runtime-only relay unit");
+        let _remove_relay_unit = RemoveTestUnit {
+            name: relay_service_name.clone(),
+            path: relay_service_unit,
+        };
+        assert!(
+            Command::new("systemctl")
+                .arg("daemon-reload")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let start_relay = Command::new("systemctl")
+            .args(["start", &relay_service_name])
+            .output()
+            .expect("start real AKRAT and Iroh relay services");
+        assert!(
+            start_relay.status.success(),
+            "{}",
+            String::from_utf8_lossy(&start_relay.stderr)
+        );
+        assert!(
+            wait_for_service(&relay_service_name, Duration::from_secs(15))
+                .expect("relay service query")
+        );
+        let relay_health_url =
+            reqwest::Url::parse(&format!("http://{relay_identity_address}/health"))
+                .expect("relay health URL");
+        let relay_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !relay_health_ok(&relay_health_url).unwrap_or(false) {
+            assert!(
+                std::time::Instant::now() < relay_deadline,
+                "AKRAT relay health endpoint did not start"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let initial_relay_pid = Command::new("systemctl")
+            .args(["show", "--property=MainPID", "--value", &relay_service_name])
+            .output()
+            .expect("read relay MainPID");
+        let initial_relay_pid: u32 = String::from_utf8_lossy(&initial_relay_pid.stdout)
+            .trim()
+            .parse()
+            .expect("parse initial relay MainPID");
+        let (iroh_status, _) = local_http_get("127.0.0.1:3340".parse().unwrap(), "/");
+        assert_eq!(
+            iroh_status, 200,
+            "Iroh relay endpoint responds before update"
+        );
+        let relay_health_address = relay_identity_address;
+        let relay_config = Config {
+            install_dir: relay_root.clone(),
+            service: relay_service_name.clone(),
+            components: vec![Component::Relay, Component::IrohRelay],
+            channel: Channel::Stable,
+            policy: Policy::Manual,
+            maintenance_start_hour: 0,
+            maintenance_end_hour: 0,
+            mailbox_config: None,
+            relay_health_url: Some(format!("http://{relay_health_address}/health")),
+            database_backups: None,
+            sqlite_databases: Vec::new(),
+            allow_mailbox_auto_update: false,
+        };
+        let relay_candidate = Candidate {
+            tag: "v0.1.13".into(),
+            distribution: new_relay_distribution,
+            assets: BTreeMap::new(),
+            attestation_bytes: new_relay_manifest,
+            signature_bytes: new_relay_signature,
+        };
+        install_transaction(
+            &relay_config,
+            &relay_candidate,
+            vec![
+                (Component::Relay, new_relay_bytes),
+                (Component::IrohRelay, new_iroh_bytes),
+            ],
+            None,
+        )
+        .expect("real signed AKRAT Relay and Iroh Relay systemd update");
+        let updated_relay_pid = Command::new("systemctl")
+            .args(["show", "--property=MainPID", "--value", &relay_service_name])
+            .output()
+            .expect("read updated relay MainPID");
+        let updated_relay_pid: u32 = String::from_utf8_lossy(&updated_relay_pid.stdout)
+            .trim()
+            .parse()
+            .expect("parse updated relay MainPID");
+        assert_ne!(updated_relay_pid, 0);
+        assert_ne!(updated_relay_pid, initial_relay_pid);
+        assert!(relay_health_ok(&relay_health_url).expect("updated relay health response"));
+        let (iroh_status, _) = local_http_get("127.0.0.1:3340".parse().unwrap(), "/");
+        assert_eq!(
+            iroh_status, 200,
+            "Iroh relay endpoint responds after update"
+        );
+        let (attestation_status, attestation_body) = local_http_get(
+            relay_identity_address,
+            "/.well-known/akrat/v2/release-attestation.json",
+        );
+        assert_eq!(attestation_status, 200);
+        assert!(attestation_body.contains("v0.1.13"));
     }
 }
