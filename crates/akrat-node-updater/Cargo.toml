@@ -15,7 +15,7 @@ chrono.workspace = true
 clap.workspace = true
 fs2.workspace = true
 hex.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 rusqlite = { version = "=0.41.1", features = ["backup", "bundled"] }
 semver.workspace = true
 serde.workspace = true
