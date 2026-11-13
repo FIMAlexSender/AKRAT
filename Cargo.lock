@@ -160,6 +160,7 @@ dependencies = [
  "dioxus",
  "dioxus-desktop",
  "directories",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
  "hex",
  "iroh",

@@ -690,6 +690,68 @@ fn App() -> Element {
                             ),
                         }
                     }
+                    UiEvent::IncomingRelayEvidence {
+                        conversation,
+                        evidence,
+                    } => {
+                        let phrase = passphrase.read().clone();
+                        let vault_path = path.read().clone();
+                        if let Ok(mut data) = load_vault(&vault_path, &phrase) {
+                            let Some(pin) = data.relay_settings.identity_pins.iter().find(|pin| {
+                                pin.relay_url == evidence.relay_url
+                                    && pin
+                                        .fingerprint
+                                        .eq_ignore_ascii_case(&evidence.first.fingerprint)
+                            }) else {
+                                push_trace(
+                                    &mut trace,
+                                    format!(
+                                        "Preuve reçue depuis {conversation} mais non enregistrée · identité de relais non épinglée sur cet appareil"
+                                    ),
+                                );
+                                continue;
+                            };
+                            if akrat_trust::verify_relay_equivocation_evidence(
+                                &evidence,
+                                &pin.fingerprint,
+                            )
+                            .is_err()
+                            {
+                                push_trace(&mut trace, "Preuve partagée refusée · elle ne correspond pas à l’identité de relais épinglée".into());
+                                continue;
+                            }
+                            if data.relay_settings.verified_evidence.contains(&evidence) {
+                                push_trace(
+                                    &mut trace,
+                                    "Preuve de relais déjà connue · doublon ignoré".into(),
+                                );
+                                continue;
+                            }
+                            if data.relay_settings.verified_evidence.len() >= 64 {
+                                push_trace(
+                                    &mut trace,
+                                    "Preuve vérifiée mais non conservée · limite locale atteinte"
+                                        .into(),
+                                );
+                                continue;
+                            }
+                            data.relay_settings.verified_evidence.push(evidence);
+                            if save_vault(&vault_path, &mut data, &phrase).is_ok() {
+                                vault.set(Some(data));
+                                push_trace(
+                                    &mut trace,
+                                    format!(
+                                        "Preuve de relais vérifiée et enregistrée depuis {conversation} · décision locale inchangée"
+                                    ),
+                                );
+                            } else {
+                                push_trace(
+                                    &mut trace,
+                                    "Preuve vérifiée mais enregistrement impossible".into(),
+                                );
+                            }
+                        }
+                    }
                     UiEvent::IncomingAttachmentChunk {
                         conversation,
                         message_id,
@@ -937,7 +999,7 @@ fn App() -> Element {
                     main { class: "content",
                         match page() {
                             Page::Messages => rsx! { ChatPage { vault, passphrase, path: path_value.clone(), active_conversation, sessions, draft, notice, trace, event_sender, on_setup: move |_| page.set(if identities == 0 { Page::Identities } else { Page::Contacts }) } },
-                            Page::Network => rsx! { NetworkPage { vault, listen_stops, path: path_value.clone(), passphrase, notice } },
+                            Page::Network => rsx! { NetworkPage { vault, listen_stops, sessions, path: path_value.clone(), passphrase, notice } },
                             Page::Contacts => rsx! { ContactsPage { vault, passphrase, path: path_value.clone(), import_uri, contact_name, notice } },
                             Page::Identities => rsx! { IdentitiesPage { vault, passphrase, path: path_value, identity_name, invitation_result, notice } },
                             Page::Settings => rsx! { SettingsPage { path: path_value, notice, update_status,
@@ -2059,6 +2121,7 @@ fn ContactRow(
 fn NetworkPage(
     vault: Signal<Option<VaultData>>,
     listen_stops: Signal<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+    sessions: Signal<HashMap<String, SessionHandle>>,
     path: PathBuf,
     passphrase: Signal<String>,
     notice: Signal<String>,
@@ -2393,6 +2456,19 @@ fn NetworkPage(
                             spawn(async move { if copy_to_clipboard(value).await { notice.set("Preuve copiée pour partage.".into()); } else { notice.set("Copie impossible · sélectionnez la preuve dans votre coffre.".into()); } });
                         }
                     }, "Copier la dernière preuve vérifiée" }
+                    button { class: "secondary compact", onclick: {
+                        let evidence = evidence.clone();
+                        let sessions = sessions;
+                        move |_| {
+                            let recipients = sessions.read().values().cloned().collect::<Vec<_>>();
+                            if recipients.is_empty() {
+                                notice.set("Aucun contact vérifié n’a une session active pour recevoir cette preuve.".into());
+                                return;
+                            }
+                            let sent = recipients.iter().filter(|session| session.send_relay_evidence(evidence.clone()).is_ok()).count();
+                            notice.set(format!("Preuve vérifiée mise en file sur {sent} session(s) chiffrée(s). Chaque destinataire la vérifiera et décidera localement."));
+                        }
+                    }, "Partager avec les contacts connectés" }
                 }
             }
             section { class: "panel mailbox-inbox-form",

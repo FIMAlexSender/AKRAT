@@ -53,6 +53,15 @@ impl SessionHandle {
             .map_err(|_| "La session est fermée".to_string())
     }
 
+    pub fn send_relay_evidence(
+        &self,
+        evidence: akrat_trust::RelayEquivocationEvidence,
+    ) -> Result<(), String> {
+        self.commands
+            .send(SessionCommand::RelayEvidence(evidence))
+            .map_err(|_| "La session est fermée".to_string())
+    }
+
     pub fn send_attachment_chunk(
         &self,
         message_id: String,
@@ -101,6 +110,7 @@ enum SessionCommand {
     },
     GroupEvent(GroupEvent),
     GroupMessage(GroupMessage),
+    RelayEvidence(akrat_trust::RelayEquivocationEvidence),
     AttachmentChunk {
         message_id: String,
         manifest: AttachmentManifest,
@@ -177,6 +187,10 @@ pub enum UiEvent {
         conversation: String,
         message: GroupMessage,
     },
+    IncomingRelayEvidence {
+        conversation: String,
+        evidence: akrat_trust::RelayEquivocationEvidence,
+    },
     IncomingAttachmentChunk {
         conversation: String,
         message_id: String,
@@ -216,6 +230,9 @@ enum WireMessage {
     GroupMessage {
         message: GroupMessage,
     },
+    RelayEvidence {
+        evidence: akrat_trust::RelayEquivocationEvidence,
+    },
     AttachmentChunk {
         message_id: String,
         manifest: AttachmentManifest,
@@ -230,6 +247,16 @@ enum WireMessage {
         id: String,
     },
     Close,
+}
+
+fn validate_shared_relay_evidence(evidence: &akrat_trust::RelayEquivocationEvidence) -> bool {
+    serde_json::to_vec(evidence)
+        .ok()
+        .filter(|bytes| bytes.len() <= 32 * 1024)
+        .is_some_and(|_| {
+            akrat_trust::verify_relay_equivocation_evidence(evidence, &evidence.first.fingerprint)
+                .is_ok()
+        })
 }
 
 pub fn connect(identity: Identity, contact: Contact, events: mpsc::UnboundedSender<UiEvent>) {
@@ -788,6 +815,7 @@ async fn start_session<S>(
     let (sender, receiver) = channel.split();
     let sender = Arc::new(Mutex::new(sender));
     let mut receiver = receiver;
+    let mut received_relay_evidence = 0u8;
     loop {
         tokio::select! {
             command = command_rx.recv() => match command {
@@ -802,6 +830,10 @@ async fn start_session<S>(
                 }
                 Some(SessionCommand::GroupMessage(message)) => {
                     let packet = match serde_json::to_vec(&WireMessage::GroupMessage { message }) { Ok(packet) => packet, Err(_) => continue };
+                    if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
+                }
+                Some(SessionCommand::RelayEvidence(evidence)) => {
+                    let packet = match serde_json::to_vec(&WireMessage::RelayEvidence { evidence }) { Ok(packet) if packet.len() <= 32 * 1024 => packet, _ => { let _ = events.send(UiEvent::Trace("Preuve trop volumineuse pour le partage sécurisé".into())); continue; } };
                     if let Err(error) = sender.lock().await.send(&packet).await { let _ = events.send(UiEvent::Closed { conversation: conversation.clone(), reason: error.to_string() }); return; }
                 }
                 Some(SessionCommand::AttachmentChunk { message_id, manifest, chunk }) => {
@@ -838,6 +870,16 @@ async fn start_session<S>(
                     }
                     Ok(WireMessage::GroupMessage { message }) => {
                         let _ = events.send(UiEvent::IncomingGroupMessage { conversation: conversation.clone(), message });
+                    }
+                    Ok(WireMessage::RelayEvidence { evidence }) => {
+                        if received_relay_evidence >= 8 {
+                            let _ = events.send(UiEvent::Trace("Partage de preuves limité · maximum de huit par session atteint".into()));
+                        } else if validate_shared_relay_evidence(&evidence) {
+                            received_relay_evidence += 1;
+                            let _ = events.send(UiEvent::IncomingRelayEvidence { conversation: conversation.clone(), evidence });
+                        } else {
+                            let _ = events.send(UiEvent::Trace("Preuve de relais partagée refusée · signature ou format invalide".into()));
+                        }
                     }
                     Ok(WireMessage::AttachmentChunk { message_id, manifest, chunk }) => {
                         match AttachmentChunk::try_from(chunk) {
@@ -926,7 +968,10 @@ pub fn received_message(conversation: String, id: String, text: String) -> Store
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionHandle, UiEvent, next_retry_delay, start_session};
+    use super::{
+        SessionHandle, UiEvent, WireMessage, next_retry_delay, start_session,
+        validate_shared_relay_evidence,
+    };
     use akrat_core::attachments::{AttachmentChunk, AttachmentManifest};
     use akrat_core::network;
     use akrat_core::{
@@ -934,6 +979,61 @@ mod tests {
     };
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn shared_relay_evidence_is_size_limited_and_cryptographically_verified() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let url = "https://relay.example.org";
+        let challenge = [9; 32];
+        let distribution = akrat_trust::RelayDistributionClaim {
+            artifact_name: "relay".into(),
+            artifact_sha256: "ab".repeat(32),
+            source_commit: "c".repeat(40),
+            protocol_version: 1,
+        };
+        let make_proof = |software_version: &str| {
+            let payload = akrat_trust::relay_identity_v2_payload(
+                url,
+                &challenge,
+                software_version,
+                &distribution,
+            )
+            .expect("relay identity payload");
+            akrat_trust::RelayIdentityProofV2 {
+                relay_url: url.into(),
+                challenge_hex: hex::encode(challenge),
+                public_key_hex: hex::encode(public_key),
+                fingerprint: akrat_trust::relay_identity_fingerprint(&public_key),
+                software_version: software_version.into(),
+                distribution: distribution.clone(),
+                signature_hex: hex::encode(key.sign(&payload).to_bytes()),
+            }
+        };
+        let evidence = akrat_trust::RelayEquivocationEvidence {
+            version: 1,
+            relay_url: url.into(),
+            observed_at_unix_seconds: 1,
+            first: make_proof("1.0"),
+            second: make_proof("2.0"),
+        };
+        assert!(validate_shared_relay_evidence(&evidence));
+        let packet = serde_json::to_vec(&WireMessage::RelayEvidence {
+            evidence: evidence.clone(),
+        })
+        .expect("serialize shared evidence");
+        assert!(packet.len() < 32 * 1024);
+        let decoded: WireMessage = serde_json::from_slice(&packet).expect("decode shared evidence");
+        assert!(matches!(decoded, WireMessage::RelayEvidence { .. }));
+        let mut forged = evidence.clone();
+        forged.second.signature_hex = "00".repeat(64);
+        assert!(!validate_shared_relay_evidence(&forged));
+        let mut oversized = evidence;
+        oversized.first.software_version = "x".repeat(33 * 1024);
+        assert!(!validate_shared_relay_evidence(&oversized));
+    }
 
     #[test]
     fn automatic_retry_backoff_is_capped() {
