@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-akrat-core = { version = "=0.1.12", path = "../akrat-core", default-features = false }
+akrat-core = { version = "=0.1.13", path = "../akrat-core", default-features = false }
 base64.workspace = true
 clap.workspace = true
 directories.workspace = true

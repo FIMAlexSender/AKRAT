@@ -1,4 +1,6 @@
-use iroh::{Endpoint, RelayMode, Watcher, endpoint::presets::N0, tls::CaTlsConfig};
+use akrat_core::RelaySettings;
+use akrat_trust::{RelayDisposition, RelayOperationalRecord};
+use iroh::{Endpoint, EndpointAddr, RelayMode, Watcher, endpoint::presets::N0, tls::CaTlsConfig};
 
 const ALPN: &[u8] = b"akrat-relay-test/0.1";
 
@@ -65,10 +67,29 @@ async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
         .expect("start second local Iroh relay");
     relay_map.extend(&second_map);
 
+    let settings = RelaySettings {
+        use_default_relays: false,
+        custom_relays: vec![first_url.to_string(), second_url.to_string()],
+        operational_records: vec![
+            RelayOperationalRecord {
+                relay_url: first_url.to_string(),
+                disposition: RelayDisposition::Favorite,
+                ..RelayOperationalRecord::default()
+            },
+            RelayOperationalRecord {
+                relay_url: second_url.to_string(),
+                disposition: RelayDisposition::Allowed,
+                ..RelayOperationalRecord::default()
+            },
+        ],
+        ..RelaySettings::default()
+    };
+
     let endpoint = Endpoint::builder(N0)
         .alpns(vec![ALPN.to_vec()])
         .ca_tls_config(CaTlsConfig::insecure_skip_verify())
-        .relay_mode(RelayMode::Custom(relay_map))
+        .relay_mode(settings.relay_mode().expect("valid relay settings"))
+        .path_selector(settings.path_selector())
         .clear_ip_transports()
         .bind()
         .await
@@ -140,6 +161,7 @@ async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
         .alpns(vec![ALPN.to_vec()])
         .ca_tls_config(CaTlsConfig::insecure_skip_verify())
         .relay_mode(RelayMode::custom([fallback]))
+        .path_selector(settings.path_selector())
         .clear_ip_transports()
         .bind()
         .await
@@ -165,4 +187,107 @@ async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
     );
     client.close().await;
     endpoint.close().await;
+}
+
+#[tokio::test]
+async fn favorite_relay_is_preferred_for_an_open_p2p_path() {
+    let (relay_map, first_url, _first_server) = iroh::test_utils::run_relay_server()
+        .await
+        .expect("start first local Iroh relay");
+    let (second_map, second_url, _second_server) = iroh::test_utils::run_relay_server()
+        .await
+        .expect("start second local Iroh relay");
+    relay_map.extend(&second_map);
+
+    let settings = RelaySettings {
+        use_default_relays: false,
+        custom_relays: vec![first_url.to_string(), second_url.to_string()],
+        operational_records: vec![
+            RelayOperationalRecord {
+                relay_url: first_url.to_string(),
+                disposition: RelayDisposition::Allowed,
+                ..RelayOperationalRecord::default()
+            },
+            RelayOperationalRecord {
+                relay_url: second_url.to_string(),
+                disposition: RelayDisposition::Favorite,
+                ..RelayOperationalRecord::default()
+            },
+        ],
+        ..RelaySettings::default()
+    };
+    let relay_mode = RelayMode::Custom(relay_map);
+    let server = Endpoint::builder(N0)
+        .alpns(vec![ALPN.to_vec()])
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+        .relay_mode(relay_mode.clone())
+        .path_selector(settings.path_selector())
+        .clear_ip_transports()
+        .bind()
+        .await
+        .expect("bind favorite-aware server");
+    tokio::time::timeout(std::time::Duration::from_secs(30), server.online())
+        .await
+        .expect("server connects to an allowed relay");
+
+    let client = Endpoint::builder(N0)
+        .alpns(vec![ALPN.to_vec()])
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+        .relay_mode(relay_mode)
+        .path_selector(settings.path_selector())
+        .clear_ip_transports()
+        .bind()
+        .await
+        .expect("bind favorite-aware client");
+    tokio::time::timeout(std::time::Duration::from_secs(30), client.online())
+        .await
+        .expect("client connects to an allowed relay");
+
+    let address = EndpointAddr::new(server.id())
+        .with_relay_url(first_url.clone())
+        .with_relay_url(second_url.clone());
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("accept favorite path peer");
+        let connection = incoming.await.expect("accept favorite path connection");
+        let mut receive = connection
+            .accept_uni()
+            .await
+            .expect("accept favorite stream");
+        receive
+            .read_to_end(1024)
+            .await
+            .expect("read favorite stream")
+    });
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.connect(address, ALPN),
+    )
+    .await
+    .expect("favorite relay connection deadline")
+    .expect("connect through an allowed relay");
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if connection.paths().iter().any(|path| {
+                path.is_selected()
+                    && matches!(path.remote_addr(), iroh::TransportAddr::Relay(url) if url == &second_url)
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the selected P2P path uses the favorite relay");
+
+    let mut send = connection.open_uni().await.expect("open favorite stream");
+    send.write_all(b"favorite relay path selected")
+        .await
+        .expect("send through favorite relay");
+    send.finish().expect("finish favorite stream");
+    assert_eq!(
+        server_task.await.expect("favorite server task"),
+        b"favorite relay path selected"
+    );
+    client.close().await;
 }

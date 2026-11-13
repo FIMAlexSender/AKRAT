@@ -2223,6 +2223,7 @@ fn NetworkPage(
             section { class: "panel mailbox-inbox-form",
                 div { class: "panel-title", "Relais P2P" }
                 p { class: "quiet", "Iroh tente d’abord la connexion directe et utilise ensuite les relais configurés. Le relais transporte des paquets chiffrés de bout en bout. Les relais personnalisés remplacent les relais publics par défaut." }
+                p { class: "quiet", "Quand plusieurs chemins sont disponibles, AKRAT garde la connexion directe prioritaire, puis préfère un relais marqué Favori aux relais simplement autorisés. Si le favori devient indisponible, un autre relais autorisé peut prendre le relais." }
                 label { "Niveau de confiance minimum" select {
                     value: "{relay_settings.minimum_trust as u8}",
                     onchange: {

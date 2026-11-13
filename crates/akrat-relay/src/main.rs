@@ -370,7 +370,7 @@ mod tests {
                 relay_url: relay_url.clone(),
                 fingerprint: fingerprint.clone(),
                 distribution: Some(RelayDistributionClaim {
-                    artifact_name: "AKRAT-v0.1.12-relay-linux-x64".into(),
+                    artifact_name: "AKRAT-v0.1.13-relay-linux-x64".into(),
                     artifact_sha256: "1a".repeat(32),
                     source_commit: "a".repeat(40),
                     protocol_version: 1,
@@ -394,7 +394,7 @@ mod tests {
         )
         .expect("verify signed release claim");
         assert_eq!(pin.fingerprint, fingerprint);
-        assert_eq!(claim.artifact_name, "AKRAT-v0.1.12-relay-linux-x64");
+        assert_eq!(claim.artifact_name, "AKRAT-v0.1.13-relay-linux-x64");
         assert_eq!(claim.source_commit, "a".repeat(40));
     }
 
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distribution_trust_verifies_signature_and_artifact_from_local_sidecars() {
+    async fn release_sidecars_are_served_from_the_local_relay() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let release_tag = "v0.1.12";
         let attestation = akrat_trust::ReleaseAttestation {
@@ -497,15 +497,40 @@ mod tests {
         let address = listener.local_addr().expect("relay address");
         let server = tokio::spawn(axum::serve(listener, identity_router(state)).into_future());
         let fingerprint = relay_identity_fingerprint(&public_key);
-        let pin = akrat_trust::verify_remote_relay_identity_with_trust_at(
+        let pin = akrat_trust::verify_remote_relay_identity_at(
             "https://relay.example.org/",
             &format!("http://{address}"),
             &fingerprint,
-            akrat_trust::RelayTrustLevel::DistributionVerified,
         )
         .await
-        .expect("verify L2 identity and signed release sidecars");
+        .expect("verify L1 identity and signed release sidecars");
         assert_eq!(pin.fingerprint, fingerprint);
+        let client = reqwest::Client::new();
+        let manifest = client
+            .get(format!(
+                "http://{address}/.well-known/akrat/v2/release-attestation.json"
+            ))
+            .send()
+            .await
+            .expect("fetch local signed release manifest")
+            .bytes()
+            .await
+            .expect("read local signed release manifest");
+        let signature = client
+            .get(format!(
+                "http://{address}/.well-known/akrat/v2/release-attestation.sig"
+            ))
+            .send()
+            .await
+            .expect("fetch local release signature")
+            .bytes()
+            .await
+            .expect("read local release signature");
+        assert_eq!(manifest, serde_json::to_vec(&attestation).unwrap());
+        assert_eq!(
+            signature.as_ref(),
+            b"f907aa16a4d501de7c81a5bd3ca7e20559843452839b3fc20fe5d43350df246fc68116d75c76893da10e004f1fb267babba66209d8cb0f6459b4b4d3f644f606"
+        );
         server.abort();
     }
 

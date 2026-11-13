@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "akrat"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "akrat-core",
  "akrat-trust",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "aes-gcm 0.11.1",
  "akrat-trust",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-desktop"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "akrat-core",
  "akrat-mailbox",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-mailbox"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "akrat-core",
  "base64 0.22.1",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-relay"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "akrat-trust",
  "axum",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "akrat-trust"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",

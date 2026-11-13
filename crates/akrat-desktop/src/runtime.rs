@@ -375,6 +375,7 @@ pub fn listen(
             let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(transport_key)
                 .relay_mode(relay_mode)
+                .path_selector(relay_settings.path_selector())
                 .alpns(vec![IROH_ALPN.to_vec()])
                 .bind()
                 .await

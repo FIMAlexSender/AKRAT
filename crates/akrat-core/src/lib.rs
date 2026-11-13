@@ -13,9 +13,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snow::{Builder, params::NoiseParams};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -406,6 +408,23 @@ impl Default for RelaySettings {
 }
 
 impl RelaySettings {
+    pub fn path_selector(&self) -> Arc<dyn iroh::endpoint::transports::PathSelector> {
+        let favorites = self
+            .operational_records
+            .iter()
+            .filter(|record| {
+                record.disposition == akrat_trust::RelayDisposition::Favorite
+                    && record.is_eligible()
+                    && self
+                        .custom_relays
+                        .iter()
+                        .any(|url| url == &record.relay_url)
+            })
+            .filter_map(|record| record.relay_url.parse::<iroh::RelayUrl>().ok())
+            .collect();
+        Arc::new(RelayPathSelector { favorites })
+    }
+
     pub fn relay_mode(&self) -> Result<iroh::RelayMode, String> {
         if self.custom_relays.len() > 16 {
             return Err("un maximum de 16 relais personnalisés est autorisé".into());
@@ -492,6 +511,66 @@ impl RelaySettings {
         } else {
             Ok(iroh::RelayMode::Disabled)
         }
+    }
+}
+
+#[derive(Debug)]
+struct RelayPathSelector {
+    favorites: HashSet<iroh::RelayUrl>,
+}
+
+impl RelayPathSelector {
+    fn tier(&self, path: &iroh::endpoint::transports::FourTuple) -> u8 {
+        match path {
+            iroh::endpoint::transports::FourTuple::Ip { .. }
+            | iroh::endpoint::transports::FourTuple::Custom { .. } => 0,
+            iroh::endpoint::transports::FourTuple::Relay { url, .. }
+                if self.favorites.contains(url) =>
+            {
+                1
+            }
+            iroh::endpoint::transports::FourTuple::Relay { .. } => 2,
+        }
+    }
+}
+
+impl iroh::endpoint::transports::PathSelector for RelayPathSelector {
+    fn select(
+        &self,
+        context: &iroh::endpoint::transports::PathSelectionContext<'_>,
+    ) -> iroh::endpoint::transports::PathSelection {
+        let mut best: Option<(iroh::endpoint::transports::PathSelectionData<'_>, u8, u128)> = None;
+        let mut current_score = None;
+        for path in context.paths() {
+            let Some(stats) = path.stats() else {
+                continue;
+            };
+            let tier = self.tier(path.network_path());
+            let rtt = stats.rtt.as_nanos();
+            if Some(path.network_path()) == context.current() {
+                current_score = Some((tier, rtt));
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_tier, best_rtt)| (tier, rtt) < (*best_tier, *best_rtt))
+            {
+                best = Some((path, tier, rtt));
+            }
+        }
+        let mut selection = iroh::endpoint::transports::PathSelection::none();
+        let Some((best_path, best_tier, best_rtt)) = best else {
+            return selection;
+        };
+        let should_switch = current_score.is_none_or(|(current_tier, current_rtt)| {
+            best_tier < current_tier
+                || (best_tier == current_tier
+                    && best_rtt.saturating_add(std::time::Duration::from_millis(50).as_nanos())
+                        <= current_rtt)
+        });
+        if should_switch {
+            selection.set(&best_path);
+        }
+        selection
     }
 }
 
@@ -2077,6 +2156,33 @@ mod tests {
         save_vault(&path, &mut data, "relay settings test phrase").expect("save vault");
         let restored = load_vault(&path, "relay settings test phrase").expect("restore vault");
         assert_eq!(restored.relay_settings, data.relay_settings);
+    }
+
+    #[test]
+    fn relay_path_tiers_keep_direct_paths_ahead_of_favorites_and_allowed_relays() {
+        let favorite_url = "https://favorite.example.org"
+            .parse::<iroh::RelayUrl>()
+            .unwrap();
+        let allowed_url = "https://allowed.example.org"
+            .parse::<iroh::RelayUrl>()
+            .unwrap();
+        let selector = RelayPathSelector {
+            favorites: HashSet::from([favorite_url.clone()]),
+        };
+        let direct = iroh::endpoint::transports::FourTuple::Ip {
+            remote: "127.0.0.1:4242".parse().unwrap(),
+            local: None,
+        };
+        let favorite = iroh::endpoint::transports::FourTuple::Relay {
+            url: favorite_url,
+            endpoint_id: iroh::EndpointId::from_bytes(&[1; 32]).unwrap(),
+        };
+        let allowed = iroh::endpoint::transports::FourTuple::Relay {
+            url: allowed_url,
+            endpoint_id: iroh::EndpointId::from_bytes(&[1; 32]).unwrap(),
+        };
+        assert!(selector.tier(&direct) < selector.tier(&favorite));
+        assert!(selector.tier(&favorite) < selector.tier(&allowed));
     }
 
     #[test]

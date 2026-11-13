@@ -295,11 +295,11 @@ jobs:
           cp dist/akrat-windows-x64/iroh-relay.exe "dist/AKRAT-${version}-iroh-relay-windows-x64.exe"
           cp dist/akrat-linux-x64/iroh-relay "dist/AKRAT-${version}-iroh-relay-linux-x64"
           cp dist/akrat-windows-x64/AKRAT-Setup-v"${version#v}".exe "dist/AKRAT-${version}-windows-installer.exe"
-          cp docs/v0.1.12-validation.md "dist/AKRAT-${version}-validation.md"
+          cp "docs/${version}-validation.md" "dist/AKRAT-${version}-validation.md"
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
-          Cette version ajoute le composant relais Iroh configurable, la vérification épinglée d'identité Ed25519 et une réduction ciblée des dépendances médias du service Mailbox.
+          Cette version ajoute la sélection prioritaire des relais favoris, tout en conservant la connexion directe prioritaire et le repli sur les relais autorisés. Elle conserve la vérification épinglée d'identité Ed25519, les composants Mailbox et relais indépendants et l’isolation médias du service Mailbox.
 
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application et CLI
