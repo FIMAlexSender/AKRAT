@@ -195,29 +195,18 @@ async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
 #[tokio::test]
 async fn favorite_relay_can_establish_an_open_p2p_path() {
     let _guard = LOCAL_RELAY_TEST_LOCK.lock().await;
-    let (relay_map, first_url, _first_server) = iroh::test_utils::run_relay_server()
+    let (relay_map, favorite_url, _favorite_server) = iroh::test_utils::run_relay_server()
         .await
-        .expect("start first local Iroh relay");
-    let (second_map, second_url, _second_server) = iroh::test_utils::run_relay_server()
-        .await
-        .expect("start second local Iroh relay");
-    relay_map.extend(&second_map);
+        .expect("start local favorite Iroh relay");
 
     let settings = RelaySettings {
         use_default_relays: false,
-        custom_relays: vec![first_url.to_string(), second_url.to_string()],
-        operational_records: vec![
-            RelayOperationalRecord {
-                relay_url: first_url.to_string(),
-                disposition: RelayDisposition::Allowed,
-                ..RelayOperationalRecord::default()
-            },
-            RelayOperationalRecord {
-                relay_url: second_url.to_string(),
-                disposition: RelayDisposition::Favorite,
-                ..RelayOperationalRecord::default()
-            },
-        ],
+        custom_relays: vec![favorite_url.to_string()],
+        operational_records: vec![RelayOperationalRecord {
+            relay_url: favorite_url.to_string(),
+            disposition: RelayDisposition::Favorite,
+            ..RelayOperationalRecord::default()
+        }],
         ..RelaySettings::default()
     };
     let relay_mode = RelayMode::Custom(relay_map);
@@ -247,11 +236,10 @@ async fn favorite_relay_can_establish_an_open_p2p_path() {
         .await
         .expect("client connects to an allowed relay");
 
-    // Iroh's selector ranks paths that are already open; it does not open every
-    // relay listed in a peer address to compare them. Keep this integration test
-    // deterministic by advertising the favorite route alone. Ranking among
-    // multiple open paths is covered by relay_path_tiers_keep_direct_paths_ahead...
-    let address = EndpointAddr::new(server.id()).with_relay_url(second_url.clone());
+    // Both endpoints use the same favorite relay, so this test checks actual
+    // connectivity through that route. Ranking among multiple already-open paths
+    // is covered by relay_path_tiers_keep_direct_paths_ahead...
+    let address = EndpointAddr::new(server.id()).with_relay_url(favorite_url.clone());
     let server_task = tokio::spawn(async move {
         let incoming = server.accept().await.expect("accept favorite path peer");
         let connection = incoming.await.expect("accept favorite path connection");
@@ -276,7 +264,7 @@ async fn favorite_relay_can_establish_an_open_p2p_path() {
         loop {
             if connection.paths().iter().any(|path| {
                 path.is_selected()
-                    && matches!(path.remote_addr(), iroh::TransportAddr::Relay(url) if url == &second_url)
+                    && matches!(path.remote_addr(), iroh::TransportAddr::Relay(url) if url == &favorite_url)
             }) {
                 break;
             }
