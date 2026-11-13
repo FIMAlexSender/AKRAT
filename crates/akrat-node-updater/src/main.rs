@@ -1449,4 +1449,396 @@ mod tests {
         assert_eq!(service.restarts, 2);
         assert_eq!(service.health_checks, 2);
     }
+
+    #[cfg(all(feature = "systemd-integration", target_os = "linux"))]
+    #[test]
+    fn systemd_updates_real_mailbox_and_rolls_back_a_failed_executable() {
+        use akrat_trust::{
+            DistributionAsset, RELEASE_ATTESTATION_SCHEMA, RELEASE_WORKFLOW,
+            release_attestation_payload, verify_release_attestation,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn signed_distribution(
+            tag: &str,
+            asset_name: &str,
+            artifact: &[u8],
+            signing_key: &SigningKey,
+        ) -> VerifiedDistribution {
+            let version = tag.trim_start_matches('v');
+            let attestation = ReleaseAttestation {
+                schema: RELEASE_ATTESTATION_SCHEMA.into(),
+                repository: RELEASE_REPOSITORY.into(),
+                tag: tag.into(),
+                version: version.into(),
+                source_commit: "a".repeat(40),
+                workflow: RELEASE_WORKFLOW.into(),
+                workflow_ref: format!("{RELEASE_REPOSITORY}/{RELEASE_WORKFLOW}@refs/tags/{tag}"),
+                run_id: 1,
+                issued_unix_seconds: 1,
+                protocol_version: 1,
+                assets: vec![DistributionAsset {
+                    name: asset_name.into(),
+                    sha256: hex::encode(Sha256::digest(artifact)),
+                }],
+            };
+            let payload = release_attestation_payload(&attestation).expect("valid payload");
+            let signature = hex::encode(signing_key.sign(&payload).to_bytes());
+            let distribution = verify_release_attestation(
+                &attestation,
+                &signature,
+                &signing_key.verifying_key().to_bytes(),
+            )
+            .expect("test-root signature verifies");
+            let mut invalid_signature = signature.clone().into_bytes();
+            invalid_signature[0] = if invalid_signature[0] == b'0' {
+                b'1'
+            } else {
+                b'0'
+            };
+            assert!(
+                verify_release_attestation(
+                    &attestation,
+                    std::str::from_utf8(&invalid_signature).expect("signature text"),
+                    &signing_key.verifying_key().to_bytes(),
+                )
+                .is_err()
+            );
+            verify_attested_artifact(
+                &distribution,
+                asset_name,
+                &hex::encode(Sha256::digest(artifact)),
+            )
+            .expect("signed artifact hash verifies");
+            distribution
+        }
+
+        fn command_ok(program: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
+            let output = Command::new(program)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to run {program}: {error}"));
+            assert!(
+                output.status.success(),
+                "{program} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        let uid = Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("query test user id");
+        assert_eq!(
+            String::from_utf8_lossy(&uid.stdout).trim(),
+            "0",
+            "run this test as root in isolated WSL"
+        );
+        assert!(
+            Command::new("systemctl")
+                .arg("is-system-running")
+                .output()
+                .is_ok()
+        );
+        let old_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_OLD_MAILBOX")
+                .expect("path to the real v0.1.12 mailbox binary"),
+        );
+        let new_path = PathBuf::from(
+            std::env::var_os("AKRAT_SYSTEMD_TEST_NEW_MAILBOX")
+                .expect("path to the real v0.1.13 mailbox binary"),
+        );
+        let old_bytes = std::fs::read(&old_path).expect("read v0.1.12 mailbox");
+        let new_bytes = std::fs::read(&new_path).expect("read v0.1.13 mailbox");
+        assert!(old_bytes.starts_with(b"\x7fELF"));
+        assert!(new_bytes.starts_with(b"\x7fELF"));
+        let old_version = Command::new(&old_path)
+            .arg("--version")
+            .output()
+            .expect("run old Mailbox version command");
+        assert!(old_version.status.success());
+        assert!(String::from_utf8_lossy(&old_version.stdout).contains("0.1.12"));
+
+        let old_asset_name = "AKRAT-v0.1.12-mailbox-linux-x64";
+        let new_asset_name = "AKRAT-v0.1.13-mailbox-linux-x64";
+        let mut seed = [0_u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .expect("open OS random source")
+            .read_exact(&mut seed)
+            .expect("generate ephemeral test root");
+        let signing_key = SigningKey::from_bytes(&seed);
+        seed.fill(0);
+        let old_distribution =
+            signed_distribution("v0.1.12", old_asset_name, &old_bytes, &signing_key);
+        let new_distribution =
+            signed_distribution("v0.1.13", new_asset_name, &new_bytes, &signing_key);
+
+        let directory = tempfile::tempdir().expect("isolated systemd test directory");
+        let root = directory.path();
+        let install_dir = root.join("opt/akrat");
+        let data_dir = root.join("var/lib/mailbox");
+        std::fs::create_dir_all(&install_dir).expect("create test install dir");
+        std::fs::create_dir_all(&data_dir).expect("create persistent data dir");
+        let config_path = root.join("etc/mailbox.json");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve local port");
+        let bind = listener.local_addr().expect("local address");
+        drop(listener);
+        let init = Command::new(&old_path)
+            .arg("--config")
+            .arg(&config_path)
+            .args(["init", "--name", "AKRAT updater test", "--bind"])
+            .arg(bind.to_string())
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .output()
+            .expect("initialize isolated mailbox");
+        assert!(
+            init.status.success(),
+            "mailbox init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let installed_binary = install_dir.join(Component::Mailbox.file_name());
+        std::fs::write(&installed_binary, &old_bytes).expect("install initial real executable");
+        std::fs::set_permissions(&installed_binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make initial executable runnable");
+        let identity_before =
+            Sha256::digest(std::fs::read(&config_path).expect("read identity config"));
+        let service_name = format!("akrat-updater-test-{}.service", std::process::id());
+        let service_unit = PathBuf::from("/run/systemd/system").join(&service_name);
+        std::fs::write(
+            &service_unit,
+            format!(
+                "[Unit]\nDescription=Temporary AKRAT updater integration test\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} --config {} serve\nRestart=no\n",
+                root.display(),
+                installed_binary.display(),
+                config_path.display()
+            ),
+        )
+        .expect("write runtime-only systemd unit");
+        struct RemoveTestUnit {
+            name: String,
+            path: PathBuf,
+        }
+        impl Drop for RemoveTestUnit {
+            fn drop(&mut self) {
+                let _ = Command::new("systemctl")
+                    .args(["stop", &self.name])
+                    .status();
+                let _ = std::fs::remove_file(&self.path);
+                let _ = Command::new("systemctl").arg("daemon-reload").status();
+            }
+        }
+        let _remove_unit = RemoveTestUnit {
+            name: service_name.clone(),
+            path: service_unit,
+        };
+        let reloaded = Command::new("systemctl")
+            .arg("daemon-reload")
+            .status()
+            .expect("reload isolated runtime unit");
+        assert!(reloaded.success());
+        let started = Command::new("systemctl")
+            .args(["start", &service_name])
+            .output()
+            .expect("start real Mailbox systemd unit");
+        assert!(
+            started.status.success(),
+            "systemctl start failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        assert!(wait_for_service(&service_name, Duration::from_secs(15)).expect("systemd query"));
+        let service_pid = || {
+            let output = Command::new("systemctl")
+                .args(["show", "--property=MainPID", "--value", &service_name])
+                .output()
+                .expect("read systemd MainPID");
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .expect("parse systemd MainPID")
+        };
+        let initial_pid = service_pid();
+        assert_ne!(initial_pid, 0);
+        let health_args: [&std::ffi::OsStr; 3] = [
+            std::ffi::OsStr::new("--config"),
+            config_path.as_os_str(),
+            std::ffi::OsStr::new("health"),
+        ];
+        command_ok(old_path.to_str().unwrap(), &health_args);
+        command_ok(
+            old_path.to_str().unwrap(),
+            &[
+                std::ffi::OsStr::new("--config"),
+                config_path.as_os_str(),
+                std::ffi::OsStr::new("mailbox"),
+                std::ffi::OsStr::new("create"),
+            ],
+        );
+        let database = data_dir.join("mailbox.sqlite3");
+        let connection = rusqlite::Connection::open(&database).expect("open Mailbox database");
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable real SQLite WAL");
+        let mailboxes_before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mailboxes", [], |row| row.get(0))
+            .expect("read pre-update mailbox state");
+        assert_eq!(mailboxes_before, 1);
+        let mailbox_id: String = connection
+            .query_row("SELECT id FROM mailboxes LIMIT 1", [], |row| row.get(0))
+            .expect("read created mailbox id");
+        let encrypted_payload = b"test encrypted envelope";
+        let now = chrono::Utc::now().timestamp();
+        connection
+            .execute(
+                "INSERT INTO envelopes(mailbox_id,message_id,digest,payload,accepted_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![mailbox_id, "updater-e2e-message", Sha256::digest(encrypted_payload).as_slice(), encrypted_payload, now, now + 3600],
+            )
+            .expect("seed one opaque persistent envelope");
+        drop(connection);
+
+        let config = Config {
+            install_dir: install_dir.clone(),
+            service: service_name.clone(),
+            components: vec![Component::Mailbox],
+            channel: Channel::Stable,
+            policy: Policy::Manual,
+            maintenance_start_hour: 0,
+            maintenance_end_hour: 0,
+            mailbox_config: Some(config_path.clone()),
+            relay_health_url: None,
+            database_backups: Some(root.join("var/backups")),
+            sqlite_databases: vec![database.clone()],
+            allow_mailbox_auto_update: false,
+        };
+        systemctl(&config, "stop").expect("stop old Mailbox service before backup");
+        let first_backup = backup_databases(&config, "0.1.13").expect("backup real Mailbox DB");
+        let mut candidate = Candidate {
+            tag: "v0.1.13".into(),
+            distribution: new_distribution.clone(),
+            assets: BTreeMap::new(),
+            attestation_bytes: Vec::new(),
+            signature_bytes: Vec::new(),
+        };
+        install_transaction(
+            &config,
+            &candidate,
+            vec![(Component::Mailbox, new_bytes.clone())],
+            Some(&first_backup),
+        )
+        .expect("real systemd update to signed v0.1.13 Mailbox");
+
+        let new_version = Command::new(&installed_binary)
+            .arg("--version")
+            .output()
+            .expect("run updated Mailbox version command");
+        assert!(new_version.status.success());
+        assert!(String::from_utf8_lossy(&new_version.stdout).contains("0.1.13"));
+        let updated_pid = service_pid();
+        assert_ne!(updated_pid, 0);
+        assert_ne!(
+            updated_pid, initial_pid,
+            "systemd restarted the process image"
+        );
+        let identity_after =
+            Sha256::digest(std::fs::read(&config_path).expect("read identity after update"));
+        assert_eq!(
+            identity_before, identity_after,
+            "Mailbox identity config is preserved"
+        );
+        let connection = rusqlite::Connection::open(&database).expect("reopen Mailbox database");
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("check updated database integrity");
+        assert_eq!(integrity, "ok");
+        let mailboxes_after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM mailboxes", [], |row| row.get(0))
+            .expect("read post-update mailbox state");
+        assert_eq!(mailboxes_after, mailboxes_before);
+        let messages_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM envelopes WHERE message_id='updater-e2e-message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read persisted envelope after update");
+        assert_eq!(messages_after, 1);
+        drop(connection);
+
+        systemctl(&config, "stop").expect("stop updated service before rollback scenario");
+        let connection =
+            rusqlite::Connection::open(&database).expect("open database before backup");
+        connection
+            .execute_batch("CREATE TABLE IF NOT EXISTS updater_e2e_sentinel(value TEXT); INSERT INTO updater_e2e_sentinel VALUES ('before-rollback');")
+            .expect("write pre-backup database marker");
+        drop(connection);
+        let failed_backup = backup_databases(&config, "0.1.14").expect("backup before rollback");
+        let connection =
+            rusqlite::Connection::open(&database).expect("reopen database after backup");
+        connection
+            .execute(
+                "INSERT INTO updater_e2e_sentinel VALUES ('after-backup')",
+                [],
+            )
+            .expect("write marker that rollback should remove");
+        drop(connection);
+        candidate.tag = "v0.1.14".into();
+        candidate.distribution = signed_distribution(
+            "v0.1.14",
+            "AKRAT-v0.1.14-mailbox-linux-x64",
+            b"#!/bin/sh\nexit 1\n",
+            &signing_key,
+        );
+        let broken = b"#!/bin/sh\nexit 1\n".to_vec();
+        let rollback = install_transaction(
+            &config,
+            &candidate,
+            vec![(Component::Mailbox, broken)],
+            Some(&failed_backup),
+        );
+        assert!(
+            rollback.is_err(),
+            "broken signed test binary must be rejected by health"
+        );
+        assert!(
+            wait_for_service(&service_name, Duration::from_secs(15)).expect("old service restored")
+        );
+        let restored_version = Command::new(&installed_binary)
+            .arg("--version")
+            .output()
+            .expect("run restored Mailbox version command");
+        assert!(String::from_utf8_lossy(&restored_version.stdout).contains("0.1.13"));
+        let connection = rusqlite::Connection::open(&database).expect("open restored database");
+        let markers = connection
+            .prepare("SELECT value FROM updater_e2e_sentinel ORDER BY rowid")
+            .expect("read rollback markers")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query rollback markers")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect rollback markers");
+        assert_eq!(markers, ["before-rollback"]);
+        assert_eq!(
+            read_state(&install_dir)
+                .expect("restored update state")
+                .version,
+            "0.1.13"
+        );
+        let restored_envelopes: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM envelopes WHERE message_id='updater-e2e-message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read restored message state");
+        assert_eq!(restored_envelopes, 1);
+        assert_eq!(
+            old_distribution.version, "0.1.12",
+            "the previous genuine release is independently signed"
+        );
+    }
 }

@@ -24,4 +24,9 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 tempfile = "3"
+
+[features]
+systemd-integration = []
