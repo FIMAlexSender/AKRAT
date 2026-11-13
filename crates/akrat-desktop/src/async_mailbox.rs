@@ -2383,7 +2383,13 @@ mod tests {
             .expect("persist primary key rotation");
         let mut _restarted_server1 = start_server(&config_path);
         wait_for_server(address, &alice, config.noise_identity.public_key()).await;
-        let mut duplicate_total = 0;
+        let mut duplicate_total = poll_inbox(
+            bob_vault.clone(),
+            PHRASE.into(),
+            bob_data.mailbox_inboxes[0].clone(),
+        )
+        .await
+        .expect("synchronize the rotated primary key even when its inbox is already empty");
         while mailbox_message_count(address, &alice, &config).await > 0 {
             duplicate_total += poll_inbox(
                 bob_vault.clone(),
