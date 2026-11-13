@@ -8,6 +8,7 @@ rust-version.workspace = true
 [features]
 default = []
 client = ["dep:getrandom", "dep:reqwest"]
+release-signer = []
 
 [dependencies]
 ed25519-dalek.workspace = true
@@ -16,5 +17,14 @@ hex.workspace = true
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[[bin]]
+name = "akrat-sign-release-attestation"
+path = "src/bin/sign_release_attestation.rs"
+required-features = ["release-signer"]

@@ -410,9 +410,10 @@ async fn new_endpoint(
                 .iter()
                 .find(|pin| pin.relay_url.parse::<iroh::RelayUrl>().ok().as_ref() == Some(&relay));
             match pin {
-                Some(pin) => match akrat_trust::verify_remote_relay_identity(
+                Some(pin) => match akrat_trust::verify_remote_relay_identity_with_trust(
                     &pin.relay_url,
                     &pin.fingerprint,
+                    relay_settings.minimum_trust,
                 )
                 .await
                 {

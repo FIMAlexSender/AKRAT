@@ -2089,13 +2089,51 @@ fn NetworkPage(
     let mut bundle_capability = use_signal(String::new);
     let mut relay_url_input = use_signal(String::new);
     let mut relay_fingerprint_input = use_signal(String::new);
+    let mut evidence_input = use_signal(String::new);
     let relay_settings = vault
         .read()
         .as_ref()
         .map(|data| data.relay_settings.clone())
         .unwrap_or_default();
+    let configured_minimum_trust = relay_settings.minimum_trust;
     let inbox_path = path.clone();
     let relay_path = path.clone();
+    let relay_rows = relay_settings
+        .custom_relays
+        .iter()
+        .enumerate()
+        .map(|(index, url)| {
+            let record = relay_settings
+                .operational_records
+                .iter()
+                .find(|record| record.relay_url == *url);
+            let disposition = record.map_or("allowed", |record| match record.disposition {
+                akrat_trust::RelayDisposition::Allowed => "allowed",
+                akrat_trust::RelayDisposition::Favorite => "favorite",
+                akrat_trust::RelayDisposition::Monitor => "monitor",
+                akrat_trust::RelayDisposition::Quarantined => "quarantined",
+                akrat_trust::RelayDisposition::Blocked => "blocked",
+            });
+            let measurements = record.map_or_else(
+                || "Disponibilité non mesurée".to_string(),
+                |record| {
+                    let availability = record
+                        .availability_percent()
+                        .map_or_else(|| "—".to_string(), |value| format!("{value}%"));
+                    let latency = record
+                        .latency_ewma_ms
+                        .map_or_else(|| "—".to_string(), |value| format!("{value} ms"));
+                    format!(
+                                    "Service HTTP {availability} · latence moyenne {latency} · {} succès / {} échecs · {} identité(s) refusée(s)",
+                        record.successful_checks,
+                                    record.failed_checks,
+                                    record.identity_verification_failures
+                    )
+                },
+            );
+            (index, url.clone(), disposition, measurements)
+        })
+        .collect::<Vec<_>>();
     rsx! {
         section { class: "page-scroll",
             div { class: "eyebrow", "RÉSEAU PAIR À PAIR" }
@@ -2123,7 +2161,7 @@ fn NetworkPage(
                         let path = relay_path.clone();
                         move |event: Event<FormData>| {
                             let Ok(level) = event.value().parse::<u8>() else { return; };
-                            let trust = match level { 0 => akrat_core::RelayTrustLevel::Unknown, 1 => akrat_core::RelayTrustLevel::IdentityVerified, _ => { notice.set("La provenance de distribution et l’attestation matérielle ne sont pas disponibles dans cette version.".into()); return; } };
+                            let trust = match level { 0 => akrat_core::RelayTrustLevel::Unknown, 1 => akrat_core::RelayTrustLevel::IdentityVerified, 2 => akrat_core::RelayTrustLevel::DistributionVerified, _ => { notice.set("L’attestation matérielle d’exécution n’est pas disponible dans cette version.".into()); return; } };
                             let phrase = passphrase.read().clone();
                             let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
                             data.relay_settings.minimum_trust = trust;
@@ -2133,27 +2171,128 @@ fn NetworkPage(
                     },
                     option { value: "0", "0 · Autoriser les relais non vérifiés" }
                     option { value: "1", "1 · Exiger une identité épinglée" }
-                    option { value: "2", disabled: true, "2 · Provenance de distribution · indisponible" }
+                    option { value: "2", "2 · Exiger une distribution AKRAT signée" }
                     option { value: "3", disabled: true, "3 · Exécution attestée · indisponible" }
                 } }
-                p { class: "quiet", "Niveau 1 vérifie une signature de défi Ed25519 pour l’URL épinglée. Les niveaux 2 (artefact de distribution signé) et 3 (attestation matérielle) ne sont pas annoncés comme vérifiés ici." }
+                p { class: "quiet", "Le niveau 1 vérifie l’identité Ed25519 épinglée. Le niveau 2 vérifie aussi une attestation de release signée qui lie le dépôt, le tag, le commit, le protocole et l’empreinte du binaire déclaré. Cela n’atteste pas le code réellement exécuté. Le niveau 3 reste indisponible." }
                 if relay_settings.custom_relays.is_empty() {
                     p { class: "network-identity", if relay_settings.minimum_trust >= akrat_core::RelayTrustLevel::IdentityVerified { "Mode strict · relais non épinglés désactivés · connexions directes seulement" } else if relay_settings.use_default_relays { "Relais publics Iroh activés" } else { "Relais désactivés · connexions directes seulement" } }
                 } else {
-                    for (index, url) in relay_settings.custom_relays.iter().enumerate() {
+                    for (index, url, disposition, measurements) in relay_rows.clone() {
                         div { class: "network-identity",
-                            span { class: "record-main", "{url}" }
+                            div { class: "record-main",
+                                strong { "{url}" }
+                                span { class: "quiet", "{measurements}" }
+                                label { "Décision locale" select {
+                                    value: "{disposition}",
+                                    onchange: {
+                                        let path = relay_path.clone();
+                                        let url = url.clone();
+                                        move |event: Event<FormData>| {
+                                            let disposition = match event.value().as_str() {
+                                                "allowed" => akrat_trust::RelayDisposition::Allowed,
+                                                "favorite" => akrat_trust::RelayDisposition::Favorite,
+                                                "monitor" => akrat_trust::RelayDisposition::Monitor,
+                                                "quarantined" => akrat_trust::RelayDisposition::Quarantined,
+                                                "blocked" => akrat_trust::RelayDisposition::Blocked,
+                                                _ => return,
+                                            };
+                                            let phrase = passphrase.read().clone();
+                                            let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                                            let Some(record) = data.relay_settings.operational_records.iter_mut().find(|record| record.relay_url == url) else {
+                                                data.relay_settings.operational_records.push(akrat_trust::RelayOperationalRecord { relay_url: url.clone(), disposition, ..akrat_trust::RelayOperationalRecord::default() });
+                                                match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Décision locale enregistrée.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                                                return;
+                                            };
+                                            record.disposition = disposition;
+                                            match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Décision locale enregistrée. Les services réseau redémarrent.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
+                                        }
+                                    },
+                                    option { value: "allowed", "Autorisé" }
+                                    option { value: "favorite", "Favori" }
+                                    option { value: "monitor", "Sous surveillance" }
+                                    option { value: "quarantined", "Quarantaine" }
+                                    option { value: "blocked", "Bloqué" }
+                                } }
+                            }
                             button { class: "secondary compact", onclick: {
                                 let path = relay_path.clone();
                                 move |_| {
                                     let phrase = passphrase.read().clone();
                                     let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
                                     let removed = if index < data.relay_settings.custom_relays.len() { Some(data.relay_settings.custom_relays.remove(index)) } else { None };
-                                    if let Some(url) = removed { data.relay_settings.identity_pins.retain(|pin| pin.relay_url != url); }
+                                    if let Some(url) = removed {
+                                        data.relay_settings.identity_pins.retain(|pin| pin.relay_url != url);
+                                        data.relay_settings.operational_records.retain(|record| record.relay_url != url);
+                                    }
                                     if data.relay_settings.custom_relays.is_empty() { data.relay_settings.use_default_relays = true; }
                                     match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Relais retiré. Les services réseau redémarrent.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
                                 }
                             }, "Retirer" }
+                            button { class: "secondary compact", onclick: {
+                                let path = relay_path.clone();
+                                let url = url.clone();
+                                let expected_fingerprint = relay_settings.identity_pins.iter()
+                                    .find(|pin| pin.relay_url == url)
+                                    .map(|pin| pin.fingerprint.clone());
+                                move |_| {
+                                    let Some(expected_fingerprint) = expected_fingerprint.clone() else {
+                                        notice.set("Épinglez d’abord l’identité cryptographique attendue pour mesurer ce relais.".into());
+                                        return;
+                                    };
+                                    let phrase = passphrase.read().clone();
+                                    let task_path = path.clone();
+                                    let task_url = url.clone();
+                                    spawn(async move {
+                                        let started = std::time::Instant::now();
+                                        let mut health_url = match reqwest::Url::parse(&task_url) {
+                                            Ok(url) => url,
+                                            Err(_) => { notice.set("URL de relais invalide.".into()); return; }
+                                        };
+                                        if health_url.set_scheme("http").is_err() || health_url.set_port(Some(8090)).is_err() {
+                                            notice.set("Adresse de vérification du relais invalide.".into());
+                                            return;
+                                        }
+                                        health_url.set_path("/health");
+                                        health_url.set_query(None);
+                                        health_url.set_fragment(None);
+                                        let health_succeeded = match reqwest::Client::builder()
+                                            .connect_timeout(std::time::Duration::from_secs(5))
+                                            .timeout(std::time::Duration::from_secs(8))
+                                            .build()
+                                        {
+                                            Ok(client) => client.get(health_url).send().await.is_ok_and(|response| response.status().is_success()),
+                                            Err(_) => false,
+                                        };
+                                        let health_elapsed = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                                        let result = akrat_trust::verify_remote_relay_identity_with_trust(
+                                            &task_url,
+                                            &expected_fingerprint,
+                                            configured_minimum_trust,
+                                        ).await;
+                                        let mut data = match load_vault(&task_path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                                        let record = if let Some(record) = data.relay_settings.operational_records.iter_mut().find(|record| record.relay_url == task_url) {
+                                            record
+                                        } else {
+                                            data.relay_settings.operational_records.push(akrat_trust::RelayOperationalRecord { relay_url: task_url.clone(), ..akrat_trust::RelayOperationalRecord::default() });
+                                            data.relay_settings.operational_records.last_mut().expect("record just inserted")
+                                        };
+                                        record.record_check(health_succeeded, health_succeeded.then_some(health_elapsed), chrono::Utc::now().timestamp().max(0) as u64);
+                                        record.record_identity_verification(result.is_ok());
+                                        match save_vault(&task_path, &mut data, &phrase) {
+                                            Ok(()) => {
+                                                vault.set(Some(data));
+                                                match result {
+                                                    Ok(_) => notice.set(format!("Identité vérifiée · service HTTP joignable en {health_elapsed} ms.")),
+                                                    Err(error) if health_succeeded => notice.set(format!("Service joignable · identité ou provenance refusée, pas une preuve de malveillance : {error}")),
+                                                    Err(error) => notice.set(format!("Service HTTP indisponible · ce résultat n’établit pas une faute : {error}")),
+                                                }
+                                            }
+                                            Err(error) => notice.set(format!("Enregistrement impossible : {error}")),
+                                        }
+                                    });
+                                }
+                            }, "Tester" }
                         }
                     }
                 }
@@ -2170,7 +2309,7 @@ fn NetworkPage(
                         spawn(async move {
                             let canonical = match value.parse::<iroh::RelayUrl>() { Ok(url) => url.to_string(), Err(_) => { notice.set("URL de relais Iroh invalide.".into()); return; } };
                             let pin = if expected_fingerprint.is_empty() { None } else {
-                                match akrat_trust::verify_remote_relay_identity(&canonical, &expected_fingerprint).await {
+                                match akrat_trust::verify_remote_relay_identity_with_trust(&canonical, &expected_fingerprint, configured_minimum_trust).await {
                                     Ok(pin) => Some(pin),
                                     Err(error) => { notice.set(format!("Identité du relais refusée : {error}")); return; }
                                 }
@@ -2192,10 +2331,68 @@ fn NetworkPage(
                             let phrase = passphrase.read().clone();
                             let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
                             data.relay_settings.custom_relays.clear();
+                            data.relay_settings.identity_pins.clear();
+                            data.relay_settings.operational_records.clear();
                             data.relay_settings.use_default_relays = true;
                             match save_vault(&path, &mut data, &phrase) { Ok(()) => { vault.set(Some(data)); notice.set("Relais publics Iroh réactivés.".into()); }, Err(error) => notice.set(format!("Enregistrement impossible : {error}")) }
                         }
                     }, "Revenir aux relais publics Iroh" }
+                }
+            }
+            section { class: "panel mailbox-inbox-form",
+                div { class: "panel-title", "Preuves cryptographiques partagées" }
+                p { class: "quiet", "Collez une preuve JSON reçue d’un autre participant. AKRAT ne retient que deux déclarations Ed25519 contradictoires liées au même relais et au même défi frais. Une panne réseau seule ne constitue pas une faute." }
+                label { "Preuve d’équivoque · JSON, 64 Kio maximum" textarea { value: "{evidence_input}", rows: "5", oninput: move |event| evidence_input.set(event.value()) } }
+                button { class: "secondary", onclick: {
+                    let path = relay_path.clone();
+                    move |_| {
+                        let bytes = evidence_input.read().as_bytes().to_vec();
+                        let untrusted: akrat_trust::RelayEquivocationEvidence = match serde_json::from_slice(&bytes) {
+                            Ok(evidence) if bytes.len() <= akrat_trust::MAX_RELAY_EVIDENCE_JSON_BYTES => evidence,
+                            _ => { notice.set("Preuve JSON invalide ou supérieure à 64 Kio.".into()); return; }
+                        };
+                        let phrase = passphrase.read().clone();
+                        let mut data = match load_vault(&path, &phrase) { Ok(data) => data, Err(error) => { notice.set(format!("Coffre inaccessible : {error}")); return; } };
+                        let Some(pin) = data.relay_settings.identity_pins.iter().find(|pin| pin.relay_url == untrusted.relay_url) else {
+                            notice.set("Cette preuve concerne un relais sans identité épinglée dans ce coffre. Vérifiez et épinglez son identité avant d’évaluer la preuve.".into());
+                            return;
+                        };
+                        let evidence = match akrat_trust::parse_and_verify_relay_equivocation_evidence(&bytes, &pin.fingerprint) {
+                            Ok(evidence) => evidence,
+                            Err(error) => { notice.set(format!("Preuve cryptographique refusée : {error}")); return; }
+                        };
+                        let url = evidence.relay_url.clone();
+                        if !data.relay_settings.verified_evidence.contains(&evidence) {
+                            if data.relay_settings.verified_evidence.len() >= 64 {
+                                notice.set("Le coffre contient déjà la limite de 64 preuves vérifiées.".into());
+                                return;
+                            }
+                            data.relay_settings.verified_evidence.push(evidence);
+                        }
+                        if let Some(record) = data.relay_settings.operational_records.iter_mut().find(|record| record.relay_url == url) {
+                            record.disposition = akrat_trust::RelayDisposition::Quarantined;
+                        } else {
+                            data.relay_settings.operational_records.push(akrat_trust::RelayOperationalRecord {
+                                relay_url: url,
+                                disposition: akrat_trust::RelayDisposition::Quarantined,
+                                ..akrat_trust::RelayOperationalRecord::default()
+                            });
+                        }
+                        match save_vault(&path, &mut data, &phrase) {
+                            Ok(()) => { vault.set(Some(data)); evidence_input.set(String::new()); notice.set("Preuve vérifiée indépendamment, conservée dans le coffre et relais mis en quarantaine sur cet appareil.".into()); }
+                            Err(error) => notice.set(format!("Enregistrement impossible : {error}")),
+                        }
+                    }
+                }, "Vérifier la preuve et mettre en quarantaine" }
+                if let Some(evidence) = relay_settings.verified_evidence.last() {
+                    p { class: "quiet", "{relay_settings.verified_evidence.len()} preuve(s) vérifiée(s). Dernière preuve : {evidence.relay_url} · observée le {evidence.observed_at_unix_seconds}." }
+                    button { class: "secondary compact", onclick: {
+                        let serialized = serde_json::to_string_pretty(evidence).unwrap_or_default();
+                        move |_| {
+                            let value = serialized.clone();
+                            spawn(async move { if copy_to_clipboard(value).await { notice.set("Preuve copiée pour partage.".into()); } else { notice.set("Copie impossible · sélectionnez la preuve dans votre coffre.".into()); } });
+                        }
+                    }, "Copier la dernière preuve vérifiée" }
                 }
             }
             section { class: "panel mailbox-inbox-form",

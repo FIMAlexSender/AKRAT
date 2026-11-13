@@ -67,6 +67,12 @@ jobs:
           cargo build --locked --release -p akrat-mailbox
           cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools
           cp target/relay-tools/bin/iroh-relay target/release/iroh-relay
+          export AKRAT_BUILD_COMMIT="$GITHUB_SHA"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            export AKRAT_RELAY_ARTIFACT_NAME="AKRAT-${GITHUB_REF_NAME}-relay-linux-x64"
+          else
+            export AKRAT_RELAY_ARTIFACT_NAME="akrat-relay-linux-x64"
+          fi
           cargo build --locked --release -p akrat-relay
           cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/README.md target/release/
 
@@ -135,7 +141,8 @@ jobs:
           $stableRustc = (& rustup which --toolchain stable rustc).Trim()
           $stableCargo = (& rustup which --toolchain stable cargo).Trim()
           if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The stable Rust toolchain is incomplete on the AKRAT runner.' }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox && "' + $stableCargo + '" install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools && copy /Y target\relay-tools\bin\iroh-relay.exe target\release\iroh-relay.exe && "' + $stableCargo + '" build --locked --release -p akrat-relay'
+          $artifactName = if ($env:GITHUB_REF_TYPE -eq 'tag') { "AKRAT-$($env:GITHUB_REF_NAME)-relay-windows-x64.exe" } else { 'akrat-relay-windows-x64.exe' }
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && set "AKRAT_BUILD_COMMIT=' + $env:GITHUB_SHA + '" && set "AKRAT_RELAY_ARTIFACT_NAME=' + $artifactName + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox && "' + $stableCargo + '" install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools && copy /Y target\relay-tools\bin\iroh-relay.exe target\release\iroh-relay.exe && "' + $stableCargo + '" build --locked --release -p akrat-relay'
           & $env:ComSpec /d /c $commands
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item 'packaging\relay\akrat-node.sh','packaging\relay\akrat-node.ps1','packaging\relay\iroh-relay.toml.example','packaging\relay\akrat-node.service','packaging\relay\README.md' 'target\release\' -Force
@@ -255,10 +262,10 @@ jobs:
           set -euo pipefail
           stem="AKRAT-${GITHUB_REF_NAME}-sbom"
           cargo install cargo-cyclonedx --version 0.5.10 --locked --root target/sbom-tools
-          target/sbom-tools/bin/cargo-cyclonedx cyclonedx \
-            --manifest-path crates/akrat-mailbox/Cargo.toml \
-            --format json --target all --override-filename "$stem"
           for crate in akrat-cli akrat-core akrat-desktop akrat-mailbox akrat-relay akrat-trust; do
+            target/sbom-tools/bin/cargo-cyclonedx cyclonedx \
+              --manifest-path "crates/$crate/Cargo.toml" \
+              --format json --target all --override-filename "$stem"
             cp "crates/$crate/$stem.json" "dist/$stem-$crate.json"
           done
 
@@ -299,10 +306,31 @@ jobs:
           - Android : la compilation de l’APK est vérifiée par la CI ; l’APK signé pour les installations de test est publié séparément.
           - macOS : non compilé pour cette version ; aucun Mac n’est utilisé.
 
-          Le niveau de confiance 0 et l'épinglage du niveau 1 sont disponibles. Les preuves de distribution signées (niveau 2), l'attestation matérielle (niveau 3), la réputation et les preuves décentralisées de faute ne sont pas implémentées et ne sont pas annoncées comme vérifiées. Le relais transporte le trafic Iroh chiffré sans accéder aux secrets applicatifs. Il peut toujours observer des métadonnées et interrompre le service.
+          Le niveau 1 vérifie l'identité Ed25519 épinglée. Le niveau 2 vérifie le manifeste de release signé, son identité de workflow, son commit, le protocole et l'empreinte du binaire déclaré; il ne prouve pas le code effectivement exécuté à distance. L'attestation matérielle de niveau 3, la réputation opérationnelle et les preuves décentralisées de faute restent indisponibles. Le relais transporte le trafic Iroh chiffré sans accéder aux secrets applicatifs. Il peut toujours observer des métadonnées et interrompre le service.
 
           Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256. L’APK Android est signé avec la clé de test persistante du projet.
           EOF
+          (cd dist && sha256sum AKRAT-* > SHA256SUMS)
+
+      - name: Sign official release provenance
+        shell: bash
+        env:
+          AKRAT_RELEASE_SIGNING_SEED: ${{ secrets.AKRAT_RELEASE_SIGNING_SEED }}
+        run: |
+          set -euo pipefail
+          python3 scripts/create_release_attestation.py dist
+          cargo run --locked --release -p akrat-trust --features release-signer \
+            --bin akrat-sign-release-attestation -- \
+            "dist/AKRAT-${GITHUB_REF_NAME}-release-attestation.json" \
+            "dist/AKRAT-${GITHUB_REF_NAME}-release-attestation.sig"
+          for target in windows-x64 linux-x64; do
+            folder="dist/akrat-${target}"
+            cp "dist/AKRAT-${GITHUB_REF_NAME}-release-attestation.json" "$folder/"
+            cp "dist/AKRAT-${GITHUB_REF_NAME}-release-attestation.sig" "$folder/"
+            zip -j -u "dist/AKRAT-${GITHUB_REF_NAME}-${target}.zip" \
+              "$folder/AKRAT-${GITHUB_REF_NAME}-release-attestation.json" \
+              "$folder/AKRAT-${GITHUB_REF_NAME}-release-attestation.sig"
+          done
           (cd dist && sha256sum AKRAT-* > SHA256SUMS)
 
       - name: Publier la release GitHub
@@ -327,6 +355,8 @@ jobs:
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-relay.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-trust.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-validation.md \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-release-attestation.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-release-attestation.sig \
             dist/SHA256SUMS \
             --title "AKRAT ${GITHUB_REF_NAME}" \
             --notes-file dist/release-notes.md

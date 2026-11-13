@@ -14,8 +14,10 @@ getrandom.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 akrat-trust = { version = "=0.1.12", path = "../akrat-trust", features = ["client"] }
+serde_json.workspace = true
 tempfile = "3"

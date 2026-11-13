@@ -388,6 +388,8 @@ pub struct RelaySettings {
     pub custom_relays: Vec<String>,
     pub identity_pins: Vec<RelayIdentityPin>,
     pub minimum_trust: RelayTrustLevel,
+    pub operational_records: Vec<akrat_trust::RelayOperationalRecord>,
+    pub verified_evidence: Vec<akrat_trust::RelayEquivocationEvidence>,
 }
 
 impl Default for RelaySettings {
@@ -397,6 +399,8 @@ impl Default for RelaySettings {
             custom_relays: Vec::new(),
             identity_pins: Vec::new(),
             minimum_trust: RelayTrustLevel::Unknown,
+            operational_records: Vec::new(),
+            verified_evidence: Vec::new(),
         }
     }
 }
@@ -409,10 +413,24 @@ impl RelaySettings {
         if self.identity_pins.len() > 16 {
             return Err("un maximum de 16 identités de relais peut être épinglé".into());
         }
-        if self.minimum_trust >= RelayTrustLevel::DistributionVerified {
-            return Err("la provenance de distribution et l’attestation d’exécution ne sont pas disponibles dans cette version".into());
+        if self.minimum_trust >= RelayTrustLevel::ExecutionAttested {
+            return Err(
+                "l’attestation matérielle d’exécution n’est pas disponible dans cette version"
+                    .into(),
+            );
         }
-        let relays = self
+        if self.operational_records.len() > 16
+            || self.verified_evidence.len() > 64
+            || self.operational_records.iter().any(|record| {
+                !self
+                    .custom_relays
+                    .iter()
+                    .any(|url| url == &record.relay_url)
+            })
+        {
+            return Err("état local des relais incohérent ou trop volumineux".into());
+        }
+        let configured_relays = self
             .custom_relays
             .iter()
             .map(|value| {
@@ -432,11 +450,22 @@ impl RelaySettings {
             if public_key.len() != 32
                 || !akrat_trust::relay_identity_fingerprint(&public_key)
                     .eq_ignore_ascii_case(&pin.fingerprint)
-                || !relays.iter().any(|relay| relay == &pinned_url)
+                || !configured_relays.iter().any(|relay| relay == &pinned_url)
             {
                 return Err("épinglage de relais incohérent ou invalide".into());
             }
         }
+        let relays = configured_relays
+            .into_iter()
+            .filter(|relay| {
+                self.operational_records
+                    .iter()
+                    .find(|record| {
+                        record.relay_url.parse::<iroh::RelayUrl>().ok().as_ref() == Some(relay)
+                    })
+                    .is_none_or(akrat_trust::RelayOperationalRecord::is_eligible)
+            })
+            .collect::<Vec<_>>();
         if !relays.is_empty() {
             if self.minimum_trust >= RelayTrustLevel::IdentityVerified
                 && relays.iter().any(|relay| {
@@ -451,6 +480,9 @@ impl RelaySettings {
                 );
             }
             return Ok(iroh::RelayMode::custom(relays));
+        }
+        if !self.custom_relays.is_empty() {
+            return Ok(iroh::RelayMode::Disabled);
         }
         if self.use_default_relays {
             if self.minimum_trust >= RelayTrustLevel::IdentityVerified {
@@ -2045,6 +2077,51 @@ mod tests {
         save_vault(&path, &mut data, "relay settings test phrase").expect("save vault");
         let restored = load_vault(&path, "relay settings test phrase").expect("restore vault");
         assert_eq!(restored.relay_settings, data.relay_settings);
+    }
+
+    #[test]
+    fn locally_quarantined_relay_is_excluded_without_falling_back_to_unknown_relays() {
+        let relay = "https://relay.example.org".to_string();
+        let alternate = "https://alternate.example.org".to_string();
+        let mut settings = RelaySettings {
+            use_default_relays: true,
+            custom_relays: vec![relay.clone(), alternate.clone()],
+            ..RelaySettings::default()
+        };
+        assert!(matches!(
+            settings.relay_mode(),
+            Ok(iroh::RelayMode::Custom(_))
+        ));
+        settings
+            .operational_records
+            .push(akrat_trust::RelayOperationalRecord {
+                relay_url: alternate,
+                disposition: akrat_trust::RelayDisposition::Quarantined,
+                ..akrat_trust::RelayOperationalRecord::default()
+            });
+        let iroh::RelayMode::Custom(eligible) = settings.relay_mode().expect("eligible relay")
+        else {
+            panic!("one custom relay remains eligible");
+        };
+        assert!(eligible.contains(&relay.parse().expect("first relay URL")));
+        assert!(
+            !eligible.contains(
+                &"https://alternate.example.org"
+                    .parse()
+                    .expect("alternate relay URL")
+            )
+        );
+        settings
+            .operational_records
+            .push(akrat_trust::RelayOperationalRecord {
+                relay_url: relay,
+                disposition: akrat_trust::RelayDisposition::Blocked,
+                ..akrat_trust::RelayOperationalRecord::default()
+            });
+        assert_eq!(
+            settings.relay_mode().expect("quarantined relay excluded"),
+            iroh::RelayMode::Disabled
+        );
     }
 
     #[test]
