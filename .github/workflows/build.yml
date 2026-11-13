@@ -302,7 +302,7 @@ jobs:
           cat > dist/release-notes.md <<EOF
           ## AKRAT ${version}
 
-          Cette version ajoute la sélection prioritaire des relais favoris, tout en conservant la connexion directe prioritaire et le repli sur les relais autorisés. Elle conserve la vérification épinglée d'identité Ed25519, les composants Mailbox et relais indépendants et l’isolation médias du service Mailbox.
+          Cette version ajoute un updater authentifié pour les nœuds Linux Mailbox et Relay. Il vérifie l’attestation officielle Ed25519 et l’empreinte signée avant installation, sauvegarde les bases SQLite et restaure l’ancienne version si le contrôle de santé échoue. La sélection directe/favoris/relais autorisés et l’identité des relais restent prises en charge.
 
           - Windows x64 : installateur, archive portable et CLI
           - Linux x64 : application, CLI, Mailbox, relais et gestionnaire de mises à jour de nœud
@@ -311,7 +311,7 @@ jobs:
 
           Le niveau 1 vérifie l'identité Ed25519 épinglée. Le niveau 2 vérifie le manifeste de release signé, son identité de workflow, son commit, le protocole et l'empreinte du binaire déclaré; il ne prouve pas le code effectivement exécuté à distance. L'attestation matérielle de niveau 3, la réputation opérationnelle et les preuves décentralisées de faute restent indisponibles. Le relais transporte le trafic Iroh chiffré sans accéder aux secrets applicatifs. Il peut toujours observer des métadonnées et interrompre le service.
 
-          Les mises à jour de nœuds vérifient l’attestation officielle Ed25519 et l’empreinte signée de chaque binaire avant installation. L’APK Android est signé avec la clé de test persistante du projet.
+          L’updater démarre en politique manuelle; les mises à jour automatiques restent désactivées par défaut et la v0.1.13 n’a pas encore été testée sur un VPS Contabo. La release v0.1.12 ne contient pas d’attestation officielle : le premier passage vers v0.1.13 doit donc se faire par installation manuelle. L’APK Android est signé avec la clé de test persistante du projet.
           EOF
           (cd dist && sha256sum AKRAT-* > SHA256SUMS)
 
