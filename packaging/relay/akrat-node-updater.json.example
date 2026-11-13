@@ -1,0 +1,17 @@
+{
+  "install_dir": "/opt/akrat",
+  "service": "akrat-node.service",
+  "components": ["mailbox", "relay", "iroh-relay"],
+  "channel": "stable",
+  "policy": "manual",
+  "allow_mailbox_auto_update": false,
+  "maintenance_start_hour": 3,
+  "maintenance_end_hour": 5,
+  "mailbox_config": "/etc/akrat/akrat-mailbox.toml",
+  "relay_health_url": "http://127.0.0.1:8090/health",
+  "database_backups": "/var/lib/akrat-updater/backups",
+  "sqlite_databases": [
+    "/var/lib/akrat/mailbox.sqlite3",
+    "/var/lib/akrat/federation.sqlite3"
+  ]
+}

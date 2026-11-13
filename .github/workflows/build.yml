@@ -76,8 +76,8 @@ jobs:
           python3 scripts/ci/measure_process.py linux-release -- cargo build --locked --release --workspace
           python3 scripts/ci/measure_process.py linux-iroh-relay -- cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools --target-dir target
           cp target/relay-tools/bin/iroh-relay target/release/iroh-relay
-          cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/README.md target/release/
-          python3 scripts/ci/record_artifact_sizes.py linux target/release/akrat-desktop target/release/akrat target/release/akrat-mailbox target/release/akrat-relay target/release/iroh-relay
+          cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/akrat-node-updater.service packaging/relay/akrat-node-updater.timer packaging/relay/akrat-node-updater.json.example packaging/relay/README.md target/release/
+          python3 scripts/ci/record_artifact_sizes.py linux target/release/akrat-desktop target/release/akrat target/release/akrat-mailbox target/release/akrat-relay target/release/akrat-node-updater target/release/iroh-relay
 
       - uses: actions/upload-artifact@v4
         with:
@@ -87,11 +87,15 @@ jobs:
             ${{ matrix.cli }}
             ${{ matrix.mailbox }}
             ${{ matrix.relay }}
+            target/release/akrat-node-updater
             target/release/iroh-relay
             target/release/akrat-node.sh
             target/release/akrat-node.ps1
             target/release/iroh-relay.toml.example
             target/release/akrat-node.service
+            target/release/akrat-node-updater.service
+            target/release/akrat-node-updater.timer
+            target/release/akrat-node-updater.json.example
             target/release/README.md
           if-no-files-found: error
           retention-days: 14
@@ -249,7 +253,7 @@ jobs:
           set -euo pipefail
           stem="AKRAT-${GITHUB_REF_NAME}-sbom"
           cargo install cargo-cyclonedx --version 0.5.10 --locked --root target/sbom-tools --target-dir target
-          for crate in akrat-cli akrat-core akrat-desktop akrat-mailbox akrat-relay akrat-trust; do
+          for crate in akrat-cli akrat-core akrat-desktop akrat-mailbox akrat-node-updater akrat-relay akrat-trust; do
             target/sbom-tools/bin/cargo-cyclonedx cyclonedx \
               --manifest-path "crates/$crate/Cargo.toml" \
               --format json --target all --override-filename "$stem"
@@ -268,10 +272,10 @@ jobs:
                 "$folder/akrat-desktop.exe" "$folder/akrat.exe" "$folder/akrat-mailbox.exe" "$folder/akrat-relay.exe" "$folder/iroh-relay.exe" \
                 "$folder/akrat-node.sh" "$folder/akrat-node.ps1" "$folder/iroh-relay.toml.example" "$folder/akrat-node.service" "$folder/README.md"
             else
-              chmod +x "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox" "$folder/akrat-relay" "$folder/iroh-relay" "$folder/akrat-node.sh"
+              chmod +x "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox" "$folder/akrat-relay" "$folder/akrat-node-updater" "$folder/iroh-relay" "$folder/akrat-node.sh"
               zip -j "dist/AKRAT-${version}-${target}.zip" \
                 "$folder/akrat-desktop" "$folder/akrat" "$folder/akrat-mailbox" "$folder/akrat-relay" "$folder/iroh-relay" \
-                "$folder/akrat-node.sh" "$folder/akrat-node.ps1" "$folder/iroh-relay.toml.example" "$folder/akrat-node.service" "$folder/README.md"
+                "$folder/akrat-node.sh" "$folder/akrat-node.ps1" "$folder/iroh-relay.toml.example" "$folder/akrat-node.service" "$folder/akrat-node-updater" "$folder/akrat-node-updater.service" "$folder/akrat-node-updater.timer" "$folder/akrat-node-updater.json.example" "$folder/README.md"
             fi
           done
           cp dist/akrat-android-apk/app-debug.apk "dist/AKRAT-${version}-android.apk"
@@ -279,6 +283,7 @@ jobs:
           cp dist/akrat-linux-x64/akrat-mailbox "dist/AKRAT-${version}-mailbox-linux-x64"
           cp dist/akrat-windows-x64/akrat-relay.exe "dist/AKRAT-${version}-relay-windows-x64.exe"
           cp dist/akrat-linux-x64/akrat-relay "dist/AKRAT-${version}-relay-linux-x64"
+          cp dist/akrat-linux-x64/akrat-node-updater "dist/AKRAT-${version}-node-updater-linux-x64"
           cp dist/akrat-windows-x64/iroh-relay.exe "dist/AKRAT-${version}-iroh-relay-windows-x64.exe"
           cp dist/akrat-linux-x64/iroh-relay "dist/AKRAT-${version}-iroh-relay-linux-x64"
           cp dist/akrat-windows-x64/AKRAT-Setup-v"${version#v}".exe "dist/AKRAT-${version}-windows-installer.exe"
@@ -289,13 +294,13 @@ jobs:
           Cette version ajoute la sélection prioritaire des relais favoris, tout en conservant la connexion directe prioritaire et le repli sur les relais autorisés. Elle conserve la vérification épinglée d'identité Ed25519, les composants Mailbox et relais indépendants et l’isolation médias du service Mailbox.
 
           - Windows x64 : installateur, archive portable et CLI
-          - Linux x64 : application et CLI
+          - Linux x64 : application, CLI, Mailbox, relais et gestionnaire de mises à jour de nœud
           - Android : la compilation de l’APK est vérifiée par la CI ; l’APK signé pour les installations de test est publié séparément.
           - macOS : non compilé pour cette version ; aucun Mac n’est utilisé.
 
           Le niveau 1 vérifie l'identité Ed25519 épinglée. Le niveau 2 vérifie le manifeste de release signé, son identité de workflow, son commit, le protocole et l'empreinte du binaire déclaré; il ne prouve pas le code effectivement exécuté à distance. L'attestation matérielle de niveau 3, la réputation opérationnelle et les preuves décentralisées de faute restent indisponibles. Le relais transporte le trafic Iroh chiffré sans accéder aux secrets applicatifs. Il peut toujours observer des métadonnées et interrompre le service.
 
-          Les mises à jour de bureau sont vérifiées depuis l’application et les téléchargements sont contrôlés par SHA-256. L’APK Android est signé avec la clé de test persistante du projet.
+          Les mises à jour de nœuds vérifient l’attestation officielle Ed25519 et l’empreinte signée de chaque binaire avant installation. L’APK Android est signé avec la clé de test persistante du projet.
           EOF
           (cd dist && sha256sum AKRAT-* > SHA256SUMS)
 
@@ -333,12 +338,14 @@ jobs:
             dist/AKRAT-"${GITHUB_REF_NAME}"-mailbox-linux-x64 \
             dist/AKRAT-"${GITHUB_REF_NAME}"-relay-windows-x64.exe \
             dist/AKRAT-"${GITHUB_REF_NAME}"-relay-linux-x64 \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-node-updater-linux-x64 \
             dist/AKRAT-"${GITHUB_REF_NAME}"-iroh-relay-windows-x64.exe \
             dist/AKRAT-"${GITHUB_REF_NAME}"-iroh-relay-linux-x64 \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-cli.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-core.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-desktop.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-mailbox.json \
+            dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-node-updater.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-relay.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-sbom-akrat-trust.json \
             dist/AKRAT-"${GITHUB_REF_NAME}"-validation.md \

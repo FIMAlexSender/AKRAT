@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic authenticated AKRAT node update check
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=akrat-node-updater.service
+
+[Install]
+WantedBy=timers.target

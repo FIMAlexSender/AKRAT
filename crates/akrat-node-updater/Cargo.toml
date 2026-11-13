@@ -1,0 +1,27 @@
+[package]
+name = "akrat-node-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "akrat-node-updater"
+path = "src/main.rs"
+
+[dependencies]
+akrat-trust = { version = "=0.1.13", path = "../akrat-trust" }
+chrono.workspace = true
+clap.workspace = true
+fs2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rusqlite = { version = "=0.41.1", features = ["backup", "bundled"] }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

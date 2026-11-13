@@ -203,6 +203,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "akrat-node-updater"
+version = "0.1.13"
+dependencies = [
+ "akrat-trust",
+ "chrono",
+ "clap",
+ "fs2",
+ "hex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "akrat-relay"
 version = "0.1.13"
 dependencies = [
@@ -6482,6 +6501,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -6501,12 +6521,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots",
 ]

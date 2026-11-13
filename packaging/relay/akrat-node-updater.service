@@ -1,0 +1,22 @@
+[Unit]
+Description=Check and install authenticated AKRAT node updates
+After=network-online.target akrat-node.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+StateDirectory=akrat-updater
+EnvironmentFile=-/etc/akrat/updater.env
+ExecStart=/usr/local/bin/akrat-node-updater auto --config /etc/akrat/updater.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/akrat /var/lib/akrat-updater -/var/lib/akrat
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
