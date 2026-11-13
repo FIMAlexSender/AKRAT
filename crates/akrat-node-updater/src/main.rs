@@ -1010,6 +1010,64 @@ fn verify_files(
 mod tests {
     use super::*;
 
+    struct TransactionService {
+        commands: Vec<String>,
+        fail_first_restart: bool,
+    }
+
+    impl ServiceControl for TransactionService {
+        fn command(&mut self, command: &str) -> Result<(), Box<dyn std::error::Error>> {
+            self.commands.push(command.to_string());
+            if command == "restart" && self.fail_first_restart {
+                self.fail_first_restart = false;
+                return Err("simulated restart failure".into());
+            }
+            Ok(())
+        }
+
+        fn wait_ready(&mut self, _timeout: Duration) -> Result<bool, Box<dyn std::error::Error>> {
+            Ok(true)
+        }
+
+        fn health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+    }
+
+    fn transaction_candidate() -> Candidate {
+        Candidate {
+            tag: "v0.1.14".into(),
+            distribution: VerifiedDistribution {
+                repository: RELEASE_REPOSITORY.into(),
+                tag: "v0.1.14".into(),
+                version: "0.1.14".into(),
+                source_commit: "a".repeat(40),
+                protocol_version: 1,
+                assets: Vec::new(),
+            },
+            assets: BTreeMap::new(),
+            attestation_bytes: Vec::new(),
+            signature_bytes: Vec::new(),
+        }
+    }
+
+    fn transaction_config(install_dir: PathBuf) -> Config {
+        Config {
+            install_dir,
+            service: "akrat-node.service".into(),
+            components: vec![Component::IrohRelay],
+            channel: Channel::Stable,
+            policy: Policy::Manual,
+            maintenance_start_hour: 3,
+            maintenance_end_hour: 5,
+            mailbox_config: None,
+            relay_health_url: None,
+            database_backups: None,
+            sqlite_databases: Vec::new(),
+            allow_mailbox_auto_update: false,
+        }
+    }
+
     struct FakeService {
         database: PathBuf,
         restarts: usize,
@@ -1150,6 +1208,87 @@ mod tests {
         let url = reqwest::Url::parse(&format!("http://{address}/health")).expect("health URL");
         assert!(relay_health_ok(&url).expect("valid health response"));
         server.join().expect("health server");
+    }
+
+    #[test]
+    fn successful_install_commits_binary_and_version_after_health_check() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let install_dir = directory.path().join("install");
+        std::fs::create_dir(&install_dir).expect("create install directory");
+        let executable = install_dir.join(Component::IrohRelay.file_name());
+        std::fs::write(&executable, b"old executable").expect("old executable");
+        let config = transaction_config(install_dir.clone());
+        let mut service = TransactionService {
+            commands: Vec::new(),
+            fail_first_restart: false,
+        };
+
+        install_transaction_with(
+            &config,
+            &transaction_candidate(),
+            vec![(Component::IrohRelay, b"new executable".to_vec())],
+            None,
+            &mut service,
+        )
+        .expect("healthy install transaction");
+
+        assert_eq!(
+            std::fs::read(executable).expect("read installed executable"),
+            b"new executable"
+        );
+        assert_eq!(
+            read_state(&install_dir)
+                .expect("read committed update state")
+                .version,
+            "0.1.14"
+        );
+        assert_eq!(service.commands, ["restart"]);
+    }
+
+    #[test]
+    fn failed_restart_restores_executable_and_previous_version() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let install_dir = directory.path().join("install");
+        std::fs::create_dir(&install_dir).expect("create install directory");
+        let executable = install_dir.join(Component::IrohRelay.file_name());
+        std::fs::write(&executable, b"old executable").expect("old executable");
+        write_state(
+            &install_dir,
+            &State {
+                version: "0.1.13".into(),
+                installed_at_unix_seconds: 1,
+                components: vec![Component::IrohRelay.file_name().into()],
+            },
+        )
+        .expect("write previous update state");
+        let config = transaction_config(install_dir.clone());
+        let mut service = TransactionService {
+            commands: Vec::new(),
+            fail_first_restart: true,
+        };
+
+        assert!(
+            install_transaction_with(
+                &config,
+                &transaction_candidate(),
+                vec![(Component::IrohRelay, b"new executable".to_vec())],
+                None,
+                &mut service,
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            std::fs::read(executable).expect("read restored executable"),
+            b"old executable"
+        );
+        assert_eq!(
+            read_state(&install_dir)
+                .expect("read restored update state")
+                .version,
+            "0.1.13"
+        );
+        assert_eq!(service.commands, ["restart", "stop", "restart"]);
     }
 
     #[test]
