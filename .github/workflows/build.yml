@@ -79,6 +79,17 @@ jobs:
           cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/akrat-node-updater.service packaging/relay/akrat-node-updater.timer packaging/relay/akrat-node-updater.json.example packaging/relay/README.md target/release/
           python3 scripts/ci/record_artifact_sizes.py linux target/release/akrat-desktop target/release/akrat target/release/akrat-mailbox target/release/akrat-relay target/release/akrat-node-updater target/release/iroh-relay
 
+      - name: Verify official signing key against production trust root
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/v0.1.13-node-autoupdate'
+        shell: bash
+        env:
+          AKRAT_RELEASE_SIGNING_SEED: ${{ secrets.AKRAT_RELEASE_SIGNING_SEED }}
+        run: |
+          set -euo pipefail
+          test -n "$AKRAT_RELEASE_SIGNING_SEED"
+          cargo run --locked -p akrat-trust --features release-signer \
+            --bin akrat-sign-release-attestation -- --check-key
+
       - uses: actions/upload-artifact@v4
         with:
           name: akrat-${{ matrix.artifact }}
