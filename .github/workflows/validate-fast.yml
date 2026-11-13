@@ -1,0 +1,84 @@
+name: Validation rapide AKRAT
+
+on:
+  push:
+    branches: [v0.1.13-node-autoupdate]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: akrat-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Contrôles ciblés · Linux
+    runs-on: [self-hosted, Linux, X64, akrat-linux-local]
+    env:
+      CARGO_INCREMENTAL: '1'
+      RUSTUP_TOOLCHAIN: 1.100.0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: rustfmt
+
+      - name: Vérifications statiques et tests ciblés
+        shell: bash
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE"
+          elif [[ -n "$PUSH_BEFORE" && "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            base="$PUSH_BEFORE"
+          else
+            git fetch origin v0.1.12-architecture-relay --quiet
+            base="$(git merge-base HEAD origin/v0.1.12-architecture-relay)"
+          fi
+
+          git diff --check "$base" "$GITHUB_SHA"
+          mapfile -t changed < <(git diff --name-only "$base" "$GITHUB_SHA")
+          packages=()
+          full_check=false
+          for path in "${changed[@]}"; do
+            case "$path" in
+              Cargo.toml|Cargo.lock|.cargo/*|rust-toolchain.toml)
+                full_check=true
+                ;;
+              crates/*/*)
+                crate="${path#crates/}"
+                crate="${crate%%/*}"
+                if [[ -f "crates/$crate/Cargo.toml" ]]; then packages+=("$crate"); fi
+                ;;
+            esac
+          done
+
+          if [[ "$full_check" == true ]]; then
+            cargo check --locked --workspace --all-targets
+          else
+            if ((${#packages[@]} > 0)); then
+              mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sort -u)
+            fi
+            for package in "${packages[@]}"; do
+              [[ -n "$package" ]] || continue
+              cargo test --locked -p "$package"
+            done
+          fi

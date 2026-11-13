@@ -13,10 +13,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snow::{Builder, params::NoiseParams};
+#[cfg(feature = "p2p")]
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(feature = "p2p")]
 use std::sync::Arc;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -107,7 +109,7 @@ impl Identity {
 
     pub fn transport_id(&self) -> String {
         let private_key = self.transport_private_key();
-        let secret = iroh::SecretKey::from_bytes(&private_key);
+        let secret = iroh_base::SecretKey::from_bytes(&private_key);
         secret.public().to_string()
     }
 
@@ -276,7 +278,7 @@ impl Invitation {
         }
         invitation
             .transport_id
-            .parse::<iroh::EndpointId>()
+            .parse::<iroh_base::EndpointId>()
             .map_err(|_| AkratError::InvalidIdentity)?;
         Ok(invitation)
     }
@@ -408,6 +410,7 @@ impl Default for RelaySettings {
 }
 
 impl RelaySettings {
+    #[cfg(feature = "p2p")]
     pub fn path_selector(&self) -> Arc<dyn iroh::endpoint::transports::PathSelector> {
         let favorites = self
             .operational_records
@@ -425,6 +428,7 @@ impl RelaySettings {
         Arc::new(RelayPathSelector { favorites })
     }
 
+    #[cfg(feature = "p2p")]
     pub fn relay_mode(&self) -> Result<iroh::RelayMode, String> {
         if self.custom_relays.len() > 16 {
             return Err("un maximum de 16 relais personnalisés est autorisé".into());
@@ -515,10 +519,12 @@ impl RelaySettings {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "p2p")]
 struct RelayPathSelector {
     favorites: HashSet<iroh::RelayUrl>,
 }
 
+#[cfg(feature = "p2p")]
 impl RelayPathSelector {
     fn tier(&self, path: &iroh::endpoint::transports::FourTuple) -> u8 {
         match path {
@@ -534,6 +540,7 @@ impl RelayPathSelector {
     }
 }
 
+#[cfg(feature = "p2p")]
 impl iroh::endpoint::transports::PathSelector for RelayPathSelector {
     fn select(
         &self,
@@ -1745,7 +1752,10 @@ fn validate_vault(data: &VaultData) -> Result<(), AkratError> {
         if contact.public_key.len() != 32
             || contact.fingerprint != fingerprint(&contact.public_key)
             || (!contact.transport_id.is_empty()
-                && contact.transport_id.parse::<iroh::EndpointId>().is_err())
+                && contact
+                    .transport_id
+                    .parse::<iroh_base::EndpointId>()
+                    .is_err())
             || !contacts.insert(contact.fingerprint.as_str())
         {
             return Err(AkratError::InvalidVault);
@@ -2103,6 +2113,7 @@ mod tests {
     use std::fs;
 
     #[test]
+    #[cfg(feature = "p2p")]
     fn relay_settings_are_validated_and_survive_vault_reopen() {
         let mut settings = RelaySettings::default();
         assert_eq!(
@@ -2159,6 +2170,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "p2p")]
     fn relay_path_tiers_keep_direct_paths_ahead_of_favorites_and_allowed_relays() {
         let favorite_url = "https://favorite.example.org"
             .parse::<iroh::RelayUrl>()
@@ -2186,6 +2198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "p2p")]
     fn locally_quarantined_relay_is_excluded_without_falling_back_to_unknown_relays() {
         let relay = "https://relay.example.org".to_string();
         let alternate = "https://alternate.example.org".to_string();

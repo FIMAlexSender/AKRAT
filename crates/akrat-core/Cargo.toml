@@ -6,9 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["media-image", "markdown"]
+default = ["media-image", "markdown", "p2p"]
 media-image = ["dep:image"]
 markdown = ["dep:pulldown-cmark"]
+p2p = ["dep:iroh"]
 
 [dependencies]
 akrat-trust = { version = "=0.1.13", path = "../akrat-trust" }
@@ -19,7 +20,8 @@ getrandom.workspace = true
 hex.workspace = true
 fs2.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
-iroh.workspace = true
+iroh = { workspace = true, optional = true }
+iroh-base.workspace = true
 libsignal-protocol = { version = "=0.1.0", git = "https://github.com/signalapp/libsignal", rev = "0abcfd4044a5827d73b657c1170ab3638d660330" }
 pulldown-cmark = { version = "0.13.4", optional = true }
 rand = "0.9"

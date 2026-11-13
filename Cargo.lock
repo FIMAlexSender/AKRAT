@@ -134,6 +134,7 @@ dependencies = [
  "hex",
  "image",
  "iroh",
+ "iroh-base",
  "libsignal-protocol",
  "pulldown-cmark",
  "rand 0.9.5",

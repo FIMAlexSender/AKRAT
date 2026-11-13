@@ -2,22 +2,20 @@ name: Build AKRAT
 
 on:
   push:
-    branches: [main, v0.1.9-mailbox-federation, v0.1.10-vault-manager, v0.1.11-groups-media-markdown, v0.1.12-architecture-relay, akr-at-v0.1-foundation, akrat-cli-core, akrat-desktop-ui]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: akrat-build-${{ github.ref }}-${{ github.run_id }}
-  cancel-in-progress: false
+  group: ${{ startsWith(github.ref, 'refs/tags/') && 'akrat-release-build' || format('akrat-ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   desktop:
     name: Desktop · ${{ matrix.os }}
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: desktop-windows-local
     strategy:
       fail-fast: false
       matrix:
@@ -29,8 +27,16 @@ jobs:
             mailbox: target/release/akrat-mailbox
             relay: target/release/akrat-relay
     runs-on: [self-hosted, Linux, X64, "${{ matrix.os }}"]
+    env:
+      CARGO_INCREMENTAL: '1'
+      RUSTUP_TOOLCHAIN: 1.100.0
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Prepare build metrics directory
+        run: python3 -c 'import shutil; shutil.rmtree("target/ci-metrics", ignore_errors=True)'
 
       - name: Verify Linux runner prerequisites
         if: runner.os == 'Linux'
@@ -38,43 +44,40 @@ jobs:
           pkg-config --exists webkit2gtk-4.1 gtk+-3.0 openssl
           protoc --version
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
 
       - name: Test workspace and formatting
         run: |
           cargo fmt --all -- --check
-          cargo check --locked --workspace --all-targets
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          python3 scripts/ci/measure_process.py linux-clippy -- cargo clippy --locked --workspace --all-targets -- -D warnings
+          python3 scripts/ci/measure_process.py linux-tests -- cargo test --locked --workspace
 
       - name: Audit Rust dependencies
+        env:
+          CARGO_INCREMENTAL: '0'
         run: |
-          cargo install cargo-audit --version 0.23.0 --locked --root target/security-tools
-          cargo install cargo-deny --version 0.20.2 --locked --root target/security-tools
+          cargo install cargo-audit --version 0.23.0 --locked --root target/security-tools --target-dir target
+          cargo install cargo-deny --version 0.20.2 --locked --root target/security-tools --target-dir target
           target/security-tools/bin/cargo-audit audit
           target/security-tools/bin/cargo-deny check -W unmaintained -W unsound --hide-inclusion-graph
 
       - name: Build desktop app and CLI
+        env:
+          CARGO_INCREMENTAL: '0'
         run: |
-          cargo build --locked --release -p akrat-desktop --features desktop
-          cargo build --locked --release -p akrat
-          cargo build --locked --release -p akrat-mailbox
-          cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools
-          cp target/relay-tools/bin/iroh-relay target/release/iroh-relay
           export AKRAT_BUILD_COMMIT="$GITHUB_SHA"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             export AKRAT_RELAY_ARTIFACT_NAME="AKRAT-${GITHUB_REF_NAME}-relay-linux-x64"
           else
             export AKRAT_RELAY_ARTIFACT_NAME="akrat-relay-linux-x64"
           fi
-          cargo build --locked --release -p akrat-relay
+          python3 scripts/ci/measure_process.py linux-release -- cargo build --locked --release --workspace
+          python3 scripts/ci/measure_process.py linux-iroh-relay -- cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools --target-dir target
+          cp target/relay-tools/bin/iroh-relay target/release/iroh-relay
           cp packaging/relay/akrat-node.sh packaging/relay/akrat-node.ps1 packaging/relay/iroh-relay.toml.example packaging/relay/akrat-node.service packaging/relay/README.md target/release/
+          python3 scripts/ci/record_artifact_sizes.py linux target/release/akrat-desktop target/release/akrat target/release/akrat-mailbox target/release/akrat-relay target/release/iroh-relay
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,32 +96,52 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: akrat-metrics-linux
+          path: target/ci-metrics/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   desktop-windows-local:
     name: Desktop Windows · PC AKRAT
-    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, Windows, X64, akrat-local]
     env:
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.100.0
+      CARGO_INCREMENTAL: '1'
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Prepare build metrics directory
+        shell: powershell
+        run: Remove-Item 'target\ci-metrics' -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Install pinned protobuf compiler
         shell: powershell
         run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
-          $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
-          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
+          $toolsRoot = Join-Path $env:LOCALAPPDATA 'AKRAT\ci-tools'
+          $archive = Join-Path $toolsRoot 'protoc-36.2-win64.zip'
+          $root = Join-Path $toolsRoot 'protoc-36.2'
+          New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+          if (-not (Test-Path -LiteralPath $archive)) { Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive }
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') { throw "protoc archive SHA-256 mismatch: $hash" }
-          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') {
+            Remove-Item -LiteralPath $archive -Force
+            Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
+            $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') { throw "protoc archive SHA-256 mismatch: $hash" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'bin\protoc.exe'))) { Expand-Archive -LiteralPath $archive -DestinationPath $root -Force }
           "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$root\bin\protoc.exe" --version
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Verify Rust toolchain on the AKRAT PC
         shell: powershell
         run: |
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
           cargo --version
           rustc --version
 
@@ -126,9 +149,7 @@ jobs:
         shell: powershell
         run: |
           cargo fmt --all -- --check
-          cargo check --locked --workspace --all-targets
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          & .\scripts\ci\measure-process.ps1 -Name windows-debug -Command 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'
 
       - name: Build desktop app and CLI with MSVC
         shell: powershell
@@ -138,13 +159,12 @@ jobs:
           if (-not $vsPath) { throw 'Visual Studio C++ Build Tools are required on the AKRAT runner.' }
           $devCmd = Join-Path $vsPath 'Common7\Tools\VsDevCmd.bat'
           if (-not (Test-Path $devCmd)) { throw "MSVC setup script not found: $devCmd" }
-          $stableRustc = (& rustup which --toolchain stable rustc).Trim()
-          $stableCargo = (& rustup which --toolchain stable cargo).Trim()
-          if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The stable Rust toolchain is incomplete on the AKRAT runner.' }
+          $stableRustc = (& rustup which --toolchain 1.100.0 rustc).Trim()
+          $stableCargo = (& rustup which --toolchain 1.100.0 cargo).Trim()
+          if (-not (Test-Path $stableRustc) -or -not (Test-Path $stableCargo)) { throw 'The pinned Rust toolchain is incomplete on the AKRAT runner.' }
           $artifactName = if ($env:GITHUB_REF_TYPE -eq 'tag') { "AKRAT-$($env:GITHUB_REF_NAME)-relay-windows-x64.exe" } else { 'akrat-relay-windows-x64.exe' }
-          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=stable" && set "RUSTC=' + $stableRustc + '" && set "AKRAT_BUILD_COMMIT=' + $env:GITHUB_SHA + '" && set "AKRAT_RELAY_ARTIFACT_NAME=' + $artifactName + '" && "' + $stableCargo + '" build --locked --release -p akrat-desktop --features desktop && "' + $stableCargo + '" build --locked --release -p akrat && "' + $stableCargo + '" build --locked --release -p akrat-mailbox && "' + $stableCargo + '" install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools && copy /Y target\relay-tools\bin\iroh-relay.exe target\release\iroh-relay.exe && "' + $stableCargo + '" build --locked --release -p akrat-relay'
-          & $env:ComSpec /d /c $commands
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $commands = '"' + $devCmd + '" -arch=x64 -host_arch=x64 -no_logo && set "RUSTUP_TOOLCHAIN=1.100.0" && set "RUSTC=' + $stableRustc + '" && set "CARGO_INCREMENTAL=0" && set "AKRAT_BUILD_COMMIT=' + $env:GITHUB_SHA + '" && set "AKRAT_RELAY_ARTIFACT_NAME=' + $artifactName + '" && "' + $stableCargo + '" build --locked --release --workspace && "' + $stableCargo + '" install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools --target-dir target && copy /Y target\relay-tools\bin\iroh-relay.exe target\release\iroh-relay.exe'
+          & .\scripts\ci\measure-process.ps1 -Name windows-release -Command $commands
           Copy-Item 'packaging\relay\akrat-node.sh','packaging\relay\akrat-node.ps1','packaging\relay\iroh-relay.toml.example','packaging\relay\akrat-node.service','packaging\relay\README.md' 'target\release\' -Force
 
       - name: Package the Windows installer
@@ -152,18 +172,25 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^" ]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if (-not $version) { throw 'Could not read the workspace version from Cargo.toml.' }
-          $nsisZip = Join-Path $env:RUNNER_TEMP 'nsis-3.13.zip'
-          $nsisRoot = Join-Path $env:RUNNER_TEMP 'nsis'
-          Invoke-WebRequest -Uri 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' -OutFile $nsisZip
+          $toolsRoot = Join-Path $env:LOCALAPPDATA 'AKRAT\ci-tools'
+          $nsisZip = Join-Path $toolsRoot 'nsis-3.13.zip'
+          $nsisRoot = Join-Path $toolsRoot 'nsis'
+          New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+          if (-not (Test-Path -LiteralPath $nsisZip)) { Invoke-WebRequest -Uri 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' -OutFile $nsisZip }
           $actualHash = (Get-FileHash -Path $nsisZip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne 'ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8') {
-            throw "NSIS archive SHA-256 mismatch: $actualHash"
+            Remove-Item -LiteralPath $nsisZip -Force
+            Invoke-WebRequest -Uri 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' -OutFile $nsisZip
+            $actualHash = (Get-FileHash -Path $nsisZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne 'ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8') { throw "NSIS archive SHA-256 mismatch: $actualHash" }
           }
-          Expand-Archive -Path $nsisZip -DestinationPath $nsisRoot -Force
+          Get-ChildItem 'target\release\AKRAT-Setup-*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $nsisRoot 'nsis-3.13\makensis.exe'))) { Expand-Archive -Path $nsisZip -DestinationPath $nsisRoot -Force }
           $makensis = Join-Path $nsisRoot 'nsis-3.13\makensis.exe'
           & $makensis /V2 "/DAKRAT_VERSION=$version" 'packaging\windows\akrat-installer.nsi'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path "target\release\AKRAT-Setup-v$version.exe")) { throw 'Windows installer was not created.' }
+          python scripts/ci/record_artifact_sizes.py windows target/release/akrat-desktop.exe target/release/akrat.exe target/release/akrat-mailbox.exe target/release/akrat-relay.exe target/release/iroh-relay.exe "target/release/AKRAT-Setup-v$version.exe"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -183,61 +210,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  desktop-windows-pr:
-    name: Desktop Windows · PC AKRAT (pull requests)
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64, akrat-local]
-    env:
-      RUSTUP_TOOLCHAIN: stable
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install pinned protobuf compiler
-        shell: powershell
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'protoc-36.2-win64.zip'
-          $root = Join-Path $env:RUNNER_TEMP 'protoc-36.2'
-          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' -OutFile $archive
-          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne 'f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3') { throw "protoc archive SHA-256 mismatch: $hash" }
-          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
-          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$root\bin\protoc.exe" --version
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
-
-      - name: Test workspace and formatting
-        run: |
-          cargo fmt --all -- --check
-          cargo test --locked --workspace
-
-      - name: Build desktop app and CLI
-        run: |
-          cargo build --locked --release -p akrat-desktop --features desktop
-          cargo build --locked --release -p akrat
-          cargo build --locked --release -p akrat-mailbox
-          cargo install iroh-relay --version 1.4.1 --features server --locked --root target/relay-tools
-          Copy-Item 'target\relay-tools\bin\iroh-relay.exe' 'target\release\iroh-relay.exe' -Force
-          cargo build --locked --release -p akrat-relay
-          Copy-Item 'packaging\relay\akrat-node.sh','packaging\relay\akrat-node.ps1','packaging\relay\iroh-relay.toml.example','packaging\relay\akrat-node.service','packaging\relay\README.md' 'target\release\' -Force
-
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: akrat-windows-x64
-          path: |
-            target/release/akrat-desktop.exe
-            target/release/akrat.exe
-            target/release/akrat-mailbox.exe
-            target/release/akrat-relay.exe
-            target/release/iroh-relay.exe
-            target/release/akrat-node.sh
-            target/release/akrat-node.ps1
-            target/release/iroh-relay.toml.example
-            target/release/akrat-node.service
-            target/release/README.md
-          if-no-files-found: error
+          name: akrat-metrics-windows
+          path: target/ci-metrics/*.json
+          if-no-files-found: ignore
           retention-days: 14
 
   release:
@@ -245,12 +223,21 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [desktop, desktop-windows-local, android]
     runs-on: [self-hosted, Linux, X64, akrat-linux-local]
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_TOOLCHAIN: 1.100.0
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
+
+      - name: Remove previous release staging files
+        shell: bash
+        run: python3 -c 'import shutil; shutil.rmtree("dist", ignore_errors=True)'
 
       - uses: actions/download-artifact@v4
         with:
@@ -261,7 +248,7 @@ jobs:
         run: |
           set -euo pipefail
           stem="AKRAT-${GITHUB_REF_NAME}-sbom"
-          cargo install cargo-cyclonedx --version 0.5.10 --locked --root target/sbom-tools
+          cargo install cargo-cyclonedx --version 0.5.10 --locked --root target/sbom-tools --target-dir target
           for crate in akrat-cli akrat-core akrat-desktop akrat-mailbox akrat-relay akrat-trust; do
             target/sbom-tools/bin/cargo-cyclonedx cyclonedx \
               --manifest-path "crates/$crate/Cargo.toml" \
@@ -363,10 +350,18 @@ jobs:
 
   android:
     name: Android · APK de test
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: desktop
     runs-on: [self-hosted, Linux, X64, akrat-linux-local]
+    env:
+      CARGO_INCREMENTAL: '1'
+      RUSTUP_TOOLCHAIN: 1.100.0
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Prepare build metrics directory
+        run: python3 -c 'import shutil; shutil.rmtree("target/ci-metrics", ignore_errors=True)'
 
       - name: Verify Android runner prerequisites
         run: protoc --version
@@ -394,29 +389,33 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: aarch64-linux-android
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: false
 
       - name: Install Dioxus CLI
         shell: bash
         run: |
           set -euo pipefail
           base_url="https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10"
-          curl --fail --location --silent --show-error "$base_url/dx-x86_64-unknown-linux-gnu.tar.gz" -o "$RUNNER_TEMP/dx.tar.gz"
+          tools_root="$HOME/.local/share/akrat-ci/dx-0.7.10"
+          archive="$HOME/.local/share/akrat-ci/dx-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$tools_root" "$(dirname "$archive")"
           curl --fail --location --silent --show-error "$base_url/dx-x86_64-unknown-linux-gnu.sha256" -o "$RUNNER_TEMP/dx.sha256"
           expected="$(awk '$2 == "dx-x86_64-unknown-linux-gnu.tar.gz" {print $1}' "$RUNNER_TEMP/dx.sha256")"
           test -n "$expected"
-          echo "$expected  $RUNNER_TEMP/dx.tar.gz" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/dx"
-          tar -xzf "$RUNNER_TEMP/dx.tar.gz" -C "$RUNNER_TEMP/dx"
-          chmod +x "$RUNNER_TEMP/dx/dx"
-          echo "$RUNNER_TEMP/dx" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/dx/dx" --version
+          if [[ ! -f "$archive" ]] || [[ "$(sha256sum "$archive" | awk '{print $1}')" != "$expected" ]]; then
+            curl --fail --location --silent --show-error "$base_url/dx-x86_64-unknown-linux-gnu.tar.gz" -o "$archive.tmp"
+            echo "$expected  $archive.tmp" | sha256sum --check --status
+            mv "$archive.tmp" "$archive"
+          fi
+          echo "$expected  $archive" | sha256sum --check --status
+          if [[ ! -x "$tools_root/dx" ]]; then
+            tar -xzf "$archive" -C "$tools_root"
+            chmod +x "$tools_root/dx"
+          fi
+          echo "$tools_root" >> "$GITHUB_PATH"
+          "$tools_root/dx" --version
 
       - name: Clear launcher images from a previous local build
         shell: bash
@@ -430,10 +429,10 @@ jobs:
           PY
 
       - name: Build installable Android test APK
-        run: >-
-          dx bundle --platform android --target aarch64-linux-android --package akrat-desktop
-          --release --no-default-features --features mobile --package-types apk
-          --out-dir dist/android
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          python3 scripts/ci/measure_process.py android-release -- dx bundle --platform android --target aarch64-linux-android --package akrat-desktop --release --no-default-features --features mobile --package-types apk --out-dir dist/android
 
       - name: Apply the AKRAT Android launcher icon
         run: |
@@ -441,7 +440,7 @@ jobs:
           python packaging/android/apply_launcher_icon.py \
             --project target/dx/akrat-desktop/release/android/app \
             --icon crates/akrat-desktop/assets/akrat-logo.png
-          bash target/dx/akrat-desktop/release/android/app/gradlew \
+          python3 scripts/ci/measure_process.py android-packaging -- bash target/dx/akrat-desktop/release/android/app/gradlew \
             --project-dir target/dx/akrat-desktop/release/android/app \
             --no-daemon --console=plain :app:assembleDebug
           cp target/dx/akrat-desktop/release/android/app/app/build/outputs/apk/debug/app-debug.apk \
@@ -470,10 +469,19 @@ jobs:
             "$apk"
           mv "$RUNNER_TEMP/akrat-signed.apk" "$apk"
           "$apksigner" verify --verbose "$apk"
+          python3 scripts/ci/record_artifact_sizes.py android "$apk"
 
       - uses: actions/upload-artifact@v4
         with:
           name: akrat-android-apk
           path: dist/android/*.apk
           if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: akrat-metrics-android
+          path: target/ci-metrics/*.json
+          if-no-files-found: ignore
           retention-days: 14

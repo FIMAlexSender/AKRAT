@@ -23,6 +23,7 @@ getrandom = "0.4"
 hex = "0.4"
 fs2 = "0.4"
 iroh = { version = "=1.4.1", features = ["unstable-custom-transports"] }
+iroh-base = "=1.4.1"
 rpassword = "7.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 semver = "1"

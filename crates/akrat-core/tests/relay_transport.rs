@@ -3,9 +3,11 @@ use akrat_trust::{RelayDisposition, RelayOperationalRecord};
 use iroh::{Endpoint, EndpointAddr, RelayMode, Watcher, endpoint::presets::N0, tls::CaTlsConfig};
 
 const ALPN: &[u8] = b"akrat-relay-test/0.1";
+static LOCAL_RELAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn encrypted_peer_stream_works_through_a_forced_local_iroh_relay() {
+    let _guard = LOCAL_RELAY_TEST_LOCK.lock().await;
     let (relay_map, _, _relay_server) = iroh::test_utils::run_relay_server()
         .await
         .expect("start local Iroh relay");
@@ -59,6 +61,7 @@ async fn encrypted_peer_stream_works_through_a_forced_local_iroh_relay() {
 
 #[tokio::test]
 async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
+    let _guard = LOCAL_RELAY_TEST_LOCK.lock().await;
     let (relay_map, first_url, first_server) = iroh::test_utils::run_relay_server()
         .await
         .expect("start first local Iroh relay");
@@ -191,6 +194,7 @@ async fn endpoint_switches_to_an_allowed_relay_after_home_relay_fails() {
 
 #[tokio::test]
 async fn favorite_relay_is_preferred_for_an_open_p2p_path() {
+    let _guard = LOCAL_RELAY_TEST_LOCK.lock().await;
     let (relay_map, first_url, _first_server) = iroh::test_utils::run_relay_server()
         .await
         .expect("start first local Iroh relay");
@@ -266,7 +270,7 @@ async fn favorite_relay_is_preferred_for_an_open_p2p_path() {
     .expect("favorite relay connection deadline")
     .expect("connect through an allowed relay");
 
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let selection = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if connection.paths().iter().any(|path| {
                 path.is_selected()
@@ -277,8 +281,12 @@ async fn favorite_relay_is_preferred_for_an_open_p2p_path() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("the selected P2P path uses the favorite relay");
+    .await;
+    assert!(
+        selection.is_ok(),
+        "the selected P2P path uses the favorite relay; observed paths: {:?}",
+        connection.paths()
+    );
 
     let mut send = connection.open_uni().await.expect("open favorite stream");
     send.write_all(b"favorite relay path selected")
